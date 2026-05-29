@@ -1,29 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-ui/fdidm_hardware_test_tab.py
 
-FDIDM paper-strict hardware verification page - v17.
-
-What changed in v17 vs v16 UI:
-    1) _connect_signals: self.probe_guard_spin is now included in the spin
-       tuple that connects to _on_params_changed; in v16 it was missing,
-       so editing this spinbox did nothing.
-    2) _connect_signals: the dead-code `if isinstance(QDoubleSpinBox) else`
-       branch with identical bodies has been collapsed into a single line.
-    3) Default samp_rate -> 1 MHz (was 960 kHz). 1 MHz is an integer divisor
-       of the B210 master clock (52 MHz), making the rate exact.
-    4) Default tx_gain / rx_gain -> 20 dB (was 40 dB). B210 self-loopback
-       at 40+40 dB drives the RX ADC well into saturation; 20+20 dB is
-       a safe starting point. The user can still raise them.
-    5) The group title and the note next to the parameter block were
-       updated to describe the v17 channel-estimation flow (single known
-       pilot frame in place of the v16 M*N impulse probes).
-    6) _apply_params_to_backend now also pushes the current TX text into
-       tx_text_view so the displayed TX text doesn't lag the edit field.
-    7) "探测保护" and "最大阶数" spinboxes are kept and still passed
-       through configure() so old configs do not break, but they are
-       silently ignored by the v17 backend.
-"""
 
 from __future__ import annotations
 
@@ -46,7 +22,6 @@ from hardware.fdidm_hardtest import FDIDMHardwareTest
 
 MATLAB_BLUE = (0, 114, 189)
 MATLAB_ORANGE = (217, 83, 25)
-MATLAB_YELLOW = (237, 177, 32)
 MATLAB_PURPLE = (126, 47, 142)
 LIGHT_BG = (250, 250, 250)
 AXIS_COLOR = (60, 60, 60)
@@ -54,16 +29,7 @@ BORDER_COLOR = (225, 225, 225)
 
 
 class FDIDMHardwareTestTab(QWidget):
-    """FDIDM paper-strict USRP hardware verification UI (v17).
 
-    Key properties of the v17 link:
-      - no OFDM pilot holes inside the data grid;
-      - full M x N FDIDM payload grid;
-      - a single known random-QPSK pilot frame is transmitted directly
-        before the data frame, replacing v16's M*N impulse probes;
-      - cross-domain ZF / MMSE on a diagonal H_TF, mathematically
-        equivalent to the paper's matrix-form equalization.
-    """
 
     def __init__(self):
         super().__init__()
@@ -74,12 +40,10 @@ class FDIDMHardwareTestTab(QWidget):
         self._evm_index = 0
         self._last_plot_samp_rate = None
         self._last_runtime_log_time = 0.0
-        self._hot_update_in_progress = False
         # v17.1: cursor for incremental debug-log streaming from the backend.
         # Each refresh tick drains entries with seq > _last_debug_seq.
         self._last_debug_seq = 0
-        # Level filter for the auto-stream; user can switch in code if desired.
-        # Default INFO keeps the log readable; flip to "DEBUG" for full firehose.
+        # Level filter for the auto-stream; default INFO keeps log readable.
         self._auto_debug_level = "INFO"
 
         self._init_ui()
@@ -323,7 +287,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.tx_curve = self.tx_plot.plot(pen=pg.mkPen(MATLAB_BLUE, width=2))
         self.rx_curve = self.rx_spectrum_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2))
         self.evm_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_PURPLE, width=2))
-        self.constellation_scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(MATLAB_YELLOW[0], MATLAB_YELLOW[1], MATLAB_YELLOW[2], 160))
+        self.constellation_scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(237, 177, 32, 160))
         self.constellation_plot.addItem(self.constellation_scatter)
         return panel
 
@@ -576,8 +540,6 @@ class FDIDMHardwareTestTab(QWidget):
             self._apply_params_to_backend()
 
     def _on_params_changed(self, *_args):
-        if self._hot_update_in_progress:
-            return
         if self.auto_apply_check.isChecked():
             self._apply_params_to_backend()
 
@@ -653,13 +615,10 @@ class FDIDMHardwareTestTab(QWidget):
         get_tx_spectrum_source / get_tx_samples both fall back to the
         cached self._tx_waveform when the runtime buffer is empty, so
         this works both before and during start()."""
-        try:
-            if self.backend is None:
-                return
-            samp_rate = float(self.backend.get_status().get("samp_rate", self.samp_rate_spin.value()))
-            self._update_tx_plot(samp_rate)
-        except Exception:
-            pass
+        if self.backend is None:
+            return
+        samp_rate = float(self.backend.get_status().get("samp_rate", self.samp_rate_spin.value()))
+        self._update_tx_plot(samp_rate)
 
     def _update_tx_plot(self, samp_rate: float):
         if self.backend is None:

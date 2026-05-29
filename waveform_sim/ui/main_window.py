@@ -43,7 +43,7 @@ class MainWindow(QMainWindow):
             ("ui.ofdm_tab", "OfdmTab", "OFDM波形仿真"),
             ("ui.otfs_tab", "OTFSTab", "OTFS波形仿真"),
             ("ui.afdm_tab", "AfdmTab", "AFDM波形仿真"),
-            ("ui.fdidm_hardware_test_tab", "FDIDMHardwareTestTab", "FDIDM严格硬件验证"),
+            ("ui.fdidm_hardware_test_tab", "FDIDMHardwareTestTab", "FDIDM硬件验证"),
             ("ui.hardware_test_tab", "HardwareTestTab", "硬件测评"),
             ("ui.waveform_compare_tab", "WaveformCompareTab", "波形对比分析"),
         ]
