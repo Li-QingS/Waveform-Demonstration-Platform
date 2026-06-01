@@ -84,6 +84,229 @@ class _SampleRing:
             return out, total, count
 
 
+class _NTNTDLChannel:
+    """Small SISO NTN-TDL software channel for FDIDM bench testing.
+
+    The tap tables follow the NTN-TDL-A/C/D profiles in 3GPP TR 38.811
+    Tables 6.9.2-1, 6.9.2-3, and 6.9.2-4.  Delays in the tables are
+    normalized; this class scales them to the requested RMS delay spread.
+
+    This is intentionally a lightweight real-time GNU Radio helper:
+    - fractional delays are implemented by vectorized linear interpolation;
+    - Rayleigh taps use a sum-of-sinusoids approximation to the Doppler
+      spectrum; LOS entries are deterministic specular components;
+    - one common Doppler shift is applied to all taps, matching the NTN
+      additional satellite Doppler statement in TR 38.811.
+    """
+
+    # (normalized_delay, power_dB, fading_kind)
+    # LOS C/D are represented exactly as the table entries: a deterministic
+    # LOS component plus a Rayleigh component at the same delay.
+    TDL_PROFILES: Dict[str, List[Tuple[float, float, str]]] = {
+        "tdl_a": [
+            (0.0000, 0.000, "rayleigh"),
+            (1.0811, -4.675, "rayleigh"),
+            (2.8416, -6.482, "rayleigh"),
+        ],
+        "tdl_c": [
+            (0.0000, -0.394, "los"),
+            (0.0000, -10.618, "rayleigh"),
+            (14.8124, -23.373, "rayleigh"),
+        ],
+        "tdl_d": [
+            (0.0000, -0.284, "los"),
+            (0.0000, -11.991, "rayleigh"),
+            (0.5596, -9.887, "rayleigh"),
+            (7.3340, -16.771, "rayleigh"),
+        ],
+    }
+
+    DISPLAY_NAMES = {
+        "tdl_a": "NTN-TDL-A (NLOS/Rayleigh)",
+        "tdl_c": "NTN-TDL-C (LOS/Rician)",
+        "tdl_d": "NTN-TDL-D (LOS/Rician)",
+    }
+
+    def __init__(
+            self,
+            sample_rate: float,
+            model: str = "tdl_a",
+            rms_delay_spread_ns: float = 1000.0,
+            doppler_hz: float = 0.0,
+            doppler_spread_hz: float = 0.0,
+            snr_db: float = 35.0,
+            seed: int = 0x38_811,
+            normalize_power: bool = True,
+            num_sinusoids: int = 8,
+    ):
+        self.sample_rate = float(max(sample_rate, 1.0))
+        self.model = "tdl_a"
+        self.rms_delay_spread_ns = 1000.0
+        self.doppler_hz = 0.0
+        self.doppler_spread_hz = 0.0
+        self.snr_db = 35.0
+        self.seed = int(seed) & 0xFFFFFFFF
+        self.normalize_power = bool(normalize_power)
+        self.num_sinusoids = int(max(4, min(int(num_sinusoids), 64)))
+        self._rng = np.random.default_rng(self.seed)
+        self._components: List[Dict[str, Any]] = []
+        self._history = np.zeros(8, dtype=np.complex128)
+        self._sample_index = 0
+        self._delay_scale_s = 0.0
+        self.configure(sample_rate=sample_rate, model=model,
+                       rms_delay_spread_ns=rms_delay_spread_ns,
+                       doppler_hz=doppler_hz,
+                       doppler_spread_hz=doppler_spread_hz,
+                       snr_db=snr_db,
+                       seed=seed,
+                       normalize_power=normalize_power,
+                       num_sinusoids=num_sinusoids)
+
+    @classmethod
+    def normalize_model(cls, model: str) -> str:
+        m = str(model or "tdl_a").strip().lower().replace("-", "_").replace(" ", "_")
+        if m in ("a", "ntn_tdl_a", "tdla", "tdl_a"):
+            return "tdl_a"
+        if m in ("c", "ntn_tdl_c", "tdlc", "tdl_c"):
+            return "tdl_c"
+        if m in ("d", "ntn_tdl_d", "tdld", "tdl_d"):
+            return "tdl_d"
+        if m in cls.TDL_PROFILES:
+            return m
+        raise ValueError("software TDL model must be one of: tdl_a, tdl_c, tdl_d")
+
+    @staticmethod
+    def _db_to_linear(power_db: float) -> float:
+        return float(10.0 ** (float(power_db) / 10.0))
+
+    def configure(self, **kwargs: Any):
+        if "sample_rate" in kwargs and kwargs["sample_rate"] is not None:
+            self.sample_rate = float(max(float(kwargs["sample_rate"]), 1.0))
+        if "model" in kwargs and kwargs["model"] is not None:
+            self.model = self.normalize_model(kwargs["model"])
+        if "rms_delay_spread_ns" in kwargs and kwargs["rms_delay_spread_ns"] is not None:
+            self.rms_delay_spread_ns = float(max(0.0, float(kwargs["rms_delay_spread_ns"])))
+        if "doppler_hz" in kwargs and kwargs["doppler_hz"] is not None:
+            self.doppler_hz = float(kwargs["doppler_hz"])
+        if "doppler_spread_hz" in kwargs and kwargs["doppler_spread_hz"] is not None:
+            self.doppler_spread_hz = float(max(0.0, float(kwargs["doppler_spread_hz"])))
+        if "snr_db" in kwargs and kwargs["snr_db"] is not None:
+            self.snr_db = float(kwargs["snr_db"])
+        if "seed" in kwargs and kwargs["seed"] is not None:
+            self.seed = int(kwargs["seed"]) & 0xFFFFFFFF
+        if "normalize_power" in kwargs and kwargs["normalize_power"] is not None:
+            self.normalize_power = bool(kwargs["normalize_power"])
+        if "num_sinusoids" in kwargs and kwargs["num_sinusoids"] is not None:
+            self.num_sinusoids = int(max(4, min(int(kwargs["num_sinusoids"]), 64)))
+
+        self._rng = np.random.default_rng(self.seed)
+        raw = list(self.TDL_PROFILES[self.model])
+        delays_norm = np.array([r[0] for r in raw], dtype=np.float64)
+        powers = np.array([self._db_to_linear(r[1]) for r in raw], dtype=np.float64)
+        if self.normalize_power:
+            powers = powers / max(float(np.sum(powers)), 1e-12)
+        mean_tau = float(np.sum(powers * delays_norm) / max(float(np.sum(powers)), 1e-12))
+        rms_norm = float(np.sqrt(np.sum(powers * (delays_norm - mean_tau) ** 2) /
+                                 max(float(np.sum(powers)), 1e-12)))
+        desired_ds_s = float(self.rms_delay_spread_ns) * 1e-9
+        self._delay_scale_s = desired_ds_s / max(rms_norm, 1e-12) if desired_ds_s > 0.0 else 0.0
+        delays_samp = delays_norm * self._delay_scale_s * self.sample_rate
+        max_delay_samp = float(np.max(delays_samp)) if delays_samp.size else 0.0
+        hist_len = int(max(8, np.ceil(max_delay_samp) + 8))
+        self._history = np.zeros(hist_len, dtype=np.complex128)
+        self._sample_index = 0
+        self._components = []
+        for idx, (delay_norm, power_db, kind) in enumerate(raw):
+            power_lin = self._db_to_linear(power_db)
+            if self.normalize_power:
+                power_lin = power_lin / max(float(np.sum([self._db_to_linear(r[1]) for r in raw])), 1e-12)
+            comp: Dict[str, Any] = {
+                "idx": int(idx),
+                "delay_norm": float(delay_norm),
+                "delay_samp": float(delay_norm) * self._delay_scale_s * self.sample_rate,
+                "power_lin": float(power_lin),
+                "sqrt_power": float(np.sqrt(max(power_lin, 0.0))),
+                "kind": str(kind).lower(),
+                "phase0": float(self._rng.uniform(0.0, 2.0 * np.pi)),
+            }
+            if comp["kind"] == "rayleigh":
+                comp["static_rayleigh"] = ((self._rng.normal() + 1j * self._rng.normal()) / np.sqrt(2.0))
+                # Deterministic-ish angle grid with a small random offset per tap.
+                offset = float(self._rng.uniform(0.0, 1.0))
+                comp["angles"] = 2.0 * np.pi * ((np.arange(self.num_sinusoids, dtype=np.float64) + offset)
+                                                 / max(self.num_sinusoids, 1))
+                comp["phases"] = self._rng.uniform(0.0, 2.0 * np.pi, size=self.num_sinusoids).astype(np.float64)
+            self._components.append(comp)
+
+    def reset(self):
+        self._history[:] = 0.0
+        self._sample_index = 0
+
+    def summary(self) -> str:
+        tap_desc = ", ".join(
+            f"{c['kind']}@{c['delay_samp']:.3f} samp/{10*np.log10(max(c['power_lin'],1e-15)):.1f} dB"
+            for c in self._components
+        )
+        return (f"{self.DISPLAY_NAMES.get(self.model, self.model)}, "
+                f"DS={self.rms_delay_spread_ns:.1f} ns, fd={self.doppler_hz:.1f} Hz, "
+                f"spread={self.doppler_spread_hz:.1f} Hz, SNR={self.snr_db:.1f} dB, taps=[{tap_desc}]")
+
+    @staticmethod
+    def _fractional_delay(ext: np.ndarray, hist_len: int, n: np.ndarray, delay_samp: float) -> np.ndarray:
+        pos = float(hist_len) + n.astype(np.float64) - float(delay_samp)
+        i0 = np.floor(pos).astype(np.int64)
+        frac = pos - i0.astype(np.float64)
+        out = np.zeros(n.size, dtype=np.complex128)
+        valid = (i0 >= 0) & (i0 < ext.size)
+        if np.any(valid):
+            ii = i0[valid]
+            ii1 = np.minimum(ii + 1, ext.size - 1)
+            ff = frac[valid]
+            out[valid] = (1.0 - ff) * ext[ii] + ff * ext[ii1]
+        return out
+
+    def _component_gain(self, comp: Dict[str, Any], t: np.ndarray) -> np.ndarray:
+        sqrt_power = float(comp.get("sqrt_power", 0.0))
+        common = float(self.doppler_hz)
+        if comp.get("kind") == "los":
+            return sqrt_power * np.exp(1j * (2.0 * np.pi * common * t + float(comp.get("phase0", 0.0))))
+        spread = float(self.doppler_spread_hz)
+        if spread <= 1e-9:
+            return sqrt_power * complex(comp.get("static_rayleigh", 1.0 + 0.0j)) * np.exp(1j * 2.0 * np.pi * common * t)
+        angles = np.asarray(comp.get("angles"), dtype=np.float64).reshape(-1)
+        phases = np.asarray(comp.get("phases"), dtype=np.float64).reshape(-1)
+        freqs = common + spread * np.cos(angles)
+        # Shape: (num_sinusoids, num_samples).  The scale gives approximately
+        # unit-power Rayleigh fading before multiplying by sqrt_power.
+        ph = 2.0 * np.pi * freqs[:, None] * t[None, :] + phases[:, None]
+        return sqrt_power * np.sum(np.exp(1j * ph), axis=0) / np.sqrt(max(freqs.size, 1))
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        x = np.asarray(samples, dtype=np.complex64).reshape(-1)
+        if x.size == 0:
+            return np.zeros(0, dtype=np.complex64)
+        x128 = x.astype(np.complex128, copy=False)
+        hist_len = int(self._history.size)
+        ext = np.concatenate((self._history, x128))
+        n = np.arange(x128.size, dtype=np.int64)
+        t = (float(self._sample_index) + n.astype(np.float64)) / max(self.sample_rate, 1.0)
+        y = np.zeros(x128.size, dtype=np.complex128)
+        for comp in self._components:
+            delayed = self._fractional_delay(ext, hist_len, n, float(comp.get("delay_samp", 0.0)))
+            y += self._component_gain(comp, t) * delayed
+        self._history = ext[-hist_len:].copy()
+        self._sample_index += int(x128.size)
+        if np.isfinite(self.snr_db) and self.snr_db < 200.0:
+            sig_power = float(np.mean(np.abs(y) ** 2))
+            if sig_power > 1e-18:
+                noise_power = sig_power / (10.0 ** (float(self.snr_db) / 10.0))
+                noise = np.sqrt(noise_power / 2.0) * (
+                    self._rng.normal(size=y.size) + 1j * self._rng.normal(size=y.size)
+                )
+                y = y + noise
+        return y.astype(np.complex64)
+
+
 class FDIDMHardwareTest:
     APP_MAGIC = b"MTPK"
     PILOT_SEED = 0xFD1D_0017  # deterministic pilot generator
@@ -117,9 +340,18 @@ class FDIDMHardwareTest:
             training_probe_guard_len: int = 16,  # legacy; ignored in v17
             max_full_htf_order: int = 4096,  # maximum order for full paper H_TF estimation
             channel_estimator: str = "full_htf",  # "full_htf" = paper-strict; "diag_tf" = fast loopback mode
-            full_htf_update_interval_frames: int = 8,  # reuse full H_TF for static links; 1 = estimate every frame
-            process_interval_ms: float = 200.0,        # throttle heavy Python decoding to avoid UHD RX overflow
-            usrp_buffer_frames: int = 512,             # UHD streamer buffer hint for Windows/B210 stability
+            full_htf_update_interval_frames: int = 10000,  # kept for backward compatibility; one-shot mode ignores it
+            full_htf_once: bool = True,              # v24: estimate full H_TF once, then reuse until cache is cleared
+            process_interval_ms: float = 200.0,      # throttle heavy Python decoding to avoid UHD RX overflow
+            usrp_buffer_frames: int = 512,           # UHD streamer buffer hint for Windows/B210 stability
+            channel_mode: str = "rf",                # "rf" or "tdl_a"/"tdl_c"/"tdl_d" software loopback
+            software_channel_model: Optional[str] = None,  # legacy/alias for channel_mode when set to a TDL model
+            tdl_rms_delay_spread_ns: float = 1000.0,
+            tdl_doppler_hz: float = 0.0,             # common satellite Doppler shift applied to all taps
+            tdl_doppler_spread_hz: float = 0.0,      # local scattering Doppler spread for Rayleigh taps
+            tdl_snr_db: float = 35.0,
+            tdl_seed: int = 0x38811,
+            tdl_normalize_power: bool = True,
             **_legacy_ignored: Any,
     ):
         self.carrier_freq = float(carrier_freq)
@@ -158,13 +390,26 @@ class FDIDMHardwareTest:
         if self.channel_estimator not in ("full_htf", "diag_tf"):
             raise ValueError("channel_estimator must be 'full_htf' or 'diag_tf'")
         self.full_htf_update_interval_frames = int(max(1, min(int(full_htf_update_interval_frames), 10_000)))
+        self.full_htf_once = bool(full_htf_once)
         self.process_interval_sec = max(0.03, float(process_interval_ms) / 1000.0)
         self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
+
+        # Optional software NTN-TDL channel inserted between the FDIDM TX stream
+        # and the RX decoder.  In TDL mode the flowgraph is pure baseband
+        # loopback: vector_source -> throttle -> TDL channel -> RX probe.
+        # In RF mode the original USRP TX/RX path is used.
+        self.channel_mode = self._normalize_channel_mode(software_channel_model or channel_mode)
+        self.tdl_rms_delay_spread_ns = float(max(0.0, float(tdl_rms_delay_spread_ns)))
+        self.tdl_doppler_hz = float(tdl_doppler_hz)
+        self.tdl_doppler_spread_hz = float(max(0.0, float(tdl_doppler_spread_hz)))
+        self.tdl_snr_db = float(tdl_snr_db)
+        self.tdl_seed = int(tdl_seed) & 0xFFFFFFFF
+        self.tdl_normalize_power = bool(tdl_normalize_power)
 
         # Hardware/sync frame structure.
         # Frame = [pre_guard][sync_preamble][pilot_frame][data_frame][post_guard]
         self._recompute_strict_frame_timing()
-        self.strict_chain_name = "FDIDM_FULL_HTF_PAPER_STRICT_RXPROBE_STABLE_v23"
+        self.strict_chain_name = "FDIDM_FULL_HTF_ONESHOT_NTN_TDL_RXPROBE_STABLE_v24"
 
         # Tunables.
         self.sync_metric_threshold = 0.30
@@ -201,15 +446,19 @@ class FDIDMHardwareTest:
         self._rx_buffer = _SampleRing(self._buffer_keep)
         self._rx_probe = None
         self._rx_stream_to_vector = None
+        self._tdl_channel_block = None
+        self._throttle_block = None
+        self._tx_gain_block = None
         self._rx_probe_len = 0
         self._rx_probe_mode = "unconfigured"
         self._rx_probe_last_fp = None
         self._rx_probe_total_est = 0
         self._rx_probe_start_t = 0.0
-        # Full-H_TF cache: in a static cable/bench test, estimating the 256x256
-        # matrix on every repeated frame wastes CPU and can starve UHD RX.
-        # The first valid frame always estimates H_TF; later frames reuse it
-        # until full_htf_update_interval_frames expires.
+        # Full-H_TF cache: v24 performs one-shot channel identification.  The
+        # first accepted full-H_TF estimate is reused for all later frames until
+        # the cache is explicitly cleared or a structural/channel parameter is
+        # reconfigured.  This matches the requested "identify once, do not
+        # re-estimate every frame" behavior.
         self._cached_htf_full: Optional[np.ndarray] = None
         self._cached_htf_leakage = float("nan")
         self._cached_htf_frame_counter = -10**18
@@ -285,7 +534,10 @@ class FDIDMHardwareTest:
         self._debug("INFO",
                     f"FDIDM backend v23 rx-probe/cache ready: chain={self.strict_chain_name}, "
                     f"estimator={self.channel_estimator}, use_full_htf={self.use_full_htf}, "
-                    f"H_update={self.full_htf_update_interval_frames} frame(s), "
+                    f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames} frame(s), "
+                    f"channel_mode={self.channel_mode}, "
+                    f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f} ns, fd={self.tdl_doppler_hz:.1f} Hz, "
+                    f"spread={self.tdl_doppler_spread_hz:.1f} Hz, SNR={self.tdl_snr_db:.1f} dB, "
                     f"process_interval={self.process_interval_sec*1000:.0f} ms, "
                     f"M={self.M} N={self.N} CP={self.cp_len} alpha={self.alpha:.3f} beta={self.beta:.3f} "
                     f"mod={self.mod_order} eq={self.equalizer} Fs={self.sample_rate:.0f} Hz "
@@ -744,9 +996,13 @@ class FDIDMHardwareTest:
             return False
         if self._cached_htf_full is None or self._cached_H_cross is None:
             return True
-        # Refresh only after successful decodes, not merely after processed candidates.
-        # Bad/noisy candidates used to trigger periodic re-estimation and could poison
-        # the cached H, which looked like: constellation stable -> suddenly scattered.
+        # v24 requested behavior: full-H_TF is one-shot channel identification.
+        # Once a good H_TF is cached, never re-estimate on later frames unless
+        # reset_full_htf_cache() or a structural/channel reconfigure clears it.
+        if bool(getattr(self, "full_htf_once", True)):
+            return False
+        # Backward-compatible periodic refresh can still be enabled explicitly
+        # by setting full_htf_once=False.
         return (int(self._frames_decode_ok) - int(self._cached_htf_frame_counter)) >= int(self.full_htf_update_interval_frames)
 
     def _cache_full_htf(self, htf: np.ndarray, leakage: float):
@@ -1140,6 +1396,55 @@ class FDIDMHardwareTest:
         return gain
 
     # =========================================================
+    # Software NTN-TDL channel configuration
+    # =========================================================
+    def _normalize_channel_mode(self, mode: str) -> str:
+        m = str(mode or "rf").strip().lower().replace("-", "_").replace(" ", "_")
+        if m in ("rf", "usrp", "hardware", "off", "none", "no", "false", "0"):
+            return "rf"
+        return _NTNTDLChannel.normalize_model(m)
+
+    def _software_channel_enabled(self) -> bool:
+        return str(getattr(self, "channel_mode", "rf")).lower() in _NTNTDLChannel.TDL_PROFILES
+
+    def _make_tdl_channel_block(self):
+        """Create a GNU Radio Python sync_block wrapping _NTNTDLChannel."""
+        gr = self._gr
+        channel = _NTNTDLChannel(
+            sample_rate=self.sample_rate,
+            model=self.channel_mode,
+            rms_delay_spread_ns=self.tdl_rms_delay_spread_ns,
+            doppler_hz=self.tdl_doppler_hz,
+            doppler_spread_hz=self.tdl_doppler_spread_hz,
+            snr_db=self.tdl_snr_db,
+            seed=self.tdl_seed,
+            normalize_power=self.tdl_normalize_power,
+        )
+
+        class _TDLChannelBlock(gr.sync_block):
+            def __init__(self):
+                gr.sync_block.__init__(self, name="ntn_tdl_channel_v24", in_sig=[np.complex64], out_sig=[np.complex64])
+                self.channel = channel
+
+            def work(self, input_items, output_items):
+                y = self.channel.process(input_items[0])
+                output_items[0][:len(y)] = y
+                return len(y)
+
+            def reset_channel(self):
+                self.channel.reset()
+
+            def channel_summary(self) -> str:
+                return self.channel.summary()
+
+        return _TDLChannelBlock()
+
+    def reset_full_htf_cache(self):
+        """Public API used by the UI: force the next full-H_TF frame to re-identify the channel."""
+        self._clear_channel_cache()
+        self._debug("INFO", "full-H_TF cache cleared; next valid full-H frame will perform one-shot identification")
+
+    # =========================================================
     # GNU Radio / UHD lifecycle
     # =========================================================
     def _build_device_args(self) -> str:
@@ -1254,10 +1559,10 @@ class FDIDMHardwareTest:
                 self._debug("INFO", "old top_block stopped during rebuild")
             except Exception as e:
                 self._debug("WARN", f"old top_block.stop during rebuild: {type(e).__name__}: {e}")
-        # Drop all strong references so the old USRP source/sink finalisers
-        # can run and release the USB endpoint.
+        # Drop all strong references so old GR/UHD blocks can be finalized.
         for attr in ("_tb", "_vector_source", "_usrp_source", "_usrp_sink",
-                     "_tx_sink_vec", "_rx_sink_vec", "_rx_probe", "_rx_stream_to_vector"):
+                     "_tx_sink_vec", "_rx_sink_vec", "_rx_probe", "_rx_stream_to_vector",
+                     "_tdl_channel_block", "_throttle_block", "_tx_gain_block"):
             if hasattr(self, attr):
                 try:
                     setattr(self, attr, None)
@@ -1265,56 +1570,85 @@ class FDIDMHardwareTest:
                     pass
         import gc
         gc.collect()
-        # Give libuhd a moment to fully release the USB handle; without this
-        # the new usrp_sink() call below can race with the old one's teardown.
-        time.sleep(0.25)
+        # In RF mode, give libuhd a moment to release the USB endpoint before
+        # re-opening.  In software-loopback mode this is harmless and brief.
+        time.sleep(0.25 if not self._software_channel_enabled() else 0.05)
 
+        mode_text = ("software " + str(self.channel_mode)) if self._software_channel_enabled() else "USRP RF"
         self._debug("INFO",
-                    f"building new top_block: {self._waveform_fingerprint()}, "
+                    f"building new top_block ({mode_text}): {self._waveform_fingerprint()}, "
                     f"alpha={self.alpha:.3f}, beta={self.beta:.3f}, mod={self.mod_order}")
 
         class _TopBlock(gr.top_block):
             pass
 
-        tb = _TopBlock("FDIDM Paper Strict Hardware Test v20 RX Probe", catch_exceptions=True)
+        tb = _TopBlock("FDIDM Paper Strict Hardware Test v24 OneShot NTN-TDL", catch_exceptions=True)
         vector_source = blocks.vector_source_c(self._tx_waveform.tolist(), True, 1, [])
         tx_gain_block = blocks.multiply_const_cc(1.0)
-        # Do not mirror the TX stream into Python during live UHD operation.
-        # It is known exactly from _tx_waveform and can be previewed offline.
         tx_sink_vec = None
         rx_stream_to_vector, rx_sink_vec, rx_probe, rx_probe_mode = self._build_rx_probe_chain()
-        usrp_source = uhd.usrp_source(
-            ",".join(("", self._usrp_args)),
-            uhd.stream_args(cpu_format="fc32", args=self._rx_stream_args(), channels=list(range(0, 1))),
-        )
-        usrp_source.set_subdev_spec("A:A", 0)
-        usrp_source.set_samp_rate(self.sample_rate)
-        usrp_source.set_time_unknown_pps(uhd.time_spec(0))
-        usrp_source.set_center_freq(self.carrier_freq, 0)
-        usrp_source.set_antenna(self.rx_antenna, 0)
-        usrp_source.set_gain(self.rx_gain, 0)
-        try:
-            usrp_source.set_min_output_buffer(max(32768, int(self._rx_probe_len)))
-        except Exception:
-            pass
-        usrp_sink = uhd.usrp_sink(
-            ",".join(("", self._usrp_args)),
-            uhd.stream_args(cpu_format="fc32", args=self._tx_stream_args(), channels=list(range(0, 1))),
-            "",
-        )
-        usrp_sink.set_subdev_spec("A:A", 0)
-        usrp_sink.set_samp_rate(self.sample_rate)
-        usrp_sink.set_time_unknown_pps(uhd.time_spec(0))
-        usrp_sink.set_center_freq(self.carrier_freq, 0)
-        usrp_sink.set_antenna(self.tx_antenna, 0)
-        usrp_sink.set_gain(self.tx_gain, 0)
+
+        usrp_source = None
+        usrp_sink = None
+        throttle_block = None
+        tdl_channel_block = None
+
         tb.connect((vector_source, 0), (tx_gain_block, 0))
-        tb.connect((tx_gain_block, 0), (usrp_sink, 0))
-        if rx_stream_to_vector is not None:
-            tb.connect((usrp_source, 0), (rx_stream_to_vector, 0))
-            tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
+
+        if self._software_channel_enabled():
+            # Pure baseband loopback with a real-time throttle:
+            # TX vector -> TDL channel -> RX probe.  This is the requested
+            # software channel inserted between TX and RX.  It bypasses the RF
+            # front-end so the impairment is exactly controlled and repeatable.
+            throttle_block = blocks.throttle(gr.sizeof_gr_complex, float(self.sample_rate), True)
+            tdl_channel_block = self._make_tdl_channel_block()
+            tb.connect((tx_gain_block, 0), (throttle_block, 0))
+            tb.connect((throttle_block, 0), (tdl_channel_block, 0))
+            if rx_stream_to_vector is not None:
+                tb.connect((tdl_channel_block, 0), (rx_stream_to_vector, 0))
+                tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
+            else:
+                tb.connect((tdl_channel_block, 0), (rx_sink_vec, 0))
+            try:
+                self._debug("INFO", "software channel configured: " + tdl_channel_block.channel_summary())
+            except Exception:
+                pass
         else:
-            tb.connect((usrp_source, 0), (rx_sink_vec, 0))
+            # Original hardware path: TX vector -> USRP sink, USRP source -> RX probe.
+            if uhd is None:
+                raise RuntimeError("GNU Radio UHD module is unavailable but channel_mode='rf' requires USRP.")
+            usrp_source = uhd.usrp_source(
+                ",".join(("", self._usrp_args)),
+                uhd.stream_args(cpu_format="fc32", args=self._rx_stream_args(), channels=list(range(0, 1))),
+            )
+            usrp_source.set_subdev_spec("A:A", 0)
+            usrp_source.set_samp_rate(self.sample_rate)
+            usrp_source.set_time_unknown_pps(uhd.time_spec(0))
+            usrp_source.set_center_freq(self.carrier_freq, 0)
+            usrp_source.set_antenna(self.rx_antenna, 0)
+            usrp_source.set_gain(self.rx_gain, 0)
+            try:
+                usrp_source.set_min_output_buffer(max(32768, int(self._rx_probe_len)))
+            except Exception:
+                pass
+            usrp_sink = uhd.usrp_sink(
+                ",".join(("", self._usrp_args)),
+                uhd.stream_args(cpu_format="fc32", args=self._tx_stream_args(), channels=list(range(0, 1))),
+                "",
+            )
+            usrp_sink.set_subdev_spec("A:A", 0)
+            usrp_sink.set_samp_rate(self.sample_rate)
+            usrp_sink.set_time_unknown_pps(uhd.time_spec(0))
+            usrp_sink.set_center_freq(self.carrier_freq, 0)
+            usrp_sink.set_antenna(self.tx_antenna, 0)
+            usrp_sink.set_gain(self.tx_gain, 0)
+            tb.connect((tx_gain_block, 0), (usrp_sink, 0))
+            if rx_stream_to_vector is not None:
+                tb.connect((usrp_source, 0), (rx_stream_to_vector, 0))
+                tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
+            else:
+                tb.connect((usrp_source, 0), (rx_sink_vec, 0))
+
         self._tb = tb
         self._usrp_source = usrp_source
         self._usrp_sink = usrp_sink
@@ -1323,8 +1657,12 @@ class FDIDMHardwareTest:
         self._rx_stream_to_vector = rx_stream_to_vector
         self._rx_probe = rx_probe
         self._vector_source = vector_source
+        self._tdl_channel_block = tdl_channel_block
+        self._throttle_block = throttle_block
+        self._tx_gain_block = tx_gain_block
         self._debug("INFO",
-                    f"new top_block assembled, USRP source/sink bound, rx_mode={rx_probe_mode}, rx_probe_len={self._rx_probe_len}")
+                    f"new top_block assembled, path={mode_text}, rx_mode={rx_probe_mode}, "
+                    f"rx_probe_len={self._rx_probe_len}")
         with self._lock:
             self._tx_buffer.clear()
             self._rx_buffer.clear()
@@ -1411,6 +1749,11 @@ class FDIDMHardwareTest:
                 self._vector_source.rewind()
             except Exception:
                 pass
+            if getattr(self, "_tdl_channel_block", None) is not None:
+                try:
+                    self._tdl_channel_block.reset_channel()
+                except Exception:
+                    pass
             self._needs_top_block_rebuild = False
             self._debug("INFO", "live set_data() + rewind ok")
         except Exception as e:
@@ -1446,17 +1789,31 @@ class FDIDMHardwareTest:
             device_type: Optional[str] = None,
             channel_estimator: Optional[str] = None,
             full_htf_update_interval_frames: Optional[int] = None,
+            full_htf_once: Optional[bool] = None,
             process_interval_ms: Optional[float] = None,
             usrp_buffer_frames: Optional[int] = None,
+            channel_mode: Optional[str] = None,
+            software_channel_model: Optional[str] = None,
+            tdl_rms_delay_spread_ns: Optional[float] = None,
+            tdl_doppler_hz: Optional[float] = None,
+            tdl_doppler_spread_hz: Optional[float] = None,
+            tdl_snr_db: Optional[float] = None,
+            tdl_seed: Optional[int] = None,
+            tdl_normalize_power: Optional[bool] = None,
             **_ignored: Any,
     ):
 
         if self._running:
             # We allow hot-swapping a small subset of params while running.
+            # Software-channel settings rebuild the top_block, so stop first.
             hot_swap_ok = all(v is None for v in (samp_rate, fdidm_m, fdidm_n, cp_len,
-                                                  alpha, beta, mod_order, device_type, channel_estimator))
+                                                  alpha, beta, mod_order, device_type, channel_estimator,
+                                                  channel_mode, software_channel_model,
+                                                  tdl_rms_delay_spread_ns, tdl_doppler_hz,
+                                                  tdl_doppler_spread_hz, tdl_snr_db,
+                                                  tdl_seed, tdl_normalize_power))
             if not hot_swap_ok:
-                raise RuntimeError("Cannot reconfigure structural parameters while running; stop first.")
+                raise RuntimeError("Cannot reconfigure structural/channel parameters while running; stop first.")
 
         rebuild_waveform = False
         rebuild_top_block = False
@@ -1466,32 +1823,36 @@ class FDIDMHardwareTest:
             rebuild_top_block = True
         if carrier_freq is not None and float(carrier_freq) != self.carrier_freq:
             self.carrier_freq = float(carrier_freq)
-            if hasattr(self, "_usrp_source"):
+            if getattr(self, "_usrp_source", None) is not None and getattr(self, "_usrp_sink", None) is not None:
                 try:
                     self._usrp_source.set_center_freq(self.carrier_freq, 0)
                     self._usrp_sink.set_center_freq(self.carrier_freq, 0)
                 except Exception:
                     rebuild_top_block = True
+            else:
+                rebuild_top_block = True
         if samp_rate is not None and float(samp_rate) != self.sample_rate:
             self.sample_rate = float(samp_rate);
             self.samp_rate = self.sample_rate
             self.subcarrier_spacing = self.sample_rate / max(self.M, 1)
-            if hasattr(self, "_usrp_source"):
+            if getattr(self, "_usrp_source", None) is not None and getattr(self, "_usrp_sink", None) is not None:
                 try:
                     self._usrp_source.set_samp_rate(self.sample_rate)
                     self._usrp_sink.set_samp_rate(self.sample_rate)
                 except Exception:
                     rebuild_top_block = True
+            else:
+                rebuild_top_block = True
         if tx_gain is not None and float(tx_gain) != self.tx_gain:
             self.tx_gain = float(tx_gain)
-            if hasattr(self, "_usrp_sink"):
+            if getattr(self, "_usrp_sink", None) is not None:
                 try:
                     self._usrp_sink.set_gain(self.tx_gain, 0)
                 except Exception:
                     pass
         if rx_gain is not None and float(rx_gain) != self.rx_gain:
             self.rx_gain = float(rx_gain)
-            if hasattr(self, "_usrp_source"):
+            if getattr(self, "_usrp_source", None) is not None:
                 try:
                     self._usrp_source.set_gain(self.rx_gain, 0)
                 except Exception:
@@ -1567,6 +1928,56 @@ class FDIDMHardwareTest:
         if usrp_buffer_frames is not None:
             self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
             rebuild_top_block = True
+        if full_htf_once is not None:
+            self.full_htf_once = bool(full_htf_once)
+
+        # Software channel settings.  Any change invalidates one-shot CSI and
+        # rebuilds the flowgraph because the channel is a live GNU Radio block.
+        new_channel_mode = None
+        if software_channel_model is not None:
+            new_channel_mode = self._normalize_channel_mode(software_channel_model)
+        elif channel_mode is not None:
+            new_channel_mode = self._normalize_channel_mode(channel_mode)
+        if new_channel_mode is not None and new_channel_mode != self.channel_mode:
+            self.channel_mode = new_channel_mode
+            rebuild_top_block = True
+            self._clear_channel_cache()
+
+        if tdl_rms_delay_spread_ns is not None:
+            v = float(max(0.0, float(tdl_rms_delay_spread_ns)))
+            if v != self.tdl_rms_delay_spread_ns:
+                self.tdl_rms_delay_spread_ns = v
+                rebuild_top_block = True
+                self._clear_channel_cache()
+        if tdl_doppler_hz is not None:
+            v = float(tdl_doppler_hz)
+            if v != self.tdl_doppler_hz:
+                self.tdl_doppler_hz = v
+                rebuild_top_block = True
+                self._clear_channel_cache()
+        if tdl_doppler_spread_hz is not None:
+            v = float(max(0.0, float(tdl_doppler_spread_hz)))
+            if v != self.tdl_doppler_spread_hz:
+                self.tdl_doppler_spread_hz = v
+                rebuild_top_block = True
+                self._clear_channel_cache()
+        if tdl_snr_db is not None:
+            v = float(tdl_snr_db)
+            if v != self.tdl_snr_db:
+                self.tdl_snr_db = v
+                rebuild_top_block = True
+        if tdl_seed is not None:
+            v = int(tdl_seed) & 0xFFFFFFFF
+            if v != self.tdl_seed:
+                self.tdl_seed = v
+                rebuild_top_block = True
+                self._clear_channel_cache()
+        if tdl_normalize_power is not None:
+            v = bool(tdl_normalize_power)
+            if v != self.tdl_normalize_power:
+                self.tdl_normalize_power = v
+                rebuild_top_block = True
+                self._clear_channel_cache()
 
         tx_text_changed = (tx_text is not None and str(tx_text) != self._tx_text)
         if rebuild_waveform or tx_text_changed:
@@ -1574,7 +1985,8 @@ class FDIDMHardwareTest:
                         f"configure() applying changes: "
                         f"M={self.M} N={self.N} CP={self.cp_len} alpha={self.alpha:.3f} beta={self.beta:.3f} "
                         f"mod={self.mod_order} eq={self.equalizer} estimator={self.channel_estimator} "
-                        f"H_update={self.full_htf_update_interval_frames}, process_interval={self.process_interval_sec*1000:.0f}ms, tx_text_len="
+                        f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames}, "
+                        f"channel_mode={self.channel_mode}, process_interval={self.process_interval_sec*1000:.0f}ms, tx_text_len="
                         f"{len(self._tx_text) if tx_text is None else len(str(tx_text))} bytes")
             self._gamma_cache.clear()
             self._recompute_strict_frame_timing()
@@ -1597,7 +2009,10 @@ class FDIDMHardwareTest:
             self._sync_waveform_to_top_block()
 
         if rebuild_top_block and not self._running:
-            self._debug("INFO", f"configure() rebuilding top_block for device_type={self.device_type}")
+            self._debug("INFO",
+                        f"configure() rebuilding top_block for path={self.channel_mode}, device_type={self.device_type}, "
+                        f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f}ns, fd={self.tdl_doppler_hz:.1f}Hz, "
+                        f"spread={self.tdl_doppler_spread_hz:.1f}Hz, SNR={self.tdl_snr_db:.1f}dB")
             self._usrp_args = self._build_device_args()
             self._build_top_block()
 
@@ -1621,7 +2036,9 @@ class FDIDMHardwareTest:
         self._debug("INFO",
                     f"start(): launching top_block, TX waveform len={self._tx_waveform.size}, "
                     f"frame_len={self.frame_len}, alpha={self.alpha:.3f}, beta={self.beta:.3f}, "
-                    f"mod={self.mod_order}, eq={self.equalizer}, Fs={self.sample_rate:.0f} Hz")
+                    f"mod={self.mod_order}, eq={self.equalizer}, Fs={self.sample_rate:.0f} Hz, "
+                    f"H_once={self.full_htf_once}, channel_mode={self.channel_mode}, "
+                    f"TDL_fd={self.tdl_doppler_hz:.1f} Hz")
         self._tb.start()
         self._tx_preview_start_t = time.time()
         self._rx_probe_start_t = time.time()
@@ -2043,7 +2460,7 @@ class FDIDMHardwareTest:
 
     def set_tx_gain(self, value: float):
         self.tx_gain = float(value)
-        if hasattr(self, "_usrp_sink"):
+        if getattr(self, "_usrp_sink", None) is not None:
             try:
                 self._usrp_sink.set_gain(self.tx_gain, 0)
             except Exception:
@@ -2051,7 +2468,7 @@ class FDIDMHardwareTest:
 
     def set_rx_gain(self, value: float):
         self.rx_gain = float(value)
-        if hasattr(self, "_usrp_source"):
+        if getattr(self, "_usrp_source", None) is not None:
             try:
                 self._usrp_source.set_gain(self.rx_gain, 0)
             except Exception:
@@ -2265,6 +2682,7 @@ class FDIDMHardwareTest:
                 "rx_probe_len": int(self._rx_probe_len),
                 "process_interval_ms": float(self.process_interval_sec * 1000.0),
                 "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),
+                "full_htf_once": bool(self.full_htf_once),
                 "full_htf_cached": bool(self._cached_htf_full is not None),
                 "full_htf_estimates": int(self._full_htf_estimates),
                 "usrp_buffer_frames": int(self.usrp_buffer_frames),
@@ -2300,10 +2718,20 @@ class FDIDMHardwareTest:
             "channel_estimator": self.channel_estimator,
             "use_full_htf": bool(self.use_full_htf),
             "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),
+            "full_htf_once": bool(self.full_htf_once),
             "full_htf_cached": bool(snap.get("full_htf_cached", False)),
             "full_htf_estimates": int(snap.get("full_htf_estimates", 0)),
             "process_interval_ms": float(snap.get("process_interval_ms", self.process_interval_sec * 1000.0)),
             "usrp_buffer_frames": int(snap.get("usrp_buffer_frames", self.usrp_buffer_frames)),
+            "channel_mode": str(self.channel_mode),
+            "software_channel_enabled": bool(self._software_channel_enabled()),
+            "tdl_model": str(self.channel_mode) if self._software_channel_enabled() else "off",
+            "tdl_rms_delay_spread_ns": float(self.tdl_rms_delay_spread_ns),
+            "tdl_doppler_hz": float(self.tdl_doppler_hz),
+            "tdl_doppler_spread_hz": float(self.tdl_doppler_spread_hz),
+            "tdl_snr_db": float(self.tdl_snr_db),
+            "tdl_seed": int(self.tdl_seed),
+            "tdl_normalize_power": bool(self.tdl_normalize_power),
             "tx_frame_count": int(self.tx_frame_count),
             "tx_cycle_frame_count": int(getattr(self, "_tx_cycle_frame_count", self.tx_frame_count)),
             "inter_frame_guard_len": int(self.inter_frame_guard_len),
@@ -2348,7 +2776,8 @@ class FDIDMHardwareTest:
 
 
 if __name__ == "__main__":
-    tb = FDIDMHardwareTest(fdidm_m=16, fdidm_n=16)
+    tb = FDIDMHardwareTest(fdidm_m=16, fdidm_n=16, channel_mode="tdl_a")
     st = tb.get_status()
-    print(f"v21 paper-strict rx-probe/cache ready: chain={st['chain']}, frame_len={st['frame_len']} samples "
+    print(f"v24 one-shot full-H + NTN-TDL ready: chain={st['chain']}, channel={st['channel_mode']}, "
+          f"frame_len={st['frame_len']} samples "
           f"({st['frame_len'] / st['sample_rate'] * 1000:.2f} ms at {st['sample_rate'] / 1e6:.2f} MHz)")

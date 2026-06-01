@@ -92,7 +92,7 @@ class FDIDMHardwareTestTab(QWidget):
         hw.addWidget(self.fc_spin, 2, 1)
         layout.addWidget(hw_group)
 
-        fd_group = QGroupBox("FDIDM 论文链路参数 v23（full-H_TF / diag-TF 可切换）")
+        fd_group = QGroupBox("FDIDM 论文链路参数 v24（full-H_TF 一次辨识 + NTN-TDL 软件信道）")
         fd = QGridLayout(fd_group)
         fd.setHorizontalSpacing(8)
         fd.setVerticalSpacing(8)
@@ -110,8 +110,20 @@ class FDIDMHardwareTestTab(QWidget):
         self.channel_estimator_combo = QComboBox()
         self.channel_estimator_combo.addItem("严格 full-H_TF（论文 Eq.20/29）", "full_htf")
         self.channel_estimator_combo.addItem("快速 diag-TF（硬件链路自检）", "diag_tf")
-        self.htf_update_spin = self._spin(1, 10000, 1000)
+        self.htf_update_spin = self._spin(1, 10000, 10000)
+        self.htf_once_check = QCheckBox("full-H_TF 仅首次辨识，之后固定复用 H 缓存")
+        self.htf_once_check.setChecked(True)
         self.process_interval_spin = self._spin(30, 2000, 250)
+        self.channel_mode_combo = QComboBox()
+        self.channel_mode_combo.addItem("USRP RF 实测（无软件信道）", "rf")
+        self.channel_mode_combo.addItem("软件 NTN-TDL-A（NLOS/Rayleigh）", "tdl_a")
+        self.channel_mode_combo.addItem("软件 NTN-TDL-C（LOS/Rician）", "tdl_c")
+        self.channel_mode_combo.addItem("软件 NTN-TDL-D（LOS/Rician）", "tdl_d")
+        self.tdl_ds_spin = self._dspin(0.0, 100000.0, 1000.0, 1, " ns", step=100.0)
+        self.tdl_fd_spin = self._dspin(-500000.0, 500000.0, 0.0, 1, " Hz", step=100.0)
+        self.tdl_spread_spin = self._dspin(0.0, 500000.0, 0.0, 1, " Hz", step=100.0)
+        self.tdl_snr_spin = self._dspin(-10.0, 100.0, 35.0, 1, " dB", step=1.0)
+        self.btn_reset_hcache = QPushButton("清空 full-H 缓存 / 下帧重新辨识")
         fd.addWidget(QLabel("α"), 0, 0)
         fd.addWidget(self.alpha_spin, 0, 1)
         fd.addWidget(QLabel("β"), 0, 2)
@@ -136,28 +148,41 @@ class FDIDMHardwareTestTab(QWidget):
         fd.addWidget(self.train_amp_spin, 5, 1)
         fd.addWidget(QLabel("信道估计"), 5, 2)
         fd.addWidget(self.channel_estimator_combo, 5, 3)
-        fd.addWidget(QLabel("full-H更新间隔"), 6, 0)
+        fd.addWidget(QLabel("full-H间隔*"), 6, 0)
         fd.addWidget(self.htf_update_spin, 6, 1)
         fd.addWidget(QLabel("处理间隔"), 6, 2)
         fd.addWidget(self.process_interval_spin, 6, 3)
+        fd.addWidget(self.htf_once_check, 7, 0, 1, 4)
+        fd.addWidget(QLabel("信道模式"), 8, 0)
+        fd.addWidget(self.channel_mode_combo, 8, 1, 1, 3)
+        fd.addWidget(QLabel("TDL RMS-DS"), 9, 0)
+        fd.addWidget(self.tdl_ds_spin, 9, 1)
+        fd.addWidget(QLabel("公共Doppler"), 9, 2)
+        fd.addWidget(self.tdl_fd_spin, 9, 3)
+        fd.addWidget(QLabel("Doppler扩展"), 10, 0)
+        fd.addWidget(self.tdl_spread_spin, 10, 1)
+        fd.addWidget(QLabel("软件信道SNR"), 10, 2)
+        fd.addWidget(self.tdl_snr_spin, 10, 3)
         self.btn_ofdm = QPushButton("OFDM 特例\nα=0 β=0")
         self.btn_otfs = QPushButton("OTFS 特例\nα=1 β=1")
         self.btn_reco = QPushButton("推荐初值\nα=0.5 β=1")
         self.btn_apply_params = QPushButton("应用 FDIDM 参数")
-        fd.addWidget(self.btn_ofdm, 7, 0, 1, 2)
-        fd.addWidget(self.btn_otfs, 7, 2, 1, 2)
-        fd.addWidget(self.btn_reco, 8, 0, 1, 2)
-        fd.addWidget(self.btn_apply_params, 8, 2, 1, 2)
-        self.auto_apply_check = QCheckBox("FDIDM 参数改动后自动应用（运行中会停止/重启，不建议实时开启）")
+        fd.addWidget(self.btn_ofdm, 11, 0, 1, 2)
+        fd.addWidget(self.btn_otfs, 11, 2, 1, 2)
+        fd.addWidget(self.btn_reco, 12, 0, 1, 2)
+        fd.addWidget(self.btn_apply_params, 12, 2, 1, 2)
+        fd.addWidget(self.btn_reset_hcache, 13, 0, 1, 4)
+        self.auto_apply_check = QCheckBox("FDIDM/信道参数改动后自动应用（运行中会停止/重启，不建议实时开启）")
         self.auto_apply_check.setChecked(False)
-        fd.addWidget(self.auto_apply_check, 9, 0, 1, 4)
+        fd.addWidget(self.auto_apply_check, 14, 0, 1, 4)
         strict_note = QLabel(
-            "v23：严格模式使用 MN 个 TF 基向量估计完整 H_TF，并按 H=ΦH_TF A 做跨域 ZF/MMSE。\n"
-            "diag-TF 仅用于先验证 USRP 线缆/同步/增益是否稳定，不代表完整论文接收机。\n"
-            "full-H更新间隔=1 表示每帧重估；静态线缆建议 1000，即只在链路变差或手动改参后重估，可避免坏 H 缓存导致星座图突然散开。处理间隔单位 ms。"
+            "v24：严格模式使用 MN 个 TF 基向量估计完整 H_TF，并按 H=ΦH_TF A 做跨域 ZF/MMSE；"
+            "默认只做一次性信道辨识，之后固定复用 H 缓存，不再每帧重估。\n"
+            "软件信道模式旁路 USRP RF，形成 TX 基带 → NTN-TDL-A/C/D → RX probe 的可控闭环；RF模式保持原 USRP B210 收发链路。\n"
+            "TDL-A 为 NLOS/Rayleigh，TDL-C/D 为 LOS/Rician；公共 Doppler 作用到所有 tap，Doppler扩展作用到 Rayleigh tap。*仅取消“一次辨识”时，full-H间隔才作为兼容周期重估参数。"
         )
         strict_note.setWordWrap(True)
-        fd.addWidget(strict_note, 10, 0, 1, 4)
+        fd.addWidget(strict_note, 15, 0, 1, 4)
         layout.addWidget(fd_group)
 
         modem_group = QGroupBox("收发与解调配置")
@@ -364,11 +389,16 @@ class FDIDMHardwareTestTab(QWidget):
                   self.cp_spin, self.frame_count_spin, self.guard_spin,
                   self.probe_guard_spin, self.evm_avg_spin,
                   self.train_amp_spin, self.max_order_spin,
-                  self.htf_update_spin, self.process_interval_spin):
+                  self.htf_update_spin, self.process_interval_spin,
+                  self.tdl_ds_spin, self.tdl_fd_spin,
+                  self.tdl_spread_spin, self.tdl_snr_spin):
             w.valueChanged.connect(self._on_params_changed)
         self.mod_order_combo.currentTextChanged.connect(self._on_mod_or_eq_changed)
         self.equalizer_combo.currentTextChanged.connect(self._on_mod_or_eq_changed)
         self.channel_estimator_combo.currentIndexChanged.connect(lambda _: self._on_params_changed())
+        self.channel_mode_combo.currentIndexChanged.connect(lambda _: self._on_params_changed())
+        self.htf_once_check.stateChanged.connect(lambda _: self._on_params_changed())
+        self.btn_reset_hcache.clicked.connect(self._on_reset_hcache_clicked)
         self.tx_gain_spin.valueChanged.connect(lambda v: self._apply_gain("tx", float(v)))
         self.rx_gain_spin.valueChanged.connect(lambda v: self._apply_gain("rx", float(v)))
         self.const_mode_combo.currentIndexChanged.connect(lambda _: self._push_const_mode())
@@ -385,7 +415,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
             self._push_const_mode()
-            self._log("FDIDM 论文链路后端已配置 v23（full-H_TF/diag-TF 可切换 + RX probe + H 缓存）。")
+            self._log("FDIDM 论文链路后端已配置 v24（full-H_TF 一次辨识 + NTN-TDL 软件信道 + RX probe）。")
             self._log(self._backend_summary())
             self.btn_connect.setEnabled(False)
             self.btn_start_test.setEnabled(True)
@@ -405,7 +435,7 @@ class FDIDMHardwareTestTab(QWidget):
                 self._configure_backend(self.tx_text_edit.toPlainText())
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
-            self.decode_status_label.setText("解调状态：v23 运行中，等待 USRP 接收帧…")
+            self.decode_status_label.setText("解调状态：v24 运行中，等待接收帧…")
             self._reset_runtime_curves()
             self.backend.start()
             self.test_running = True
@@ -413,7 +443,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
-            self._log("v23 硬件测试已启动。")
+            self._log("v24 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
             self.test_running = False
@@ -458,12 +488,27 @@ class FDIDMHardwareTestTab(QWidget):
         self.file_path_label.setText("可直接编辑下方文本，或加载 .txt 文件")
         self._log("已恢复严格 FDIDM 默认文本。")
 
+    def _on_reset_hcache_clicked(self):
+        if self.backend is None:
+            self._log("尚未创建后端，没有 full-H 缓存可清空。")
+            return
+        try:
+            self.backend.reset_full_htf_cache()
+            self._log("已清空 full-H_TF 缓存；下一帧将重新做一次性信道辨识。")
+            self._drain_debug_to_log()
+        except Exception as e:
+            self._log(f"清空 full-H 缓存失败: {type(e).__name__}: {e}")
+
     # =========================================================
     # Backend
     # =========================================================
     def _selected_channel_estimator(self) -> str:
         data = self.channel_estimator_combo.currentData() if hasattr(self, "channel_estimator_combo") else None
         return str(data or "full_htf")
+
+    def _selected_channel_mode(self) -> str:
+        data = self.channel_mode_combo.currentData() if hasattr(self, "channel_mode_combo") else None
+        return str(data or "rf")
 
     def _create_backend(self):
         # Backend is being recreated -> reset the debug-log cursor so we get
@@ -494,7 +539,13 @@ class FDIDMHardwareTestTab(QWidget):
             max_full_htf_order=self.max_order_spin.value(),
             channel_estimator=self._selected_channel_estimator(),
             full_htf_update_interval_frames=self.htf_update_spin.value(),
+            full_htf_once=self.htf_once_check.isChecked(),
             process_interval_ms=self.process_interval_spin.value(),
+            channel_mode=self._selected_channel_mode(),
+            tdl_rms_delay_spread_ns=self.tdl_ds_spin.value(),
+            tdl_doppler_hz=self.tdl_fd_spin.value(),
+            tdl_doppler_spread_hz=self.tdl_spread_spin.value(),
+            tdl_snr_db=self.tdl_snr_spin.value(),
         )
 
     def _configure_backend(self, tx_text: str):
@@ -522,7 +573,13 @@ class FDIDMHardwareTestTab(QWidget):
             max_full_htf_order=self.max_order_spin.value(),
             channel_estimator=self._selected_channel_estimator(),
             full_htf_update_interval_frames=self.htf_update_spin.value(),
+            full_htf_once=self.htf_once_check.isChecked(),
             process_interval_ms=self.process_interval_spin.value(),
+            channel_mode=self._selected_channel_mode(),
+            tdl_rms_delay_spread_ns=self.tdl_ds_spin.value(),
+            tdl_doppler_hz=self.tdl_fd_spin.value(),
+            tdl_doppler_spread_hz=self.tdl_spread_spin.value(),
+            tdl_snr_db=self.tdl_snr_spin.value(),
         )
         self._push_const_mode()
 
@@ -677,7 +734,7 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _update_decode_status(self, stats, status):
         ok = bool(stats.get("decode_ok", False))
-        head = "解调状态：v23 CRC 通过，文本已恢复" if ok else "解调状态：v23 尚未恢复"
+        head = "解调状态：v24 CRC 通过，文本已恢复" if ok else "解调状态：v24 尚未恢复"
         evm_avg = float(status.get("evm_average_percent", np.nan))
         evm_inst = float(status.get("evm_instant_percent", np.nan))
         evm_avg_text = "nan" if not np.isfinite(evm_avg) else f"{evm_avg:.2f}%"
@@ -693,7 +750,9 @@ class FDIDMHardwareTestTab(QWidget):
             f"EVM(inst)={evm_inst_text}, Hleak={float(status.get('htf_leakage',0.0)):.3f}, "
             f"cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
             f"resφ={float(status.get('residual_phase_deg',np.nan)):.1f}°, RX={int(status.get('rx_samples_seen',0))}, "
-            f"mode={status.get('channel_estimator','')}, rx_mode={status.get('rx_probe_mode','')}, "
+            f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, "
+            f"fd={float(status.get('tdl_doppler_hz',0.0)):.1f}Hz, rx_mode={status.get('rx_probe_mode','')}, "
+            f"H1shot={bool(status.get('full_htf_once',True))}, "
             f"Hcache={bool(status.get('full_htf_cached',False))}/{int(status.get('full_htf_estimates',0))}"
         )
 
@@ -703,7 +762,7 @@ class FDIDMHardwareTestTab(QWidget):
             return
         self._last_runtime_log_time = now
         self._log(
-            "v23 runtime: "
+            "v24 runtime: "
             f"reason={status.get('reason','')}, "
             f"frames={int(status.get('frames_decode_ok',0))}/{int(status.get('frames_processed',0))} "
             f"(decode_ok/processed), monitor_cycles={int(status.get('monitor_cycles',0))}, "
@@ -717,7 +776,10 @@ class FDIDMHardwareTestTab(QWidget):
             f"noise_var={float(status.get('noise_var',np.nan)):.2e}, "
             f"alpha/beta={float(status.get('alpha',0)):.3f}/{float(status.get('beta',0)):.3f}, "
             f"mode={status.get('channel_estimator','')}, use_full={bool(status.get('use_full_htf',False))}, "
-            f"rx_mode={status.get('rx_probe_mode','')}, Hcache={bool(status.get('full_htf_cached',False))}/{int(status.get('full_htf_estimates',0))}, "
+            f"ch={status.get('channel_mode','')}, fd={float(status.get('tdl_doppler_hz',0.0)):.1f}Hz, "
+            f"spread={float(status.get('tdl_doppler_spread_hz',0.0)):.1f}Hz, "
+            f"rx_mode={status.get('rx_probe_mode','')}, H1shot={bool(status.get('full_htf_once',True))}, "
+            f"Hcache={bool(status.get('full_htf_cached',False))}/{int(status.get('full_htf_estimates',0))}, "
             f"decode_ok={bool(stats.get('decode_ok',False))}, "
             f"match={int(stats.get('match_bytes',0))}/{int(stats.get('expected_bytes',0))}"
         )
@@ -869,7 +931,10 @@ class FDIDMHardwareTestTab(QWidget):
             f"链路={st.get('chain')}, 模式={st.get('channel_estimator')}, use_full={st.get('use_full_htf')}, "
             f"MxN={st.get('fdidm_m')}x{st.get('fdidm_n')}, CP={st.get('cp_len')}, "
             f"full-H_TF阶数={st.get('full_htf_order')}, 训练块={st.get('htf_training_blocks')}, TX随机帧={st.get('tx_cycle_frame_count', st.get('tx_frame_count'))}, "
-            f"H更新间隔={st.get('full_htf_update_interval_frames')}, 处理间隔={st.get('process_interval_ms'):.0f}ms, "
+            f"H一次辨识={st.get('full_htf_once')}, H缓存={st.get('full_htf_cached')}/{st.get('full_htf_estimates')}, "
+            f"信道={st.get('channel_mode')}, DS={float(st.get('tdl_rms_delay_spread_ns',0.0)):.1f}ns, "
+            f"fd={float(st.get('tdl_doppler_hz',0.0)):.1f}Hz, spread={float(st.get('tdl_doppler_spread_hz',0.0)):.1f}Hz, "
+            f"SNR={float(st.get('tdl_snr_db',0.0)):.1f}dB, 处理间隔={st.get('process_interval_ms'):.0f}ms, "
             f"rx_mode={st.get('rx_probe_mode')}, Fs={st.get('samp_rate'):.0f} Hz, "
             f"调制={st.get('mod_order')}, EQ={st.get('equalizer')}, "
             f"α={st.get('alpha'):.2f}, β={st.get('beta'):.2f}, "
