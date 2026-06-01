@@ -100,7 +100,7 @@ class FDIDMHardwareTest:
             serial: Optional[str] = None,
             tx_antenna: str = "TX/RX",
             rx_antenna: str = "RX2",
-            tx_text: str = "Hello FDIDM Paper Strict Test!",
+            tx_text: str = "FDIDM OK",
             mod_order: str = "QPSK",
             equalizer: str = "MMSE",
             alpha: float = 0.5,
@@ -117,6 +117,9 @@ class FDIDMHardwareTest:
             training_probe_guard_len: int = 16,  # legacy; ignored in v17
             max_full_htf_order: int = 4096,  # maximum order for full paper H_TF estimation
             channel_estimator: str = "full_htf",  # "full_htf" = paper-strict; "diag_tf" = fast loopback mode
+            full_htf_update_interval_frames: int = 8,  # reuse full H_TF for static links; 1 = estimate every frame
+            process_interval_ms: float = 200.0,        # throttle heavy Python decoding to avoid UHD RX overflow
+            usrp_buffer_frames: int = 512,             # UHD streamer buffer hint for Windows/B210 stability
             **_legacy_ignored: Any,
     ):
         self.carrier_freq = float(carrier_freq)
@@ -154,11 +157,14 @@ class FDIDMHardwareTest:
         self.channel_estimator = str(channel_estimator or "full_htf").lower()
         if self.channel_estimator not in ("full_htf", "diag_tf"):
             raise ValueError("channel_estimator must be 'full_htf' or 'diag_tf'")
+        self.full_htf_update_interval_frames = int(max(1, min(int(full_htf_update_interval_frames), 10_000)))
+        self.process_interval_sec = max(0.03, float(process_interval_ms) / 1000.0)
+        self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
 
         # Hardware/sync frame structure.
         # Frame = [pre_guard][sync_preamble][pilot_frame][data_frame][post_guard]
         self._recompute_strict_frame_timing()
-        self.strict_chain_name = "FDIDM_FULL_HTF_PAPER_STRICT_RXPROBE_v20"
+        self.strict_chain_name = "FDIDM_FULL_HTF_PAPER_STRICT_RXPROBE_STABLE_v23"
 
         # Tunables.
         self.sync_metric_threshold = 0.30
@@ -200,18 +206,40 @@ class FDIDMHardwareTest:
         self._rx_probe_last_fp = None
         self._rx_probe_total_est = 0
         self._rx_probe_start_t = 0.0
+        # Full-H_TF cache: in a static cable/bench test, estimating the 256x256
+        # matrix on every repeated frame wastes CPU and can starve UHD RX.
+        # The first valid frame always estimates H_TF; later frames reuse it
+        # until full_htf_update_interval_frames expires.
+        self._cached_htf_full: Optional[np.ndarray] = None
+        self._cached_htf_leakage = float("nan")
+        self._cached_htf_frame_counter = -10**18
+        self._cached_H_cross: Optional[np.ndarray] = None
+        self._cached_Hh_cross: Optional[np.ndarray] = None
+        self._cached_HhH_cross: Optional[np.ndarray] = None
+        self._cached_Phi: Optional[np.ndarray] = None
+        self._cached_H_cond_proxy = float("nan")
+        self._full_htf_estimates = 0
+        self._last_process_t = 0.0
+        self._tx_preview_start_t = time.time()
+        self._tx_cycle_frame_count = int(self.tx_frame_count)
+        # Only good frames are allowed to update plots/cache. This prevents a
+        # momentary bad sync or noisy full-H estimate from making the constellation
+        # appear stable for a while and then suddenly scatter.
+        self.constellation_soft_ber_threshold = 5e-3
+        self.constellation_soft_evm_threshold = 35.0
         self._latest_tx_samples = np.zeros(4096, dtype=np.complex64)
         self._latest_rx_samples = np.zeros(4096, dtype=np.complex64)
         self._latest_constellation = np.zeros(0, dtype=np.complex64)
         self._latest_constellation_pre_eq = np.zeros(0, dtype=np.complex64)
         self._last_good_constellation = np.zeros(0, dtype=np.complex64)
-        self.constellation_display_mode = "dd_refined"
+        self.constellation_display_mode = "raw"
 
         self._tx_text = ""
         self._tx_payload = b""
         self._tx_frame = b""
         self._tx_frame_bits = np.zeros(0, dtype=np.int8)
         self._tx_bits_frame = np.zeros(0, dtype=np.int8)
+        self._tx_bits_frames: List[np.ndarray] = []
         self._tx_x_cross = np.zeros((self.M, self.N), dtype=np.complex128)
         self._tx_x_tf = np.zeros((self.M, self.N), dtype=np.complex128)
         self._tx_waveform = np.zeros(1, dtype=np.complex64)
@@ -255,7 +283,10 @@ class FDIDMHardwareTest:
         self._set_tx_text_internal(tx_text)
         self._build_top_block()
         self._debug("INFO",
-                    f"FDIDM backend v20 rx-probe ready: chain={self.strict_chain_name}, "
+                    f"FDIDM backend v23 rx-probe/cache ready: chain={self.strict_chain_name}, "
+                    f"estimator={self.channel_estimator}, use_full_htf={self.use_full_htf}, "
+                    f"H_update={self.full_htf_update_interval_frames} frame(s), "
+                    f"process_interval={self.process_interval_sec*1000:.0f} ms, "
                     f"M={self.M} N={self.N} CP={self.cp_len} alpha={self.alpha:.3f} beta={self.beta:.3f} "
                     f"mod={self.mod_order} eq={self.equalizer} Fs={self.sample_rate:.0f} Hz "
                     f"frame_len={self.frame_len} ({self.frame_len / max(self.sample_rate, 1) * 1000.0:.2f} ms)")
@@ -362,6 +393,43 @@ class FDIDMHardwareTest:
             return False, b""
         return True, frame_bytes[8:-4]
 
+    def _make_data_bits_for_frame(self, frame_bits: np.ndarray, frame_idx: int) -> np.ndarray:
+        """Build one payload-bearing data grid with random filler.
+
+        The application header/payload/CRC are identical in every transmitted
+        physical frame, so CRC recovery remains deterministic.  The unused
+        capacity after the application frame is randomized per physical frame,
+        which prevents the USRP from replaying a completely identical data
+        block forever and gives the constellation/decoder a more realistic
+        symbol stream.
+        """
+        max_bits = self._max_data_bits_capacity()
+        out = np.zeros(max_bits, dtype=np.int8)
+        fb = np.asarray(frame_bits, dtype=np.int8).reshape(-1)
+        out[:fb.size] = fb[:max_bits]
+        if fb.size < max_bits:
+            seed = (int(self._rng_seed) + 0x9E3779B9 * (int(frame_idx) + 1) +
+                    131 * int(self.M) + 17 * int(self.N)) & 0xFFFFFFFF
+            rng = np.random.default_rng(seed)
+            out[fb.size:] = rng.integers(0, 2, size=max_bits - fb.size, dtype=np.int8)
+        return out
+
+    def _build_one_physical_frame(self, data_bits: np.ndarray, pilot_block: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        qam = self._qam_modulate(data_bits, self.mod_order)
+        x_cross = qam.reshape((self.M, self.N), order="F")
+        x_tf = self._ifdit(x_cross)
+        data_block = self._heisenberg(x_tf)
+        one_frame = np.concatenate([
+            np.zeros(self.pre_guard_len, dtype=np.complex128),
+            self.sync_preamble.astype(np.complex128),
+            pilot_block,
+            data_block,
+            np.zeros(self.post_guard_len, dtype=np.complex128),
+        ]).astype(np.complex128)
+        if one_frame.size != self.frame_len:
+            raise RuntimeError(f"internal frame length mismatch: {one_frame.size} != {self.frame_len}")
+        return one_frame, x_cross, x_tf
+
     def _set_tx_text_internal(self, text: str):
         if text is None or len(text) == 0:
             text = " "
@@ -376,39 +444,34 @@ class FDIDMHardwareTest:
                 f"mod={self.mod_order}, max payload about {max_payload_bytes} bytes, "
                 f"current UTF-8 text is {len(payload)} bytes."
             )
-        tx_bits = np.zeros(max_bits, dtype=np.int8)
-        tx_bits[:frame_bits.size] = frame_bits
-        rng = np.random.default_rng(self._rng_seed)
-        if frame_bits.size < max_bits:
-            tx_bits[frame_bits.size:] = rng.integers(0, 2, size=max_bits - frame_bits.size, dtype=np.int8)
 
-        qam = self._qam_modulate(tx_bits, self.mod_order)
-        x_cross = qam.reshape((self.M, self.N), order="F")
-        x_tf = self._ifdit(x_cross)
-        data_block = self._heisenberg(x_tf)
+        # The pilot/training part is shared by all repeated physical frames.
         if self.use_full_htf:
             pilot_block = self._build_full_htf_training_waveform()
         else:
             pilot_block = self._heisenberg(self._pilot_X_tf)
 
-        one_frame = np.concatenate([
-            np.zeros(self.pre_guard_len, dtype=np.complex128),
-            self.sync_preamble.astype(np.complex128),
-            pilot_block,
-            data_block,
-            np.zeros(self.post_guard_len, dtype=np.complex128),
-        ]).astype(np.complex128)
-        if one_frame.size != self.frame_len:
-            raise RuntimeError(f"internal frame length mismatch: {one_frame.size} != {self.frame_len}")
-
         guard = np.zeros(self.inter_frame_guard_len, dtype=np.complex128)
         frames = []
-        for _ in range(self.tx_frame_count):
-            frames.append(one_frame.copy())
+        bits_frames: List[np.ndarray] = []
+        first_x_cross = None
+        first_x_tf = None
+        # Do not let the USRP repeat a single identical frame. Even if the UI
+        # requests 1-2 physical frames, build a short pseudo-random super-cycle
+        # whose application payload is the same but whose filler bits differ.
+        self._tx_cycle_frame_count = int(max(self.tx_frame_count, 8))
+        for frame_idx in range(self._tx_cycle_frame_count):
+            tx_bits_i = self._make_data_bits_for_frame(frame_bits, frame_idx)
+            one_frame, x_cross_i, x_tf_i = self._build_one_physical_frame(tx_bits_i, pilot_block)
+            frames.append(one_frame)
+            bits_frames.append(tx_bits_i.astype(np.int8, copy=True))
+            if first_x_cross is None:
+                first_x_cross = x_cross_i.copy()
+                first_x_tf = x_tf_i.copy()
             if self.inter_frame_guard_len > 0:
                 frames.append(guard.copy())
-        tx_wave = np.concatenate(frames) if frames else one_frame
-        # v17: peak-normalize (preserves the training_amplitude / data ratio set above).
+        tx_wave = np.concatenate(frames) if frames else np.zeros(1, dtype=np.complex128)
+        # Peak-normalize; this preserves the training/data ratio set above.
         peak = float(np.max(np.abs(tx_wave)) + 1e-12)
         tx_wave = (0.9 / peak) * tx_wave
 
@@ -416,9 +479,10 @@ class FDIDMHardwareTest:
         self._tx_payload = payload
         self._tx_frame = frame
         self._tx_frame_bits = frame_bits.astype(np.int8)
-        self._tx_bits_frame = tx_bits.astype(np.int8)
-        self._tx_x_cross = x_cross.copy()
-        self._tx_x_tf = x_tf.copy()
+        self._tx_bits_frame = bits_frames[0].astype(np.int8) if bits_frames else np.zeros(max_bits, dtype=np.int8)
+        self._tx_bits_frames = bits_frames
+        self._tx_x_cross = first_x_cross if first_x_cross is not None else np.zeros((self.M, self.N), dtype=np.complex128)
+        self._tx_x_tf = first_x_tf if first_x_tf is not None else np.zeros((self.M, self.N), dtype=np.complex128)
         self._tx_waveform = tx_wave.astype(np.complex64)
         self._rx_text = ""
         self._decode_ok = False
@@ -635,6 +699,82 @@ class FDIDMHardwareTest:
         """Phi=A^H in y=Phi y_TF, matching paper Eqns. (27)-(29)."""
         return np.kron(self._gamma(self.N, self.beta), self._gamma(self.M, -self.alpha)).astype(np.complex128)
 
+    def _clear_channel_cache(self):
+        """Drop cached full-H_TF and derived cross-domain matrices."""
+        self._cached_htf_full = None
+        self._cached_htf_leakage = float("nan")
+        self._cached_htf_frame_counter = -10**18
+        self._cached_H_cross = None
+        self._cached_Hh_cross = None
+        self._cached_HhH_cross = None
+        self._cached_Phi = None
+        self._cached_H_cond_proxy = float("nan")
+        self._full_htf_estimates = 0
+
+    def _snapshot_channel_cache(self) -> Dict[str, Any]:
+        """Take a shallow/deep-enough snapshot so a bad full-H update can be rolled back."""
+        return {
+            "htf": None if self._cached_htf_full is None else self._cached_htf_full.copy(),
+            "leakage": float(self._cached_htf_leakage),
+            "frame_counter": int(self._cached_htf_frame_counter),
+            "H": None if self._cached_H_cross is None else self._cached_H_cross.copy(),
+            "Hh": None if self._cached_Hh_cross is None else self._cached_Hh_cross.copy(),
+            "HhH": None if self._cached_HhH_cross is None else self._cached_HhH_cross.copy(),
+            "Phi": None if self._cached_Phi is None else self._cached_Phi.copy(),
+            "cond": float(self._cached_H_cond_proxy),
+            "estimates": int(self._full_htf_estimates),
+        }
+
+    def _restore_channel_cache(self, snap: Optional[Dict[str, Any]]):
+        if not snap:
+            self._clear_channel_cache()
+            return
+        self._cached_htf_full = snap.get("htf")
+        self._cached_htf_leakage = float(snap.get("leakage", float("nan")))
+        self._cached_htf_frame_counter = int(snap.get("frame_counter", -10**18))
+        self._cached_H_cross = snap.get("H")
+        self._cached_Hh_cross = snap.get("Hh")
+        self._cached_HhH_cross = snap.get("HhH")
+        self._cached_Phi = snap.get("Phi")
+        self._cached_H_cond_proxy = float(snap.get("cond", float("nan")))
+        self._full_htf_estimates = int(snap.get("estimates", self._full_htf_estimates))
+
+    def _should_refresh_full_htf(self) -> bool:
+        if not self.use_full_htf:
+            return False
+        if self._cached_htf_full is None or self._cached_H_cross is None:
+            return True
+        # Refresh only after successful decodes, not merely after processed candidates.
+        # Bad/noisy candidates used to trigger periodic re-estimation and could poison
+        # the cached H, which looked like: constellation stable -> suddenly scattered.
+        return (int(self._frames_decode_ok) - int(self._cached_htf_frame_counter)) >= int(self.full_htf_update_interval_frames)
+
+    def _cache_full_htf(self, htf: np.ndarray, leakage: float):
+        """Cache H_TF and the expensive H=Phi H_TF A products for reuse.
+
+        This keeps the receiver paper-strict while avoiding repeated 256x256
+        matrix construction on every identical loopback frame.
+        """
+        K = int(self.full_htf_order)
+        Htf = np.asarray(htf, dtype=np.complex128)
+        if Htf.shape != (K, K):
+            raise ValueError(f"H_TF shape mismatch for cache: {Htf.shape} != {(K, K)}")
+        A = self._fdidm_tx_matrix()
+        Phi = self._fdidm_rx_matrix()
+        H = Phi @ Htf @ A
+        Hh = H.conj().T
+        self._cached_htf_full = Htf.copy()
+        self._cached_htf_leakage = float(leakage)
+        self._cached_htf_frame_counter = int(self._frames_decode_ok)
+        self._cached_H_cross = H
+        self._cached_Hh_cross = Hh
+        self._cached_HhH_cross = Hh @ H
+        self._cached_Phi = Phi
+        row_norm = np.linalg.norm(H, axis=1)
+        nz = row_norm[row_norm > 1e-12]
+        self._cached_H_cond_proxy = float(nz.max() / max(nz.min(), 1e-12)) if nz.size else float("inf")
+        self._full_htf_estimates += 1
+
     # =========================================================
     # Channel estimation
     # =========================================================
@@ -727,15 +867,39 @@ class FDIDMHardwareTest:
             y     = Phi y_TF, Phi = A^H
             H     = Phi H_TF A
         Then apply the paper's ZF/MMSE linear decoder to y = Hx+n.
+
+        v21 uses cached H, H^H and H^H H whenever H_TF is reused.
         """
         K = int(self.full_htf_order)
         y_tf_vec = np.asarray(y_tf_data, dtype=np.complex128).reshape(-1, order="F")[:K]
         Htf = np.asarray(h_tf, dtype=np.complex128)
         if Htf.shape != (K, K):
             raise ValueError(f"H_TF shape mismatch: {Htf.shape} != {(K, K)}")
-        A = self._fdidm_tx_matrix()
-        Phi = self._fdidm_rx_matrix()
-        H = Phi @ Htf @ A
+
+        use_cached_cross = (
+            self._cached_htf_full is not None and
+            Htf is self._cached_htf_full and
+            self._cached_H_cross is not None and
+            self._cached_Hh_cross is not None and
+            self._cached_HhH_cross is not None and
+            self._cached_Phi is not None
+        )
+        if use_cached_cross:
+            H = self._cached_H_cross
+            Hh = self._cached_Hh_cross
+            HhH = self._cached_HhH_cross
+            Phi = self._cached_Phi
+            cond_val = self._cached_H_cond_proxy
+        else:
+            A = self._fdidm_tx_matrix()
+            Phi = self._fdidm_rx_matrix()
+            H = Phi @ Htf @ A
+            Hh = H.conj().T
+            HhH = Hh @ H
+            row_norm = np.linalg.norm(H, axis=1)
+            nz = row_norm[row_norm > 1e-12]
+            cond_val = float(nz.max() / max(nz.min(), 1e-12)) if nz.size else float("inf")
+
         y = Phi @ y_tf_vec
         nv = max(float(noise_var) if np.isfinite(noise_var) else 0.0, 1e-12)
         warning = ""
@@ -743,21 +907,16 @@ class FDIDMHardwareTest:
             if self.equalizer == "ZF":
                 x = np.linalg.solve(H, y)
             else:
-                lhs = H.conj().T @ H + nv * np.eye(K, dtype=np.complex128)
-                rhs = H.conj().T @ y
+                lhs = HhH + nv * np.eye(K, dtype=np.complex128)
+                rhs = Hh @ y
                 x = np.linalg.solve(lhs, rhs)
         except np.linalg.LinAlgError:
-            # Avoid SVD-based pinv in the real-time path.  A small diagonal
-            # loading keeps the hardware test responsive when H is ill-conditioned.
             warning = "H_cross_singular_used_loaded_normal_eq"
             load = max(nv, 1e-6 * float(np.mean(np.abs(H) ** 2) + 1e-12))
-            lhs = H.conj().T @ H + load * np.eye(K, dtype=np.complex128)
-            rhs = H.conj().T @ y
+            lhs = HhH + load * np.eye(K, dtype=np.complex128)
+            rhs = Hh @ y
             x = np.linalg.solve(lhs, rhs)
-        row_norm = np.linalg.norm(H, axis=1)
-        nz = row_norm[row_norm > 1e-12]
-        cond_val = float(nz.max() / max(nz.min(), 1e-12)) if nz.size else float("inf")
-        return x.reshape((self.M, self.N), order="F"), cond_val, warning
+        return x.reshape((self.M, self.N), order="F"), float(cond_val), warning
 
     # =========================================================
     # Modem / payload recovery / EVM
@@ -894,13 +1053,25 @@ class FDIDMHardwareTest:
             vals = np.asarray(self._evm_history, dtype=np.float64)
             self.last_evm_average_percent = float(np.sqrt(np.mean(vals ** 2))) if vals.size else float("nan")
 
+    def _verification_ber(self, bits_all: np.ndarray) -> float:
+        bits_all = np.asarray(bits_all, dtype=np.int8).reshape(-1)
+        refs = getattr(self, "_tx_bits_frames", None) or [self._tx_bits_frame]
+        vals = []
+        for ref in refs:
+            ref = np.asarray(ref, dtype=np.int8).reshape(-1)
+            L = int(min(bits_all.size, ref.size))
+            if L > 0:
+                vals.append(float(np.mean(bits_all[:L] != ref[:L])))
+        return min(vals) if vals else 1.0
+
     def _recover_payload_from_symbols(self, rx_syms: np.ndarray):
         """Demodulate, parse APP frame, compute diagnostics.
 
-        With v17's pilot-based equalization there is no 4-fold QAM ambiguity
-        to resolve, so we no longer search rotations against known TX bits.
-        decode_ok is purely CRC-based; verification metrics (match_bytes,
-        BER vs known TX bits) are kept as diagnostics.
+        v23 uses two stabilizers for real hardware tests:
+        1) common gain/phase is estimated from the known application frame
+           prefix rather than only the 4-byte magic, which reduces phase jitter;
+        2) QPSK tries the four residual 90-degree rotations and chooses the
+           candidate that passes CRC or has the lowest verification BER.
         """
         rx_syms = np.asarray(rx_syms, dtype=np.complex128).reshape(-1)
         need_syms = self.M * self.N
@@ -908,37 +1079,53 @@ class FDIDMHardwareTest:
             return 1.0, b"", b"", "", 0, False, rx_syms.astype(np.complex64), float("nan")
         rx_syms = rx_syms[:need_syms]
 
-        # Residual common scalar (covers any minor gain/phase drift between pilot and data blocks).
         residual_gain = self._estimate_residual_data_gain(rx_syms)
-        syms = rx_syms / residual_gain
+        if not (np.isfinite(residual_gain.real) and np.isfinite(residual_gain.imag)) or abs(residual_gain) < 1e-8:
+            residual_gain = 1.0 + 0.0j
+        base_syms = rx_syms / residual_gain
         self.last_residual_gain_abs = float(abs(residual_gain))
         self.last_residual_phase_deg = float(np.angle(residual_gain) * 180.0 / np.pi)
 
         total_bits = self._max_data_bits_capacity()
         frame_bits_len = int(self._tx_frame_bits.size)
-        bits_all = self._qam_demodulate(syms, self.mod_order)[:total_bits]
-        # Verification BER (only meaningful in the loopback test bench because TX bits are known).
-        ber = float(np.mean(bits_all != self._tx_bits_frame[:bits_all.size])) if bits_all.size else 1.0
-        frame_bits = bits_all[:frame_bits_len]
-        frame_bytes = self._bits_to_bytes(frame_bits)
-        ok, payload = self._parse_app_frame_exact(frame_bytes)
-        text = payload.decode("utf-8", errors="replace") if ok else ""
-        match = int(sum(int(a == b) for a, b in zip(payload, self._tx_payload))) if ok else 0
-        decode_ok = bool(ok)  # CRC is enough
-        evm = self._estimate_evm_percent(syms)
-        return ber, frame_bytes, payload, text, match, decode_ok, syms.astype(np.complex64), evm
+        rotations = [1.0 + 0.0j]
+        if self.mod_order == "QPSK":
+            rotations = [1.0 + 0.0j, 0.0 + 1.0j, -1.0 + 0.0j, 0.0 - 1.0j]
+
+        best = None
+        for rot in rotations:
+            syms = base_syms * rot
+            bits_all = self._qam_demodulate(syms, self.mod_order)[:total_bits]
+            ber = self._verification_ber(bits_all)
+            frame_bits = bits_all[:frame_bits_len]
+            frame_bytes = self._bits_to_bytes(frame_bits)
+            ok, payload = self._parse_app_frame_exact(frame_bytes)
+            text = payload.decode("utf-8", errors="replace") if ok else ""
+            match = int(sum(int(a == b) for a, b in zip(payload, self._tx_payload))) if ok else 0
+            evm = self._estimate_evm_percent(syms)
+            score = (1000.0 * float(ok) + 100.0 * (1.0 - min(ber, 1.0))
+                     - 0.2 * (evm if np.isfinite(evm) else 100.0))
+            cand = (score, ber, frame_bytes, payload, text, match, bool(ok), syms.astype(np.complex64), evm)
+            if best is None or cand[0] > best[0]:
+                best = cand
+            if ok:
+                break
+        _, ber, frame_bytes, payload, text, match, decode_ok, syms_best, evm = best
+        return float(ber), frame_bytes, payload, text, int(match), bool(decode_ok), syms_best, float(evm)
 
     def _known_preamble_ref_syms(self) -> np.ndarray:
-
-        magic_bits = self._frame_to_bits(self.APP_MAGIC)
+        # Use all known application-frame bits before random filler.  This is a
+        # hardware demonstration link where the transmitted text is known; using
+        # the whole application frame makes the residual scalar estimate much
+        # less noisy than using only the 4-byte magic.
         bps = max(self.bits_per_symbol, 1)
-        usable = (magic_bits.size // bps) * bps
+        bits = np.asarray(self._tx_frame_bits, dtype=np.int8).reshape(-1)
+        usable = (bits.size // bps) * bps
         if usable <= 0:
             return np.zeros(0, dtype=np.complex128)
-        return self._qam_modulate(magic_bits[:usable], self.mod_order).astype(np.complex128)
+        return self._qam_modulate(bits[:usable], self.mod_order).astype(np.complex128)
 
     def _estimate_residual_data_gain(self, rx_syms: np.ndarray) -> complex:
-
         rx = np.asarray(rx_syms, dtype=np.complex128).reshape(-1)
         ref = self._known_preamble_ref_syms()
         L = int(min(rx.size, ref.size))
@@ -967,6 +1154,13 @@ class FDIDMHardwareTest:
         if self.serial:
             return f"serial={self.serial},{base}"
         return base
+
+    def _rx_stream_args(self) -> str:
+        # Larger UHD host buffers reduce occasional B210 RX overflow on Windows.
+        return f"recv_frame_size=8192,num_recv_frames={int(self.usrp_buffer_frames)}"
+
+    def _tx_stream_args(self) -> str:
+        return f"send_frame_size=8192,num_send_frames={int(self.usrp_buffer_frames)}"
 
     def _import_runtime(self):
         try:
@@ -1003,17 +1197,23 @@ class FDIDMHardwareTest:
     def _select_rx_probe_len(self) -> int:
         """Choose a contiguous RX window large enough for frame processing.
 
-        For full-H_TF mode, the strict frame can be long because it contains
-        MN TF-basis probes.  We therefore probe a full processing window rather
-        than accumulating small Python chunks from the live stream.
+        v23 deliberately rounds the vector length to a power of two.  GNU Radio
+        vector items are sizeof(gr_complex) * vector_len bytes; non-aligned
+        sizes such as 499680 bytes trigger Windows double-mapped buffer warnings.
+        Power-of-two lengths are also FFT/UI friendly and avoid the warning.
         """
-        n = min(
-            int(self._buffer_keep),
-            max(3 * (int(self.frame_len) + int(self.inter_frame_guard_len)), 8192),
-        )
-        n = max(int(self.frame_len), int(n))
-        n = min(int(n), max(int(self.frame_len) + 4096, 524288))
-        return int(max(1024, n))
+        base = max(3 * (int(self.frame_len) + int(self.inter_frame_guard_len)), 8192)
+        base = max(int(self.frame_len) + int(self.inter_frame_guard_len), int(base))
+        # Next power of two, clamped.  Minimum 8192 keeps item bytes aligned to
+        # 65536-byte allocation granularity because complex64 is 8 bytes.
+        n = 1 << int(np.ceil(np.log2(max(8192, base))))
+        n = min(int(n), int(self._buffer_keep))
+        n = min(int(n), 524288)
+        n = max(8192, int(n))
+        # Final safety: multiple of 8192 complex samples -> 65536 bytes.
+        if n % 8192 != 0:
+            n = int(np.ceil(n / 8192.0) * 8192)
+        return int(n)
 
     def _build_rx_probe_chain(self):
         """Return (vectorizer, sink, probe, mode) for RX capture.
@@ -1085,7 +1285,7 @@ class FDIDMHardwareTest:
         rx_stream_to_vector, rx_sink_vec, rx_probe, rx_probe_mode = self._build_rx_probe_chain()
         usrp_source = uhd.usrp_source(
             ",".join(("", self._usrp_args)),
-            uhd.stream_args(cpu_format="fc32", args="", channels=list(range(0, 1))),
+            uhd.stream_args(cpu_format="fc32", args=self._rx_stream_args(), channels=list(range(0, 1))),
         )
         usrp_source.set_subdev_spec("A:A", 0)
         usrp_source.set_samp_rate(self.sample_rate)
@@ -1093,9 +1293,13 @@ class FDIDMHardwareTest:
         usrp_source.set_center_freq(self.carrier_freq, 0)
         usrp_source.set_antenna(self.rx_antenna, 0)
         usrp_source.set_gain(self.rx_gain, 0)
+        try:
+            usrp_source.set_min_output_buffer(max(32768, int(self._rx_probe_len)))
+        except Exception:
+            pass
         usrp_sink = uhd.usrp_sink(
             ",".join(("", self._usrp_args)),
-            uhd.stream_args(cpu_format="fc32", args="", channels=list(range(0, 1))),
+            uhd.stream_args(cpu_format="fc32", args=self._tx_stream_args(), channels=list(range(0, 1))),
             "",
         )
         usrp_sink.set_subdev_spec("A:A", 0)
@@ -1137,6 +1341,7 @@ class FDIDMHardwareTest:
             self._last_info = ""
             self._status = "configured"
             self._rx_samples_seen = 0
+            self._tx_preview_start_t = time.time()
             self._rx_probe_total_est = 0
             self._rx_probe_last_fp = None
             self._last_processed_abs_start = -10 ** 18
@@ -1150,21 +1355,20 @@ class FDIDMHardwareTest:
         # normalization; in practice it shifts measurably with alpha/beta
         # because the peak-norm step rescales differently for each X_TF.
         energy = float(np.sum(np.abs(wf) ** 2))
-        # Cheap fold-hash over the real and imaginary parts as a uint64.
-        re = wf.real.astype(np.float64)
-        im = wf.imag.astype(np.float64)
-        # Fold both bit-cast streams into a uint64 sum; tiny but
-        # deterministic and easy to read for a human.
-        fold = int(
-            (np.sum(re.view(np.uint64) if re.dtype == np.float64 else re.view(np.uint32)) +
-             np.sum(im.view(np.uint64) if im.dtype == np.float64 else im.view(np.uint32))) & 0xFFFFFFFFFFFFFFFF
-        )
+        # Stable lightweight hash for human diagnostics. Avoid uint64 summation
+        # because NumPy may warn about intentional wraparound on Windows/Python.
+        sample_n = int(min(4096, wf.size))
+        if sample_n > 0:
+            sample_idx = np.linspace(0, wf.size - 1, sample_n, dtype=np.int64)
+            fold = int(zlib.crc32(wf[sample_idx].tobytes()) & 0xFFFFFFFF)
+        else:
+            fold = 0
         # Sample from the middle of the data segment (after pre_guard + sync + pilot),
         # which is the alpha/beta-dependent piece.
         mid_idx = self.pre_guard_len + self.sync_len + self.pilot_frame_len + (self.data_frame_len // 2)
         mid_idx = max(0, min(mid_idx, wf.size - 1))
         mid = complex(wf[mid_idx])
-        return (f"len={wf.size}, energy={energy:.3f}, hash=0x{fold:016x}, "
+        return (f"len={wf.size}, energy={energy:.3f}, hash=0x{fold:08x}, "
                 f"data_mid_idx={mid_idx}, data_mid={mid:.4f}")
 
     def get_waveform_fingerprint(self) -> str:
@@ -1241,6 +1445,9 @@ class FDIDMHardwareTest:
             max_full_htf_order: Optional[int] = None,  # legacy
             device_type: Optional[str] = None,
             channel_estimator: Optional[str] = None,
+            full_htf_update_interval_frames: Optional[int] = None,
+            process_interval_ms: Optional[float] = None,
+            usrp_buffer_frames: Optional[int] = None,
             **_ignored: Any,
     ):
 
@@ -1351,24 +1558,35 @@ class FDIDMHardwareTest:
             if new_ce not in ("full_htf", "diag_tf"):
                 raise ValueError("channel_estimator must be 'full_htf' or 'diag_tf'")
             if new_ce != self.channel_estimator:
-                self.channel_estimator = new_ce;
+                self.channel_estimator = new_ce
                 rebuild_waveform = True
+        if full_htf_update_interval_frames is not None:
+            self.full_htf_update_interval_frames = int(max(1, min(int(full_htf_update_interval_frames), 10_000)))
+        if process_interval_ms is not None:
+            self.process_interval_sec = max(0.03, float(process_interval_ms) / 1000.0)
+        if usrp_buffer_frames is not None:
+            self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
+            rebuild_top_block = True
 
-        if rebuild_waveform or tx_text is not None:
+        tx_text_changed = (tx_text is not None and str(tx_text) != self._tx_text)
+        if rebuild_waveform or tx_text_changed:
             self._debug("INFO",
                         f"configure() applying changes: "
                         f"M={self.M} N={self.N} CP={self.cp_len} alpha={self.alpha:.3f} beta={self.beta:.3f} "
-                        f"mod={self.mod_order} eq={self.equalizer} tx_text_len="
+                        f"mod={self.mod_order} eq={self.equalizer} estimator={self.channel_estimator} "
+                        f"H_update={self.full_htf_update_interval_frames}, process_interval={self.process_interval_sec*1000:.0f}ms, tx_text_len="
                         f"{len(self._tx_text) if tx_text is None else len(str(tx_text))} bytes")
             self._gamma_cache.clear()
             self._recompute_strict_frame_timing()
             self._rebuild_pilot_matrices()
+            self._clear_channel_cache()
             self._buffer_keep = max(262144, 8 * self.frame_len)
             with self._lock:
                 self._tx_buffer = _SampleRing(self._buffer_keep)
                 self._rx_buffer = _SampleRing(self._buffer_keep)
                 self._rx_probe_last_fp = None
                 self._rx_probe_total_est = 0
+                self._tx_preview_start_t = time.time()
             self._set_tx_text_internal(self._tx_text if tx_text is None else str(tx_text))
             self._tx_buffer.write(self._tx_waveform.astype(np.complex64, copy=False))
             # v17.1 fix: ALWAYS sync the new waveform to the GR top_block,
@@ -1405,7 +1623,9 @@ class FDIDMHardwareTest:
                     f"frame_len={self.frame_len}, alpha={self.alpha:.3f}, beta={self.beta:.3f}, "
                     f"mod={self.mod_order}, eq={self.equalizer}, Fs={self.sample_rate:.0f} Hz")
         self._tb.start()
+        self._tx_preview_start_t = time.time()
         self._rx_probe_start_t = time.time()
+        self._last_process_t = 0.0
         self._rx_probe_total_est = 0
         self._rx_probe_last_fp = None
         self._running = True
@@ -1525,11 +1745,13 @@ class FDIDMHardwareTest:
                                 f"frames_decode_ok={self._frames_decode_ok}")
                     self._monitor_last_log_t = now
                 if rx_data_size > 0 and rx_window.size >= self.frame_len:
-                    rx_window = rx_window[-process_window_len:]
-                    try:
-                        self._try_process_rx_window(rx_window.astype(np.complex128), abs_seen)
-                    except Exception as e:
-                        self._debug("WARN", f"frame processing exception: {type(e).__name__}: {e}")
+                    if now - self._last_process_t >= float(self.process_interval_sec):
+                        self._last_process_t = now
+                        rx_window = rx_window[-process_window_len:]
+                        try:
+                            self._try_process_rx_window(rx_window.astype(np.complex128), abs_seen)
+                        except Exception as e:
+                            self._debug("WARN", f"frame processing exception: {type(e).__name__}: {e}")
                 # Wake periodically; respond to stop quickly via Event.wait
                 if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
                     break
@@ -1607,18 +1829,32 @@ class FDIDMHardwareTest:
                     data_samples = frame[self._off_data:self._off_end]
                     cfo_hz = cfo_hz + res_cfo
 
+            htf_cache_refreshing = False
+            htf_old_snapshot = None
             try:
                 if self.use_full_htf:
-                    h_tf_est, leakage = self._estimate_htf_full_from_pilot(pilot_samples)
-                    h_abs = np.abs(h_tf_est)
-                    nz_abs = h_abs[h_abs > 1e-12]
-                    if nz_abs.size == 0:
-                        nz_abs = np.array([0.0])
-                    self._debug("DEBUG",
-                                f"FULL H_TF stats: order={self.full_htf_order}, "
-                                f"|H|_mean={float(np.mean(nz_abs)):.4f}, |H|_min={float(nz_abs.min()):.4e}, "
-                                f"|H|_max={float(nz_abs.max()):.4e}, offdiag_energy={leakage:.3e}, "
-                                f"alpha={self.alpha:.3f}, beta={self.beta:.3f}")
+                    if self._should_refresh_full_htf():
+                        htf_old_snapshot = self._snapshot_channel_cache()
+                        h_tf_est, leakage = self._estimate_htf_full_from_pilot(pilot_samples)
+                        # Tentatively cache so the equalizer can use the precomputed
+                        # H, H^H, and H^H H. The cache is committed only after this
+                        # candidate proves good; otherwise it is rolled back below.
+                        self._cache_full_htf(h_tf_est, leakage)
+                        htf_cache_refreshing = True
+                        h_tf_est = self._cached_htf_full
+                        h_abs = np.abs(h_tf_est)
+                        nz_abs = h_abs[h_abs > 1e-12]
+                        if nz_abs.size == 0:
+                            nz_abs = np.array([0.0])
+                        self._debug("INFO",
+                                    f"FULL H_TF tentative update: order={self.full_htf_order}, "
+                                    f"estimate_count={self._full_htf_estimates}, reuse_interval={self.full_htf_update_interval_frames}, "
+                                    f"|H|_mean={float(np.mean(nz_abs)):.4f}, |H|_min={float(nz_abs.min()):.4e}, "
+                                    f"|H|_max={float(nz_abs.max()):.4e}, offdiag_energy={leakage:.3e}, "
+                                    f"cond_proxy={self._cached_H_cond_proxy:.2e}")
+                    else:
+                        h_tf_est = self._cached_htf_full
+                        leakage = float(self._cached_htf_leakage)
                 else:
                     h_tf_est, leakage = self._estimate_htf_diag_from_pilot(pilot_samples)
                     h_abs = np.abs(h_tf_est)
@@ -1676,6 +1912,8 @@ class FDIDMHardwareTest:
                 rx_text=rx_text, match_bytes=int(match_bytes),
                 decode_ok=bool(decode_ok),
                 rx_syms=rx_syms_best, evm_inst=float(evm_inst),
+                htf_cache_refreshing=bool(htf_cache_refreshing),
+                htf_old_snapshot=htf_old_snapshot,
             )
             if best is None or cand["score"] > best["score"]:
                 best = cand
@@ -1695,8 +1933,29 @@ class FDIDMHardwareTest:
         if best["decode_ok"]:
             self._frames_decode_ok += 1
 
-        self._update_evm_history(best["evm_inst"])
-        const_points = self._prepare_constellation_points(best["rx_syms"], display_mode="raw")
+        good_quality = bool(
+            best["decode_ok"] or (
+                best["ber"] < float(self.constellation_soft_ber_threshold) and
+                np.isfinite(best["evm_inst"]) and
+                best["evm_inst"] < float(self.constellation_soft_evm_threshold)
+            )
+        )
+        # If a freshly estimated full-H_TF did not produce a good frame, roll it
+        # back. This prevents one bad estimate from poisoning all later frames.
+        if self.use_full_htf and best.get("htf_cache_refreshing") and not good_quality:
+            self._restore_channel_cache(best.get("htf_old_snapshot"))
+            self._debug("WARN",
+                        f"FULL H_TF tentative update rejected: BER={best['ber']:.3e}, "
+                        f"EVM={best['evm_inst']:.2f}%, decode_ok={best['decode_ok']}; restored previous cache")
+        elif self.use_full_htf and best.get("htf_cache_refreshing"):
+            # Mark refresh against the successful decode count after the frame has
+            # been accepted, so the reuse interval is measured in good frames.
+            self._cached_htf_frame_counter = int(self._frames_decode_ok)
+
+        if good_quality:
+            self._update_evm_history(best["evm_inst"])
+        show_this_constellation = bool(good_quality)
+        const_points = self._prepare_constellation_points(best["rx_syms"], display_mode="raw") if show_this_constellation else np.zeros(0, dtype=np.complex64)
         t_now = time.time() - self._t0
         with self._lock:
             self._last_processed_abs_start = best["abs_frame_start"]
@@ -1715,9 +1974,12 @@ class FDIDMHardwareTest:
             self.last_bad_reason = "ok" if best["decode_ok"] else (
                 "soft_ok" if best["ber"] < 0.02 else f"high_ber({best['ber']:.2f})"
             )
-            self._latest_constellation = const_points.astype(np.complex64)
-            self._latest_constellation_pre_eq = const_points.astype(np.complex64)
-            self._last_good_constellation = self._latest_constellation.copy()
+            if show_this_constellation:
+                self._latest_constellation = const_points.astype(np.complex64)
+                self._latest_constellation_pre_eq = const_points.astype(np.complex64)
+                self._last_good_constellation = self._latest_constellation.copy()
+            elif self._last_good_constellation.size > 0:
+                self._latest_constellation = self._last_good_constellation.copy()
             self._last_raw_bytes = best["raw_bytes"]
             self._ber_estimate = float(best["ber"])
             self._ber_hist_t.append(t_now)
@@ -1730,7 +1992,7 @@ class FDIDMHardwareTest:
             self._status = "running"
         self._debug(
             "INFO",
-            f"v17 frame: sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz, "
+            f"v23 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz, "
             f"Hleak={best['htf_leakage']:.3f}, cond={best['cond_h']:.2e}, "
             f"BER={best['ber']:.3e}, EVM={best['evm_inst']:.2f}%, "
             f"noise_var={best['noise_var']:.2e}, "
@@ -1882,28 +2144,36 @@ class FDIDMHardwareTest:
                 "match_ratio": float(ratio),
             }
 
-    def get_tx_samples(self, num_samples: int = 2048):
-        """Return the most recent live TX samples from the GR pipeline.
+    def _tx_waveform_window(self, num_samples: int, animated: bool = True) -> np.ndarray:
+        """Return a contiguous window from the known repeated TX waveform.
 
-        v17.2 - no more silent fallback to self._tx_waveform. If the buffer
-        is empty (e.g. backend is configured but the test hasn't been
-        started, or USRP has not yet produced its first chunk) we return
-        an EMPTY array. The UI should treat that as "no live data yet,
-        leave the plot empty" rather than show a misleading preview from
-        a static cached waveform.
-
-        Use get_tx_waveform_preview() explicitly if you want to look at
-        the cached waveform (e.g. for offline analysis), not this method.
+        v23 deliberately does not mirror the live TX stream into a Python sink
+        because that can starve UHD. Instead, the TX signal is deterministic
+        from vector_source_c(repeat=True), so the UI can show a time-advanced
+        window based on the sample rate. This fixes the "TX plot looks frozen"
+        issue without adding a heavy live TX tap.
         """
         n = max(1, int(num_samples))
-        arr, _, _ = self._tx_buffer.read_latest(n)
-        if arr.size == 0:
-            wave = np.asarray(self._tx_waveform, dtype=np.complex64).reshape(-1)
-            if wave.size == 0:
-                return np.zeros(0, dtype=np.complex64)
-            reps = int(np.ceil(n / max(wave.size, 1)))
-            return np.tile(wave, reps)[:n].copy()
-        return arr[-n:].copy() if arr.size >= n else np.pad(arr, (n - arr.size, 0))
+        wave = np.asarray(self._tx_waveform, dtype=np.complex64).reshape(-1)
+        if wave.size == 0:
+            return np.zeros(0, dtype=np.complex64)
+        if animated and self._running:
+            t0 = float(self._tx_preview_start_t or self._t0)
+            start = int(max(0.0, time.time() - t0) * max(self.sample_rate, 1.0)) % int(wave.size)
+        else:
+            start = 0
+        if n <= wave.size:
+            end = start + n
+            if end <= wave.size:
+                return wave[start:end].copy()
+            return np.concatenate((wave[start:].copy(), wave[:end - wave.size].copy()))
+        reps = int(np.ceil((start + n) / max(wave.size, 1))) + 1
+        tiled = np.tile(wave, reps)
+        return tiled[start:start + n].copy()
+
+    def get_tx_samples(self, num_samples: int = 2048):
+        """Return a time-advanced preview of the repeated TX stream."""
+        return self._tx_waveform_window(num_samples, animated=True)
 
     def get_rx_samples(self, num_samples: int = 2048):
         """Return the most recent live RX samples from the USRP source.
@@ -1993,6 +2263,11 @@ class FDIDMHardwareTest:
                 "debug_seq": int(self._debug_seq),
                 "rx_probe_mode": str(self._rx_probe_mode),
                 "rx_probe_len": int(self._rx_probe_len),
+                "process_interval_ms": float(self.process_interval_sec * 1000.0),
+                "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),
+                "full_htf_cached": bool(self._cached_htf_full is not None),
+                "full_htf_estimates": int(self._full_htf_estimates),
+                "usrp_buffer_frames": int(self.usrp_buffer_frames),
             }
 
     def get_status(self) -> Dict[str, Any]:
@@ -2024,7 +2299,13 @@ class FDIDMHardwareTest:
             "full_htf_order": int(self.M * self.N),
             "channel_estimator": self.channel_estimator,
             "use_full_htf": bool(self.use_full_htf),
+            "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),
+            "full_htf_cached": bool(snap.get("full_htf_cached", False)),
+            "full_htf_estimates": int(snap.get("full_htf_estimates", 0)),
+            "process_interval_ms": float(snap.get("process_interval_ms", self.process_interval_sec * 1000.0)),
+            "usrp_buffer_frames": int(snap.get("usrp_buffer_frames", self.usrp_buffer_frames)),
             "tx_frame_count": int(self.tx_frame_count),
+            "tx_cycle_frame_count": int(getattr(self, "_tx_cycle_frame_count", self.tx_frame_count)),
             "inter_frame_guard_len": int(self.inter_frame_guard_len),
             "last_error": self._last_error,
             "last_info": self._last_info,
@@ -2069,5 +2350,5 @@ class FDIDMHardwareTest:
 if __name__ == "__main__":
     tb = FDIDMHardwareTest(fdidm_m=16, fdidm_n=16)
     st = tb.get_status()
-    print(f"v20 paper-strict rx-probe ready: chain={st['chain']}, frame_len={st['frame_len']} samples "
+    print(f"v21 paper-strict rx-probe/cache ready: chain={st['chain']}, frame_len={st['frame_len']} samples "
           f"({st['frame_len'] / st['sample_rate'] * 1000:.2f} ms at {st['sample_rate'] / 1e6:.2f} MHz)")

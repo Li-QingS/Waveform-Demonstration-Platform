@@ -82,7 +82,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.device_combo = QComboBox()
         self.device_combo.addItems(["USRP B210", "USRP N210", "USRP X310"])
         # v17: default 1 MHz, exact integer divisor of B210 master clock 52 MHz.
-        self.samp_rate_spin = self._dspin(1e5, 100e6, 1_000_000, 0, " Hz")
+        self.samp_rate_spin = self._dspin(1e5, 100e6, 500_000, 0, " Hz")
         self.fc_spin = self._dspin(70e6, 6e9, 2.4e9, 0, " Hz")
         hw.addWidget(QLabel("设备类型"), 0, 0)
         hw.addWidget(self.device_combo, 0, 1)
@@ -92,21 +92,26 @@ class FDIDMHardwareTestTab(QWidget):
         hw.addWidget(self.fc_spin, 2, 1)
         layout.addWidget(hw_group)
 
-        fd_group = QGroupBox("FDIDM 论文严格链路参数 v17（pilot 信道估计）")
+        fd_group = QGroupBox("FDIDM 论文链路参数 v23（full-H_TF / diag-TF 可切换）")
         fd = QGridLayout(fd_group)
         fd.setHorizontalSpacing(8)
         fd.setVerticalSpacing(8)
         self.alpha_spin = self._dspin(-2.0, 2.0, 0.5, 1, "", step=0.1)
         self.beta_spin = self._dspin(-2.0, 2.0, 1.0, 1, "", step=0.1)
         self.m_spin = self._spin(4, 64, 16)
-        self.n_spin = self._spin(1, 64, 16)
+        self.n_spin = self._spin(1, 64, 8)
         self.cp_spin = self._spin(0, 63, 4)
         self.max_order_spin = self._spin(16, 4096, 1024)
-        self.frame_count_spin = self._spin(1, 32, 4)
+        self.frame_count_spin = self._spin(1, 32, 8)
         self.guard_spin = self._spin(0, 8192, 64)
         self.probe_guard_spin = self._spin(0, 8192, 16)
         self.evm_avg_spin = self._spin(1, 128, 8)
         self.train_amp_spin = self._dspin(0.05, 4.0, 1.0, 2, "", step=0.05)
+        self.channel_estimator_combo = QComboBox()
+        self.channel_estimator_combo.addItem("严格 full-H_TF（论文 Eq.20/29）", "full_htf")
+        self.channel_estimator_combo.addItem("快速 diag-TF（硬件链路自检）", "diag_tf")
+        self.htf_update_spin = self._spin(1, 10000, 1000)
+        self.process_interval_spin = self._spin(30, 2000, 250)
         fd.addWidget(QLabel("α"), 0, 0)
         fd.addWidget(self.alpha_spin, 0, 1)
         fd.addWidget(QLabel("β"), 0, 2)
@@ -129,34 +134,37 @@ class FDIDMHardwareTestTab(QWidget):
         fd.addWidget(self.evm_avg_spin, 4, 3)
         fd.addWidget(QLabel("Pilot 幅度"), 5, 0)
         fd.addWidget(self.train_amp_spin, 5, 1)
+        fd.addWidget(QLabel("信道估计"), 5, 2)
+        fd.addWidget(self.channel_estimator_combo, 5, 3)
+        fd.addWidget(QLabel("full-H更新间隔"), 6, 0)
+        fd.addWidget(self.htf_update_spin, 6, 1)
+        fd.addWidget(QLabel("处理间隔"), 6, 2)
+        fd.addWidget(self.process_interval_spin, 6, 3)
         self.btn_ofdm = QPushButton("OFDM 特例\nα=0 β=0")
         self.btn_otfs = QPushButton("OTFS 特例\nα=1 β=1")
         self.btn_reco = QPushButton("推荐初值\nα=0.5 β=1")
         self.btn_apply_params = QPushButton("应用 FDIDM 参数")
-        fd.addWidget(self.btn_ofdm, 6, 0, 1, 2)
-        fd.addWidget(self.btn_otfs, 6, 2, 1, 2)
-        fd.addWidget(self.btn_reco, 7, 0, 1, 2)
-        fd.addWidget(self.btn_apply_params, 7, 2, 1, 2)
-        self.auto_apply_check = QCheckBox("FDIDM 参数改动后自动应用")
+        fd.addWidget(self.btn_ofdm, 7, 0, 1, 2)
+        fd.addWidget(self.btn_otfs, 7, 2, 1, 2)
+        fd.addWidget(self.btn_reco, 8, 0, 1, 2)
+        fd.addWidget(self.btn_apply_params, 8, 2, 1, 2)
+        self.auto_apply_check = QCheckBox("FDIDM 参数改动后自动应用（运行中会停止/重启，不建议实时开启）")
         self.auto_apply_check.setChecked(False)
-        fd.addWidget(self.auto_apply_check, 8, 0, 1, 4)
-        # v17 note: pilot-based estimation (single random QPSK pilot frame),
-        # 269x -> 1x training overhead. The * marked legacy fields are kept
-        # for config-file back-compat but the v17 backend silently ignores them.
+        fd.addWidget(self.auto_apply_check, 9, 0, 1, 4)
         strict_note = QLabel(
-            "严格模式 v17：完整 M×N 数据栅格 + 单帧已知随机 QPSK 导频信道估计 + 跨域均衡。\n"
-            "Pilot 幅度 = TX 导频帧与数据帧的功率比；推荐 1.0。\n"
-            "带 * 字段（最大阶数 / 探测保护）为 v16 兼容字段，v17 后端忽略。"
+            "v23：严格模式使用 MN 个 TF 基向量估计完整 H_TF，并按 H=ΦH_TF A 做跨域 ZF/MMSE。\n"
+            "diag-TF 仅用于先验证 USRP 线缆/同步/增益是否稳定，不代表完整论文接收机。\n"
+            "full-H更新间隔=1 表示每帧重估；静态线缆建议 1000，即只在链路变差或手动改参后重估，可避免坏 H 缓存导致星座图突然散开。处理间隔单位 ms。"
         )
         strict_note.setWordWrap(True)
-        fd.addWidget(strict_note, 9, 0, 1, 4)
+        fd.addWidget(strict_note, 10, 0, 1, 4)
         layout.addWidget(fd_group)
 
         modem_group = QGroupBox("收发与解调配置")
         modem = QGridLayout(modem_group)
         # v17: lower default loopback gains. B210 internal loopback with
         # 40+40 dB saturates the RX ADC; 20+20 dB is the safer starting point.
-        self.tx_gain_spin = self._dspin(0, 80, 20, 1, " dB")
+        self.tx_gain_spin = self._dspin(0, 80, 10, 1, " dB")
         self.rx_gain_spin = self._dspin(0, 80, 20, 1, " dB")
         self.mod_order_combo = QComboBox()
         self.mod_order_combo.addItems(["QPSK", "16QAM", "64QAM"])
@@ -164,8 +172,8 @@ class FDIDMHardwareTestTab(QWidget):
         self.equalizer_combo.addItems(["MMSE", "ZF"])
         self.const_mode_combo = QComboBox()
         self._const_mode_items = [
-            ("决策整形（推荐）", "dd_refined"),
-            ("原始软符号", "raw"),
+            ("原始软符号（推荐）", "raw"),
+            ("决策整形", "dd_refined"),
             ("硬判决", "hard_decision"),
         ]
         for label, _ in self._const_mode_items:
@@ -193,7 +201,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.file_path_label = QLabel("可直接编辑下方文本，或加载 .txt 文件")
         self.file_path_label.setWordWrap(True)
         self.tx_text_edit = QTextEdit()
-        self.tx_text_edit.setPlainText("Hello FDIDM Paper Strict Test!")
+        self.tx_text_edit.setPlainText("FDIDM OK")
         self.tx_text_edit.setMaximumHeight(110)
         text_l.addWidget(self.btn_load_text)
         text_l.addWidget(self.btn_reset_text)
@@ -355,10 +363,12 @@ class FDIDMHardwareTestTab(QWidget):
         for w in (self.alpha_spin, self.beta_spin, self.m_spin, self.n_spin,
                   self.cp_spin, self.frame_count_spin, self.guard_spin,
                   self.probe_guard_spin, self.evm_avg_spin,
-                  self.train_amp_spin, self.max_order_spin):
+                  self.train_amp_spin, self.max_order_spin,
+                  self.htf_update_spin, self.process_interval_spin):
             w.valueChanged.connect(self._on_params_changed)
         self.mod_order_combo.currentTextChanged.connect(self._on_mod_or_eq_changed)
         self.equalizer_combo.currentTextChanged.connect(self._on_mod_or_eq_changed)
+        self.channel_estimator_combo.currentIndexChanged.connect(lambda _: self._on_params_changed())
         self.tx_gain_spin.valueChanged.connect(lambda v: self._apply_gain("tx", float(v)))
         self.rx_gain_spin.valueChanged.connect(lambda v: self._apply_gain("rx", float(v)))
         self.const_mode_combo.currentIndexChanged.connect(lambda _: self._push_const_mode())
@@ -375,7 +385,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
             self._push_const_mode()
-            self._log("FDIDM 严格论文链路后端已配置 v17.1（pilot 信道估计 + α/β 同步修复 + 调试日志流）。")
+            self._log("FDIDM 论文链路后端已配置 v23（full-H_TF/diag-TF 可切换 + RX probe + H 缓存）。")
             self._log(self._backend_summary())
             self.btn_connect.setEnabled(False)
             self.btn_start_test.setEnabled(True)
@@ -395,7 +405,7 @@ class FDIDMHardwareTestTab(QWidget):
                 self._configure_backend(self.tx_text_edit.toPlainText())
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
-            self.decode_status_label.setText("解调状态：v17.1 运行中，等待 USRP 接收帧…")
+            self.decode_status_label.setText("解调状态：v23 运行中，等待 USRP 接收帧…")
             self._reset_runtime_curves()
             self.backend.start()
             self.test_running = True
@@ -403,7 +413,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
-            self._log("v17.1 硬件测试已启动。")
+            self._log("v23 硬件测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
             self.test_running = False
@@ -442,7 +452,7 @@ class FDIDMHardwareTestTab(QWidget):
         if self.test_running:
             self._log("运行中不能修改发送文本，请先停止测试。")
             return
-        text = "Hello FDIDM Paper Strict Test!"
+        text = "FDIDM OK"
         self.tx_text_edit.setPlainText(text)
         self.tx_text_view.setPlainText(text)
         self.file_path_label.setText("可直接编辑下方文本，或加载 .txt 文件")
@@ -451,6 +461,10 @@ class FDIDMHardwareTestTab(QWidget):
     # =========================================================
     # Backend
     # =========================================================
+    def _selected_channel_estimator(self) -> str:
+        data = self.channel_estimator_combo.currentData() if hasattr(self, "channel_estimator_combo") else None
+        return str(data or "full_htf")
+
     def _create_backend(self):
         # Backend is being recreated -> reset the debug-log cursor so we get
         # the boot-time INFO messages flowing into the visible log.
@@ -478,6 +492,9 @@ class FDIDMHardwareTestTab(QWidget):
             # logs and configs keep working.
             training_probe_guard_len=self.probe_guard_spin.value(),
             max_full_htf_order=self.max_order_spin.value(),
+            channel_estimator=self._selected_channel_estimator(),
+            full_htf_update_interval_frames=self.htf_update_spin.value(),
+            process_interval_ms=self.process_interval_spin.value(),
         )
 
     def _configure_backend(self, tx_text: str):
@@ -503,6 +520,9 @@ class FDIDMHardwareTestTab(QWidget):
             training_amplitude=self.train_amp_spin.value(),
             training_probe_guard_len=self.probe_guard_spin.value(),
             max_full_htf_order=self.max_order_spin.value(),
+            channel_estimator=self._selected_channel_estimator(),
+            full_htf_update_interval_frames=self.htf_update_spin.value(),
+            process_interval_ms=self.process_interval_spin.value(),
         )
         self._push_const_mode()
 
@@ -657,7 +677,7 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _update_decode_status(self, stats, status):
         ok = bool(stats.get("decode_ok", False))
-        head = "解调状态：v17.1 CRC 通过，文本已恢复" if ok else "解调状态：v17.1 尚未恢复"
+        head = "解调状态：v23 CRC 通过，文本已恢复" if ok else "解调状态：v23 尚未恢复"
         evm_avg = float(status.get("evm_average_percent", np.nan))
         evm_inst = float(status.get("evm_instant_percent", np.nan))
         evm_avg_text = "nan" if not np.isfinite(evm_avg) else f"{evm_avg:.2f}%"
@@ -672,7 +692,9 @@ class FDIDMHardwareTestTab(QWidget):
             f"EVM(avg)={evm_avg_text}({int(status.get('evm_average_count',0))}/{int(status.get('evm_average_frames',1))}), "
             f"EVM(inst)={evm_inst_text}, Hleak={float(status.get('htf_leakage',0.0)):.3f}, "
             f"cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
-            f"resφ={float(status.get('residual_phase_deg',np.nan)):.1f}°, RX={int(status.get('rx_samples_seen',0))}"
+            f"resφ={float(status.get('residual_phase_deg',np.nan)):.1f}°, RX={int(status.get('rx_samples_seen',0))}, "
+            f"mode={status.get('channel_estimator','')}, rx_mode={status.get('rx_probe_mode','')}, "
+            f"Hcache={bool(status.get('full_htf_cached',False))}/{int(status.get('full_htf_estimates',0))}"
         )
 
     def _maybe_log_runtime(self, status, stats):
@@ -681,7 +703,7 @@ class FDIDMHardwareTestTab(QWidget):
             return
         self._last_runtime_log_time = now
         self._log(
-            "v17.1 runtime: "
+            "v23 runtime: "
             f"reason={status.get('reason','')}, "
             f"frames={int(status.get('frames_decode_ok',0))}/{int(status.get('frames_processed',0))} "
             f"(decode_ok/processed), monitor_cycles={int(status.get('monitor_cycles',0))}, "
@@ -694,6 +716,8 @@ class FDIDMHardwareTestTab(QWidget):
             f"cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
             f"noise_var={float(status.get('noise_var',np.nan)):.2e}, "
             f"alpha/beta={float(status.get('alpha',0)):.3f}/{float(status.get('beta',0)):.3f}, "
+            f"mode={status.get('channel_estimator','')}, use_full={bool(status.get('use_full_htf',False))}, "
+            f"rx_mode={status.get('rx_probe_mode','')}, Hcache={bool(status.get('full_htf_cached',False))}/{int(status.get('full_htf_estimates',0))}, "
             f"decode_ok={bool(stats.get('decode_ok',False))}, "
             f"match={int(stats.get('match_bytes',0))}/{int(stats.get('expected_bytes',0))}"
         )
@@ -842,9 +866,11 @@ class FDIDMHardwareTestTab(QWidget):
             return "未创建后端"
         st = self.backend.get_status()
         return (
-            f"链路={st.get('chain')}, MxN={st.get('fdidm_m')}x{st.get('fdidm_n')}, "
-            f"CP={st.get('cp_len')}, full-H_TF阶数={st.get('full_htf_order')}, "
-            f"训练块={st.get('htf_training_blocks')}, Fs={st.get('samp_rate'):.0f} Hz, "
+            f"链路={st.get('chain')}, 模式={st.get('channel_estimator')}, use_full={st.get('use_full_htf')}, "
+            f"MxN={st.get('fdidm_m')}x{st.get('fdidm_n')}, CP={st.get('cp_len')}, "
+            f"full-H_TF阶数={st.get('full_htf_order')}, 训练块={st.get('htf_training_blocks')}, TX随机帧={st.get('tx_cycle_frame_count', st.get('tx_frame_count'))}, "
+            f"H更新间隔={st.get('full_htf_update_interval_frames')}, 处理间隔={st.get('process_interval_ms'):.0f}ms, "
+            f"rx_mode={st.get('rx_probe_mode')}, Fs={st.get('samp_rate'):.0f} Hz, "
             f"调制={st.get('mod_order')}, EQ={st.get('equalizer')}, "
             f"α={st.get('alpha'):.2f}, β={st.get('beta'):.2f}, "
             f"帧长={st.get('frame_len')} 样点 "
