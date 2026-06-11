@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import zlib
@@ -348,14 +349,24 @@ class FDIDMHardwareTest:
             full_htf_once: bool = True,
             process_interval_ms: float = 200.0,      # throttle heavy Python decoding to avoid UHD RX overflow
             usrp_buffer_frames: int = 2048,          # UHD streamer buffer hint for Windows/B210 stability
-            tx_min_waveform_duration_ms: float = 500.0,  # v30: repeat the FDIDM super-cycle into a long UHD-friendly vector
+            tx_min_waveform_duration_ms: float = 500.0,  # repeat the FDIDM super-cycle into a long UHD-friendly vector
             tx_max_waveform_samples: int = 1_048_576,    # cap the Python list handed to vector_source_c
-            tx_prerender_tdl_before_rf: bool = True,     # v30: keep Python TDL out of the live USRP TX path
+            tx_prerender_tdl_before_rf: bool = True,     # kept for API compatibility; TDL->RF is always pre-rendered
             enable_realtime_scheduling: bool = True,
+            cfo_search_enable: bool = True,          # resolve repeated-preamble CFO aliases for high Doppler
+            cfo_search_max_hz: float = 50_000.0,     # scan range for common Doppler / oscillator offset
+            residual_cfo_max_hz: float = 5_000.0,    # sanity limit for pilot residual CFO refinement
+            startup_settle_ms: float = 800.0,        # drop dirty RX/probe windows after every USRP start
+            startup_settle_windows: int = 3,         # additional fresh probe vectors to ignore after start/reconfigure
+            cfo_scan_min_score: float = 0.55,        # non-alias CFO must score at least this well without a lock/hint
+            cfo_scan_jump_guard_hz: float = 12_000.0,# reject low-score CFO jumps far from last good CFO/hint
             coding_scheme: str = "conv12",          # "none" or "conv12" (rate-1/2 convolutional + interleaver)
             coding_interleaver: bool = True,
-            channel_mode: str = "rf_tdl_a",          # "rf", "tdl_a/c/d" software loopback, or "rf_tdl_a/c/d" RF+TDL
-            software_channel_model: Optional[str] = None,  # legacy/alias for channel_mode when set to a TDL model
+            channel_mode: str = "rf",               # RF-only, RF->TDL, or TDL->RF; baseband-only loopback is disabled
+            software_channel_model: Optional[str] = None,  # legacy alias; baseband-only TDL names map to RF->TDL
+            log_to_stdout: bool = False,
+            log_file_path: Optional[str] = None,
+            debug_log_max_entries: int = 5000,
             tdl_rms_delay_spread_ns: float = 1000.0,
             tdl_doppler_hz: float = 0.0,             # common satellite Doppler shift applied to all taps
             tdl_doppler_spread_hz: float = 0.0,      # local scattering Doppler spread for Rayleigh taps
@@ -414,8 +425,28 @@ class FDIDMHardwareTest:
         self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
         self.tx_min_waveform_duration_ms = float(max(0.0, min(float(tx_min_waveform_duration_ms), 5000.0)))
         self.tx_max_waveform_samples = int(max(8192, min(int(tx_max_waveform_samples), 4_194_304)))
-        self.tx_prerender_tdl_before_rf = bool(tx_prerender_tdl_before_rf)
+        self.tx_prerender_tdl_before_rf = True
         self.enable_realtime_scheduling = bool(enable_realtime_scheduling)
+        self.cfo_search_enable = bool(cfo_search_enable)
+        self.cfo_search_max_hz = float(max(0.0, min(float(cfo_search_max_hz), max(self.sample_rate / 2.0, 1.0))))
+        self.residual_cfo_max_hz = float(max(0.0, min(float(residual_cfo_max_hz), max(self.sample_rate / 4.0, 1.0))))
+        self._last_cfo_alias_hz = float("nan")
+        self._last_cfo_scan_score = float("nan")
+        self._last_cfo_unambiguous_hz = float("nan")
+        self.startup_settle_sec = float(max(0.0, min(float(startup_settle_ms) / 1000.0, 5.0)))
+        self.startup_settle_windows = int(max(0, min(int(startup_settle_windows), 32)))
+        self.cfo_scan_min_score = float(max(0.0, min(float(cfo_scan_min_score), 1.0)))
+        self.cfo_scan_jump_guard_hz = float(max(0.0, min(float(cfo_scan_jump_guard_hz), max(self.sample_rate / 2.0, 1.0))))
+        self._rx_settle_until_wall = 0.0
+        self._rx_settle_windows_remaining = 0
+        self._run_id = 0
+        self._last_good_cfo_hz = float("nan")
+        self._last_good_cfo_wall = 0.0
+        self._last_good_cfo_mode_key = ""
+        self.log_to_stdout = bool(log_to_stdout)
+        self.log_file_path = str(log_file_path or "")
+        self.debug_log_max_entries = int(max(500, min(int(debug_log_max_entries), 100000)))
+        self._channel_mode_note = ""
         self.coding_scheme = self._normalize_coding_scheme(coding_scheme)
         self.coding_interleaver = bool(coding_interleaver)
         self._tx_base_cycle_len = 0
@@ -427,10 +458,9 @@ class FDIDMHardwareTest:
         self._last_fec_bit_ber = float("nan")
         self._last_raw_bit_ber = float("nan")
 
-        # Optional software NTN-TDL channel inserted between the FDIDM TX stream
-        # and the RX decoder.  In TDL mode the flowgraph is pure baseband
-        # loopback: vector_source -> throttle -> TDL channel -> RX probe.
-        # In RF mode the original USRP TX/RX path is used.
+        # Channel path. Every supported mode now traverses the real USRP RF path.
+        # Baseband-only TDL loopback was removed because it does not exercise
+        # the actual hardware/channel used by this bench.
         self.channel_mode = self._normalize_channel_mode(software_channel_model or channel_mode)
         self.tdl_rms_delay_spread_ns = float(max(0.0, float(tdl_rms_delay_spread_ns)))
         self.tdl_doppler_hz = float(tdl_doppler_hz)
@@ -449,7 +479,7 @@ class FDIDMHardwareTest:
         # Hardware/sync frame structure.
         # Frame = [pre_guard][sync_preamble][pilot_frame][data_frame][post_guard]
         self._recompute_strict_frame_timing()
-        self.strict_chain_name = "FDIDM_TDL_RF_CASCADE_v30_FEC_UHD_STABLE"
+        self.strict_chain_name = "FDIDM_HW_ONLY_v33_ATOMIC_SWITCH_CFO_GUARD"
 
         # Tunables.
         self.sync_metric_threshold = 0.30
@@ -535,7 +565,7 @@ class FDIDMHardwareTest:
         # Constellation buffers.  _latest_constellation is POST-equalizer soft symbols
         # after residual gain/phase correction; _latest_constellation_pre_eq is the
         # cross-domain observation BEFORE equalization (Phi*y_TF or FDIT(Y_TF)).
-        # v29 updates these for every decodable frame candidate, even when CRC fails,
+        # Publish these for every decodable frame candidate, even when CRC fails,
         # so the plot can be used as a diagnostic instead of disappearing silently.
         self._latest_constellation = np.zeros(0, dtype=np.complex64)
         self._latest_constellation_post_eq = np.zeros(0, dtype=np.complex64)
@@ -589,8 +619,9 @@ class FDIDMHardwareTest:
         self._ber_hist_t: deque = deque(maxlen=200)
         self._ber_hist_v: deque = deque(maxlen=200)
 
-        # v17.1 debug infrastructure
-        self._debug_log: deque = deque(maxlen=2000)
+        # Runtime diagnostics consumed by the UI and optional Python logging handlers.
+        self._debug_log: deque = deque(maxlen=int(self.debug_log_max_entries))
+        self._py_logger = self._create_python_logger()
         self._debug_seq = 0
         self._frames_processed = 0  # successful frame attempts (any sync, even bad ber)
         self._frames_decode_ok = 0  # CRC-passing frames
@@ -601,7 +632,7 @@ class FDIDMHardwareTest:
         self._set_tx_text_internal(tx_text)
         self._build_top_block()
         self._debug("INFO",
-                    f"FDIDM backend v30 ready: chain={self.strict_chain_name}, "
+                    f"FDIDM backend v33 ready: chain={self.strict_chain_name}, "
                     f"estimator={self.channel_estimator}, use_full_htf={self.use_full_htf}, "
                     f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames} frame(s), "
                     f"channel_mode={self.channel_mode}, "
@@ -616,6 +647,9 @@ class FDIDMHardwareTest:
                     f"repeats={self._tx_uhd_repeats}, prerender_tdl={self._tx_tdl_prerendered}")
         if getattr(self, "_estimator_auto_note", ""):
             self._debug("WARN", self._estimator_auto_note)
+        if getattr(self, "_channel_mode_note", ""):
+            self._debug("WARN", self._channel_mode_note)
+        self._debug("INFO", self._format_link_limit_summary())
 
 
     # =========================================================
@@ -679,6 +713,108 @@ class FDIDMHardwareTest:
         # (FDIT is the exact inverse of the IFDIT used on the data path).
         self._pilot_X_cross = self._fdit(self._pilot_X_tf)
 
+    # =========================================================
+    # Parameter limit / link budget helpers
+    # =========================================================
+    @staticmethod
+    def _tdl_profile_rms_norm_and_ratio(model: str) -> Tuple[float, float]:
+        raw = list(_NTNTDLChannel.TDL_PROFILES[_NTNTDLChannel.normalize_model(model)])
+        delays = np.array([r[0] for r in raw], dtype=np.float64)
+        powers = np.array([10.0 ** (float(r[1]) / 10.0) for r in raw], dtype=np.float64)
+        powers = powers / max(float(np.sum(powers)), 1e-12)
+        mean_tau = float(np.sum(powers * delays))
+        rms_norm = float(np.sqrt(np.sum(powers * (delays - mean_tau) ** 2)))
+        max_norm = float(np.max(delays)) if delays.size else 0.0
+        ratio = max_norm / max(rms_norm, 1e-12) if max_norm > 0.0 else 0.0
+        return rms_norm, ratio
+
+    def compute_parameter_limits(self) -> Dict[str, Any]:
+        """Compute analytic first-order limits for the current FDIDM settings.
+
+        These are not guaranteed BER thresholds; they are engineering budgets
+        derived from the actual frame timing and estimator assumptions:
+          - common CFO/Doppler is limited by the repeated preamble alias period
+            and by the configured v33 CFO scan window;
+          - Doppler spread is limited by channel variation across the pilot/data
+            observation time for diag-TF, and by the much longer MN-probe time
+            for full-H_TF;
+          - delay spread is limited by the CP relative to the selected TDL
+            profile's maximum-delay/RMS-delay ratio.
+        """
+        Fs = float(max(self.sample_rate, 1.0))
+        M = int(max(self.M, 1))
+        N = int(max(self.N, 1))
+        cp = int(max(self.cp_len, 0))
+        block = int(max(self.block_len, M + cp))
+        K = int(max(self.full_htf_order, M * N))
+        t_block = float(block) / Fs
+        t_data = float(self.data_frame_len) / Fs
+        t_diag_obs = float(self.pilot_frame_len + self.data_frame_len) / Fs if not self.use_full_htf else 2.0 * t_data
+        t_full_probe = float(K * self.data_frame_len + self.data_frame_len) / Fs
+        cfo_unamb = self._preamble_cfo_unambiguous_hz()
+        cfo_period = self._preamble_cfo_period_hz()
+        cfo_scan = min(float(getattr(self, "cfo_search_max_hz", cfo_unamb)), 0.49 * Fs) if bool(getattr(self, "cfo_search_enable", True)) else cfo_unamb
+        subcarrier_spacing = Fs / max(M, 1)
+        # Strict/loose phase drift budgets across the relevant observation.
+        theta_strict = 0.35  # rad, roughly <= -9 dB phase-error EVM contribution
+        theta_loose = 0.75   # rad, FEC may still recover but EVM will be high
+        diag_spread_strict = theta_strict / (2.0 * np.pi * max(t_diag_obs, 1e-12))
+        diag_spread_loose = theta_loose / (2.0 * np.pi * max(t_diag_obs, 1e-12))
+        full_spread_strict = theta_strict / (2.0 * np.pi * max(t_full_probe, 1e-12))
+        full_spread_loose = theta_loose / (2.0 * np.pi * max(t_full_probe, 1e-12))
+        t_cp = float(cp) / Fs
+        ds_limits = {}
+        for model in ("tdl_a", "tdl_c", "tdl_d"):
+            _rms_norm, ratio = self._tdl_profile_rms_norm_and_ratio(model)
+            if ratio <= 0.0:
+                strict_ns = float("inf")
+            else:
+                strict_ns = (t_cp / ratio) * 1e9
+            ds_limits[model] = {
+                "max_rms_delay_spread_ns_cp": float(strict_ns),
+                "recommended_rms_delay_spread_ns_80pct_cp": float(0.80 * strict_ns),
+                "max_delay_over_rms_ratio": float(ratio),
+            }
+        return {
+            "Fs": Fs,
+            "M": M,
+            "N": N,
+            "CP": cp,
+            "subcarrier_spacing_hz": float(subcarrier_spacing),
+            "block_len_samples": int(block),
+            "block_time_s": float(t_block),
+            "data_time_s": float(t_data),
+            "diag_observation_time_s": float(t_diag_obs),
+            "full_htf_probe_time_s": float(t_full_probe),
+            "sync_half_len": int(self.sync_half_len),
+            "cfo_alias_period_hz": float(cfo_period),
+            "cfo_unambiguous_hz": float(cfo_unamb),
+            "cfo_scan_enabled": bool(getattr(self, "cfo_search_enable", True)),
+            "cfo_scan_max_hz": float(cfo_scan),
+            "common_doppler_practical_hz": float(0.80 * cfo_scan),
+            "residual_cfo_target_hz": float(0.05 * subcarrier_spacing),
+            "diag_doppler_spread_strict_hz": float(diag_spread_strict),
+            "diag_doppler_spread_loose_hz": float(diag_spread_loose),
+            "full_htf_doppler_spread_strict_hz": float(full_spread_strict),
+            "full_htf_doppler_spread_loose_hz": float(full_spread_loose),
+            "tdl_delay_spread_limits": ds_limits,
+        }
+
+    def _format_link_limit_summary(self) -> str:
+        lim = self.compute_parameter_limits()
+        ds = lim["tdl_delay_spread_limits"]
+        return (
+            "v33 limits: "
+            f"CFO common unamb=±{lim['cfo_unambiguous_hz']:.1f}Hz, "
+            f"scan=±{lim['cfo_scan_max_hz']:.1f}Hz, practical≈±{lim['common_doppler_practical_hz']:.1f}Hz; "
+            f"residual target<{lim['residual_cfo_target_hz']:.1f}Hz; "
+            f"Doppler spread diag strict/loose≈{lim['diag_doppler_spread_strict_hz']:.1f}/{lim['diag_doppler_spread_loose_hz']:.1f}Hz, "
+            f"full-H strict/loose≈{lim['full_htf_doppler_spread_strict_hz']:.2f}/{lim['full_htf_doppler_spread_loose_hz']:.2f}Hz; "
+            f"RMS-DS max by CP A/C/D≈{ds['tdl_a']['max_rms_delay_spread_ns_cp']:.0f}/"
+            f"{ds['tdl_c']['max_rms_delay_spread_ns_cp']:.0f}/"
+            f"{ds['tdl_d']['max_rms_delay_spread_ns_cp']:.0f}ns"
+        )
+
     def _build_full_htf_training_waveform(self) -> np.ndarray:
         """Build MN TF-basis probe frames to estimate the full H_TF matrix.
 
@@ -701,7 +837,7 @@ class FDIDMHardwareTest:
 
 
     # =========================================================
-    # v30 PHY coding / interleaving helpers
+    # PHY coding / interleaving helpers
     # =========================================================
     @staticmethod
     def _normalize_coding_scheme(scheme: str) -> str:
@@ -1045,7 +1181,7 @@ class FDIDMHardwareTest:
         tx_cycle = (0.9 / peak) * tx_cycle
         tx_wave, base_cycle_len, uhd_repeats = self._expand_waveform_for_uhd(tx_cycle.astype(np.complex64))
         tdl_prerendered = False
-        if self._tdl_before_rf_enabled() and self.tx_prerender_tdl_before_rf:
+        if self._tdl_before_rf_enabled():
             tx_wave = self._make_prerendered_tdl_tx(tx_wave)
             tdl_prerendered = True
 
@@ -1064,6 +1200,14 @@ class FDIDMHardwareTest:
         self._tx_x_cross = first_x_cross if first_x_cross is not None else np.zeros((self.M, self.N), dtype=np.complex128)
         self._tx_x_tf = first_x_tf if first_x_tf is not None else np.zeros((self.M, self.N), dtype=np.complex128)
         self._tx_waveform = tx_wave.astype(np.complex64)
+        if hasattr(self, "_debug_log"):
+            self._debug(
+                "INFO",
+                f"TX waveform rebuilt: payload={len(payload)}B, uncoded={frame_bits.size}b, "
+                f"coded={coded_frame_bits.size}b/{max_bits}b, coding={self._coding_summary()}, "
+                f"cycle={base_cycle_len} samp, repeats={uhd_repeats}, txvec={self._tx_waveform.size} samp, "
+                f"TDL_prerender={tdl_prerendered}, mode={self.channel_mode}"
+            )
         self._rx_text = ""
         self._decode_ok = False
         self._match_bytes = 0
@@ -1177,10 +1321,15 @@ class FDIDMHardwareTest:
         return np.concatenate([half, half]).astype(np.complex128)
 
     def _sync_metric(self, rx: np.ndarray) -> np.ndarray:
-        """Schmidl-Cox-like metric: auto-corr for coarse plateau, cross-corr for fine timing.
+        """CFO-tolerant Schmidl-Cox-like sync metric.
 
-        Returned metric uses the cross-correlation as the primary sharp metric,
-        gated by the autocorrelation plateau as a coarse detector.
+        v31 used a sharp known-preamble cross-correlation gated by the repeated
+        half autocorrelation.  That is excellent at small CFO, but at high
+        common Doppler the cross-correlation can collapse before CFO is known.
+        v33 therefore keeps the same sharp metric when it is available and
+        falls back to the normalized repeated-half autocorrelation as a coarse,
+        CFO-insensitive detector.  Timing is refined later with a CFO-scanned
+        cross-correlation, so the broader autocorrelation plateau is safe.
         """
         rx = np.asarray(rx, dtype=np.complex128)
         Ls = int(self.sync_len)
@@ -1188,12 +1337,15 @@ class FDIDMHardwareTest:
         if rx.size < Ls + 1:
             return np.zeros(1, dtype=np.float64)
         sync = self.sync_preamble.astype(np.complex128)
-        cross_corr = np.correlate(rx, sync, mode="valid")
         rx_abs2 = np.abs(rx) ** 2
         cum = np.concatenate([[0.0], np.cumsum(rx_abs2)])
+
+        # Known-preamble cross-correlation: sharp, but sensitive to large CFO.
+        cross_corr = np.correlate(rx, sync, mode="valid")
         seg_energy = cum[Ls:] - cum[: rx.size - Ls + 1]
         m_cross = (np.abs(cross_corr) ** 2) / (self._sync_energy * (seg_energy + 1e-12))
 
+        # Repeated-half autocorrelation: CFO-insensitive, but produces a plateau.
         prod = np.conj(rx[:-L]) * rx[L:]
         prod_cum = np.concatenate([[0.0 + 0.0j], np.cumsum(prod)])
         P = prod_cum[L:] - prod_cum[: prod.size - L + 1]
@@ -1204,9 +1356,147 @@ class FDIDMHardwareTest:
         n = min(m_cross.size, m_auto.size)
         m_cross = m_cross[:n]
         m_auto = m_auto[:n]
-        # Cross-corr peak gated by auto-corr plateau (>0.3) to suppress false alarms.
-        gate = (m_auto > 0.30).astype(np.float64)
-        return (m_cross * gate).astype(np.float64)
+        gate = (m_auto > 0.18).astype(np.float64)
+        # The 0.85 factor prevents pure autocorr plateaus from out-ranking a
+        # valid sharp cross-corr peak at low CFO, while still letting high-CFO
+        # frames pass the 0.30 detector threshold.
+        return np.maximum(m_cross * gate, 0.85 * m_auto).astype(np.float64)
+
+    def _preamble_cfo_period_hz(self) -> float:
+        return float(self.sample_rate) / max(float(self.sync_half_len), 1.0)
+
+    def _preamble_cfo_unambiguous_hz(self) -> float:
+        return 0.5 * self._preamble_cfo_period_hz()
+
+    def _cfo_hint_hz(self) -> Optional[float]:
+        """Return a soft CFO prior for alias resolution, never a hard override."""
+        key = self._current_cfo_mode_key() if hasattr(self, "_current_cfo_mode_key") else ""
+        last = float(getattr(self, "_last_good_cfo_hz", float("nan")))
+        if (np.isfinite(last) and str(getattr(self, "_last_good_cfo_mode_key", "")) == key):
+            return float(last)
+        # In software-TDL-involved tests the configured common Doppler is a useful
+        # first-run prior.  Real RF oscillator offset is still measured by the
+        # preamble, so this is only used to break low-score alias ties.
+        if self._software_channel_enabled():
+            fd = float(getattr(self, "tdl_doppler_hz", 0.0))
+            if abs(fd) > 1e-9:
+                return fd
+        return None
+
+    def _choose_cfo_from_scored_candidates(self, alias_hz: float, scored: List[Tuple[float, float]]) -> Tuple[float, float, str]:
+        """Choose a CFO candidate without letting low-score scan aliases run away.
+
+        The repeated-half phase gives an alias in ±Fs/(2L).  Wide scanning is
+        only trusted when the compensated known-preamble score is strong or when
+        a candidate agrees with a recent good CFO / configured Doppler hint.
+        This directly suppresses the observed fd=0 false locks around ±47 kHz.
+        """
+        if not scored:
+            return float(alias_hz), 0.0, "empty"
+        scored = [(float(c), float(v)) for c, v in scored if np.isfinite(c) and np.isfinite(v)]
+        if not scored:
+            return float(alias_hz), 0.0, "empty_nonfinite"
+        alias = float(alias_hz)
+        unamb = float(self._preamble_cfo_unambiguous_hz())
+        min_score = float(getattr(self, "cfo_scan_min_score", 0.55))
+        jump_guard = float(getattr(self, "cfo_scan_jump_guard_hz", 12000.0))
+        best_cfo, best_score = max(scored, key=lambda x: x[1])
+        alias_cfo, alias_score = min(scored, key=lambda x: abs(x[0] - alias))
+        hint = self._cfo_hint_hz()
+
+        # Prefer the last-good/configured-Doppler neighborhood when it is nearly
+        # as good as the absolute max.  This avoids jumping between equivalent
+        # aliases on noisy transition windows.
+        if hint is not None and np.isfinite(hint):
+            hint_cfo, hint_score = min(scored, key=lambda x: abs(x[0] - float(hint)))
+            if abs(best_cfo - float(hint)) > jump_guard and best_score < 0.75:
+                if hint_score >= max(0.35, 0.78 * best_score):
+                    return float(hint_cfo), float(hint_score), "hint_guard"
+            if hint_score >= max(min_score, 0.90 * best_score):
+                return float(hint_cfo), float(hint_score), "hint"
+
+        # No reliable prior: do not trust a far alias unless the known-preamble
+        # correlation after compensation is objectively strong.
+        if abs(best_cfo - alias) > 0.5:
+            if best_score < min_score:
+                return float(alias_cfo), float(alias_score), "alias_low_scan_score"
+            if abs(best_cfo) > max(unamb * 1.25, abs(alias) + unamb) and best_score < max(min_score, alias_score + 0.18):
+                return float(alias_cfo), float(alias_score), "alias_jump_guard"
+
+        return float(best_cfo), float(best_score), "scan_best" if abs(best_cfo - alias) > 0.5 else "alias_best"
+
+    def _preamble_cfo_candidates(self, alias_hz: float) -> List[float]:
+        """Return CFO candidates that share the same repeated-half phase.
+
+        The repeated preamble estimates CFO modulo Fs/L.  Candidate values are
+        alias_hz + k*Fs/L within ±cfo_search_max_hz, then the known preamble
+        chooses the best one by compensated cross-correlation.
+        """
+        alias = float(alias_hz)
+        period = max(self._preamble_cfo_period_hz(), 1e-12)
+        if not bool(getattr(self, "cfo_search_enable", True)):
+            return [alias]
+        max_hz = min(float(getattr(self, "cfo_search_max_hz", 0.0)), 0.49 * float(self.sample_rate))
+        if max_hz <= self._preamble_cfo_unambiguous_hz() + 1e-9:
+            return [alias]
+        k_min = int(np.ceil((-max_hz - alias) / period))
+        k_max = int(np.floor((max_hz - alias) / period))
+        cands = [alias + k * period for k in range(k_min, k_max + 1)]
+        # Always include the raw alias first if numerical clipping removed it.
+        if not any(abs(c - alias) < 1e-9 for c in cands):
+            cands.insert(0, alias)
+        return [float(c) for c in cands]
+
+    def _score_preamble_cfo(self, rx: np.ndarray, sync_start: int, cfo_hz: float) -> float:
+        sync = self.sync_preamble.astype(np.complex128)
+        Ls = int(sync.size)
+        s = int(sync_start)
+        if s < 0 or s + Ls > rx.size:
+            return 0.0
+        seg = np.asarray(rx[s:s + Ls], dtype=np.complex128)
+        n = np.arange(Ls, dtype=np.float64)
+        seg = seg * np.exp(-1j * 2.0 * np.pi * float(cfo_hz) * n / max(float(self.sample_rate), 1e-12))
+        return float((np.abs(np.vdot(sync, seg)) ** 2) / (self._sync_energy * (np.vdot(seg, seg).real + 1e-12)))
+
+    def _refine_sync_and_cfo(self, rx: np.ndarray, coarse: int, search_radius: int = 24) -> Tuple[int, float, float, float]:
+        """Refine sync timing and resolve high-Doppler CFO ambiguity.
+
+        Returns (sync_start, cfo_hz, normalized_score, alias_hz).  v33 first
+        scores every alias candidate for each timing hypothesis, then applies a
+        conservative alias guard so dirty startup/reconfigure windows cannot
+        select a low-correlation ±50 kHz CFO when the physical link is near 0 Hz.
+        """
+        Ls = int(self.sync_len)
+        lo = max(0, int(coarse) - int(search_radius))
+        hi = min(rx.size - Ls, int(coarse) + int(search_radius))
+        best_idx = int(coarse)
+        best_cfo = 0.0
+        best_alias = 0.0
+        best_score = -1.0
+        best_reason = "init"
+        for s in range(lo, hi + 1):
+            alias = self._estimate_cfo_from_preamble(rx, s)
+            scored = []
+            for cand in self._preamble_cfo_candidates(alias):
+                scored.append((float(cand), self._score_preamble_cfo(rx, s, cand)))
+            chosen_cfo, chosen_score, reason = self._choose_cfo_from_scored_candidates(alias, scored)
+            # Mildly prefer the alias/hint-guarded solution if scores tie; this
+            # keeps CFO continuous across successive frames.
+            tie_bonus = 1e-4 if reason.startswith(("alias", "hint")) else 0.0
+            if chosen_score + tie_bonus > best_score:
+                best_score = float(chosen_score)
+                best_idx = int(s)
+                best_cfo = float(chosen_cfo)
+                best_alias = float(alias)
+                best_reason = str(reason)
+        self._last_cfo_alias_hz = float(best_alias)
+        self._last_cfo_scan_score = float(best_score)
+        self._last_cfo_unambiguous_hz = float(self._preamble_cfo_unambiguous_hz())
+        if abs(best_cfo - best_alias) > 0.5 and (best_score < float(getattr(self, "cfo_scan_min_score", 0.55))):
+            self._debug("DEBUG",
+                        f"CFO scan guarded: reason={best_reason}, alias={best_alias:.1f}Hz, "
+                        f"chosen={best_cfo:.1f}Hz, score={best_score:.3f}")
+        return best_idx, best_cfo, best_score, best_alias
 
     def _find_sync_peaks(self, metric: np.ndarray, max_candidates: int = 3) -> List[int]:
         if metric.size <= 3:
@@ -1259,11 +1549,14 @@ class FDIDMHardwareTest:
         return float(phase * self.sample_rate / (2.0 * np.pi * max(L, 1)))
 
     def _estimate_residual_cfo_from_pilot(self, pilot_samples: np.ndarray) -> float:
-        """Refine residual CFO between sync and data using consecutive pilot OFDM symbols.
+        """Refine residual CFO using all adjacent pilot OFDM symbols.
 
-        Each Heisenberg block is M+CP samples; the M-point DFT of two consecutive
-        blocks gives Y_TF[:, n] and Y_TF[:, n+1]. Their phase ratio per cell
-        encodes the residual CFO (since the channel is approximately the same).
+        The v31 implementation used only pilot symbols 0 and 1.  v33 keeps the averaged
+        all adjacent pairs with magnitude weighting, which lowers estimator
+        variance and makes the result less sensitive to one faded subcarrier.
+        The output is sanity-limited because this estimator assumes a mostly
+        diagonal, slowly varying TF channel; under strong TDL/Doppler it can be
+        biased and should not override the preamble CFO by an implausible amount.
         """
         if self.N < 2:
             return 0.0
@@ -1272,16 +1565,35 @@ class FDIDMHardwareTest:
         except ValueError:
             return 0.0
         x_tf = self._pilot_X_tf
-        h0 = y_tf[:, 0] / np.where(np.abs(x_tf[:, 0]) < 1e-10, 1e-10 + 0j, x_tf[:, 0])
-        h1 = y_tf[:, 1] / np.where(np.abs(x_tf[:, 1]) < 1e-10, 1e-10 + 0j, x_tf[:, 1])
-        ratios = h1 * np.conj(h0)
-        # Drop weak / inf cells
-        good = np.isfinite(ratios) & (np.abs(ratios) > 1e-6)
+        safe_x = np.where(np.abs(x_tf) < 1e-10, 1e-10 + 0j, x_tf)
+        h = y_tf / safe_x
+        ratios = h[:, 1:] * np.conj(h[:, :-1])
+        weights = np.abs(h[:, 1:]) * np.abs(h[:, :-1])
+        good = np.isfinite(ratios) & np.isfinite(weights) & (weights > 1e-10)
         if not np.any(good):
             return 0.0
-        phase = float(np.angle(np.sum(ratios[good])))
+        # Robustly drop the weakest 20% pair products when enough samples exist.
+        ww = weights[good]
+        rr = ratios[good]
+        if ww.size >= 8:
+            floor = float(np.percentile(ww, 20.0))
+            keep = ww >= floor
+            ww = ww[keep]
+            rr = rr[keep]
+        phasor = np.sum(ww * rr / np.maximum(np.abs(rr), 1e-12))
+        if not (np.isfinite(phasor.real) and np.isfinite(phasor.imag)) or abs(phasor) < 1e-12:
+            return 0.0
+        phase = float(np.angle(phasor))
         block_period = float(self.block_len) / max(self.sample_rate, 1e-12)
-        return float(phase / (2.0 * np.pi * max(block_period, 1e-12)))
+        est = float(phase / (2.0 * np.pi * max(block_period, 1e-12)))
+        max_abs = min(float(getattr(self, "residual_cfo_max_hz", 5000.0)),
+                      0.45 * float(self.sample_rate) / max(float(self.block_len), 1.0))
+        if not np.isfinite(est):
+            return 0.0
+        if abs(est) > max_abs:
+            self._debug("DEBUG", f"residual CFO rejected as out-of-range: {est:.1f} Hz > {max_abs:.1f} Hz")
+            return 0.0
+        return est
 
     def _fdidm_tx_matrix(self) -> np.ndarray:
         """A in vec(X_TF)=A vec(X), matching paper Eq. (25)."""
@@ -1463,7 +1775,7 @@ class FDIDMHardwareTest:
 
 
     # =========================================================
-    # v29: Parametric NTN-TDL channel estimation
+    # Parametric NTN-TDL channel estimation
     # =========================================================
     def _tdl_profile_components_for_estimator(self) -> List[Dict[str, Any]]:
         """Return the deterministic delay/Doppler basis used by tdl_param mode.
@@ -1547,7 +1859,7 @@ class FDIDMHardwareTest:
 
     def _tdl_param_cache_key(self) -> Tuple[Any, ...]:
         return (
-            "tdl_param_basis_v29", int(self.M), int(self.N), int(self.cp_len),
+            "tdl_param_basis_v33", int(self.M), int(self.N), int(self.cp_len),
             round(float(self.sample_rate), 6), str(self.channel_mode), str(self._tdl_model_for_current_mode()),
             round(float(self.tdl_rms_delay_spread_ns), 6),
             round(float(self.tdl_doppler_hz), 6), round(float(self.tdl_doppler_spread_hz), 6),
@@ -2049,7 +2361,7 @@ class FDIDMHardwareTest:
         # less noisy than using only the 4-byte magic.
         bps = max(self.bits_per_symbol, 1)
         # Use the coded physical bits actually mapped into the data grid.  In
-        # v30 the APP frame may be convolutionally encoded/interleaved before
+        # The APP frame may be convolutionally encoded/interleaved before
         # modulation, so using the uncoded APP bits here would estimate a wrong
         # residual scalar and rotate/scatter the constellation.
         bits = np.asarray(getattr(self, "_tx_coded_frame_bits", self._tx_frame_bits), dtype=np.int8).reshape(-1)
@@ -2078,45 +2390,51 @@ class FDIDMHardwareTest:
     def _normalize_channel_mode(self, mode: str) -> str:
         """Normalize channel path mode.
 
-        Supported values:
+        Supported hardware-facing values:
             rf          : USRP TX -> real RF/channel -> USRP RX
-            tdl_a/c/d   : pure software baseband loopback through NTN-TDL
-            rf_tdl_a/c/d: USRP RF link first, then software NTN-TDL impairment
+            rf_tdl_a/c/d: real RF first, then software NTN-TDL before decoding
+            tdl_a/c/d_rf: software NTN-TDL pre-rendered into TX, then real RF
+
+        Legacy baseband-only TDL names are mapped to RF->TDL so old saved UI settings
+        still run through the USRP instead of silently using a baseband loopback.
         """
         raw = str(mode or "rf").strip().lower()
         m = (raw.replace("-", "_").replace(" ", "_")
                 .replace("+", "_").replace("/", "_"))
         if m in ("rf", "usrp", "hardware", "hw", "off", "none", "no", "false", "0"):
             return "rf"
-        if m in ("tdl_a", "tdla", "ntn_tdl_a", "a"):
-            return "tdl_a"
-        if m in ("tdl_c", "tdlc", "ntn_tdl_c", "c"):
-            return "tdl_c"
-        if m in ("tdl_d", "tdld", "ntn_tdl_d", "d"):
-            return "tdl_d"
+        legacy_baseband = {
+            "tdl_a": "rf_tdl_a", "tdla": "rf_tdl_a", "ntn_tdl_a": "rf_tdl_a", "a": "rf_tdl_a",
+            "tdl_c": "rf_tdl_c", "tdlc": "rf_tdl_c", "ntn_tdl_c": "rf_tdl_c", "c": "rf_tdl_c",
+            "tdl_d": "rf_tdl_d", "tdld": "rf_tdl_d", "ntn_tdl_d": "rf_tdl_d", "d": "rf_tdl_d",
+        }
+        if m in legacy_baseband:
+            mapped = legacy_baseband[m]
+            self._channel_mode_note = (
+                f"legacy baseband-only channel_mode={raw!r} mapped to {mapped!r}; "
+                "baseband-only loopback is disabled in v33 so every run traverses the USRP RF path."
+            )
+            return mapped
         if m in ("rf_tdl_a", "rf_tdla", "hybrid_tdl_a", "hybrid_tdla", "usrp_tdl_a", "usrp_tdla"):
-            return "rf_tdl_a"      # real RF first, then software TDL before decoder
+            return "rf_tdl_a"
         if m in ("rf_tdl_c", "rf_tdlc", "hybrid_tdl_c", "hybrid_tdlc", "usrp_tdl_c", "usrp_tdlc"):
             return "rf_tdl_c"
         if m in ("rf_tdl_d", "rf_tdld", "hybrid_tdl_d", "hybrid_tdld", "usrp_tdl_d", "usrp_tdld"):
             return "rf_tdl_d"
         if m in ("tdl_a_rf", "tdla_rf", "tdl_a_plus_rf", "tdl_a_and_rf"):
-            return "tdl_a_rf"      # software TDL first, then transmitted through real RF
+            return "tdl_a_rf"
         if m in ("tdl_c_rf", "tdlc_rf", "tdl_c_plus_rf", "tdl_c_and_rf"):
             return "tdl_c_rf"
         if m in ("tdl_d_rf", "tdld_rf", "tdl_d_plus_rf", "tdl_d_and_rf"):
             return "tdl_d_rf"
-        # Fall back to the pure software model parser for legacy names.
-        return _NTNTDLChannel.normalize_model(m)
+        raise ValueError("channel_mode must be one of: rf, rf_tdl_a/c/d, tdl_a/c/d_rf")
 
     def _tdl_model_for_current_mode(self) -> Optional[str]:
         mode = str(getattr(self, "channel_mode", "rf")).lower()
-        if mode in _NTNTDLChannel.TDL_PROFILES:
-            return mode
         if mode.startswith("rf_tdl_"):
-            return mode[3:]      # rf_tdl_a -> tdl_a
+            return mode[3:]
         if mode.endswith("_rf") and mode[:-3] in _NTNTDLChannel.TDL_PROFILES:
-            return mode[:-3]     # tdl_a_rf -> tdl_a
+            return mode[:-3]
         return None
 
     def _rf_path_enabled(self) -> bool:
@@ -2133,69 +2451,31 @@ class FDIDMHardwareTest:
     def _tdl_after_rf_enabled(self) -> bool:
         return str(getattr(self, "channel_mode", "rf")).lower().startswith("rf_tdl_")
 
-    def _pure_software_channel_enabled(self) -> bool:
-        return self._software_channel_enabled() and not self._rf_path_enabled()
-
     def _software_known_cfo_for_current_mode(self) -> Optional[float]:
-        # In pure software TDL, the common Doppler is exactly known and there is
-        # no hardware LO offset, so using it is more stable than preamble CFO.
-        # In RF+TDL hybrid mode, the received signal also contains real USRP RF
-        # frequency/clock offset, so the preamble estimate must be used.
-        if not self._pure_software_channel_enabled():
-            return None
-        if str(getattr(self, "channel_estimator", "")).lower() not in ("tdl_param", "full_htf", "diag_tf"):
-            return None
-        fd = float(getattr(self, "tdl_doppler_hz", 0.0))
-        return fd if np.isfinite(fd) else None
+        # Every supported v33 mode includes real RF hardware, so CFO must be
+        # measured from the received preamble rather than assumed from a model.
+        return None
 
     def _guard_estimator_for_software_tdl(self) -> bool:
         """Auto-correct estimator choices that are physically mismatched.
 
-        Two guards, each at most one switch per call:
-
-          (A) Any real-RF path (pure "rf", "rf_tdl_*", or "*_rf") carries the
-              physical RF channel response - cable/antenna multipath plus the
-              USRP analog front-end filtering.  That response is NOT in the pure
-              parametric TDL basis, so tdl_param cannot represent it; and the
-              MN-dimensional full-H_TF inverse is ill-conditioned and amplifies
-              noise on it.  For a CP-fitting link the TF channel is diagonal, so
-              the per-subcarrier diag_tf estimator is both correct and
-              well-conditioned.  Therefore steer RF + tdl_param -> diag_tf.
-              full_htf is left untouched here so it stays available for advanced
-              non-diagonal *static* RF studies.
-
-          (B) A purely-software, time-varying TDL channel is genuinely not
-              diagonal in TF; the parametric path-gain estimator tracks its
-              Doppler.  full_htf is reserved for static studies, so dynamic
-              software + full_htf -> tdl_param (the original v29 guard).
+        Any supported mode carries the physical RF response. The parametric TDL
+        basis describes only the optional software NTN-TDL stage and cannot
+        represent cable/antenna multipath or USRP analog filtering. For RF
+        cascades, full-H_TF is also noisy/ill-conditioned at practical M*N, so
+        the default receiver is the robust per-subcarrier diagonal estimator.
         """
         if not bool(getattr(self, "auto_tdl_param_for_software", True)):
             return False
         est = str(getattr(self, "channel_estimator", "")).lower()
         rf_path = self._rf_path_enabled()
         rf_cascade = rf_path and self._software_channel_enabled()
-        # tdl_param can never represent a real RF response; full_htf is left for
-        # advanced *static* pure-RF studies, but on an RF+software cascade its
-        # MN-probe inverse is too noise-fragile to invert the combined channel,
-        # so steer that case to the well-conditioned diagonal estimator too.
         if rf_path and (est == "tdl_param" or (rf_cascade and est == "full_htf")):
             self.channel_estimator = "diag_tf"
             self._estimator_auto_note = (
                 f"auto-switched estimator {est} -> diag_tf because the channel includes a "
-                "real RF path whose response the pure-TDL basis cannot represent (and the "
-                "MN-probe full-H_TF inverse amplifies noise on a real link); the per-subcarrier "
-                "diagonal estimator is well-conditioned for a CP-fitting link."
-            )
-            return True
-        dynamic = (
-            self._software_channel_enabled() and
-            (abs(float(getattr(self, "tdl_doppler_hz", 0.0))) > 1e-9 or
-             abs(float(getattr(self, "tdl_doppler_spread_hz", 0.0))) > 1e-9)
-        )
-        if dynamic and est == "full_htf":
-            self.channel_estimator = "tdl_param"
-            self._estimator_auto_note = (
-                "auto-switched estimator full_htf -> tdl_param because the configured software TDL is time-varying."
+                "real RF path; the parametric TDL basis cannot represent hardware RF response, "
+                "and full-H_TF on an RF+TDL cascade is usually ill-conditioned."
             )
             return True
         return False
@@ -2217,7 +2497,7 @@ class FDIDMHardwareTest:
 
         class _TDLChannelBlock(gr.sync_block):
             def __init__(self):
-                gr.sync_block.__init__(self, name="ntn_tdl_channel_v29", in_sig=[np.complex64], out_sig=[np.complex64])
+                gr.sync_block.__init__(self, name="ntn_tdl_channel_v33", in_sig=[np.complex64], out_sig=[np.complex64])
                 self.channel = channel
 
             def work(self, input_items, output_items):
@@ -2371,16 +2651,14 @@ class FDIDMHardwareTest:
         uses_rf = self._rf_path_enabled()
         uses_tdl = self._software_channel_enabled()
         tdl_model = self._tdl_model_for_current_mode()
-        time.sleep(0.25 if uses_rf else 0.05)
+        if not uses_rf:
+            raise RuntimeError(f"channel_mode={self.channel_mode!r} does not traverse the USRP RF path; baseband-only loopback is disabled")
+        time.sleep(0.25)
 
-        if uses_rf and uses_tdl:
-            if self._tdl_before_rf_enabled():
-                mode_text = (f"software {tdl_model} pre-rendered -> USRP RF"
-                             if self.tx_prerender_tdl_before_rf else f"software {tdl_model} -> USRP RF")
-            else:
-                mode_text = f"USRP RF -> software {tdl_model}"
+        if uses_tdl and self._tdl_before_rf_enabled():
+            mode_text = f"software {tdl_model} pre-rendered -> USRP RF"
         elif uses_tdl:
-            mode_text = f"software {tdl_model}"
+            mode_text = f"USRP RF -> software {tdl_model}"
         else:
             mode_text = "USRP RF"
         self._debug("INFO",
@@ -2391,7 +2669,7 @@ class FDIDMHardwareTest:
         class _TopBlock(gr.top_block):
             pass
 
-        tb = _TopBlock("FDIDM Hardware Test v30", catch_exceptions=True)
+        tb = _TopBlock("FDIDM Hardware Test v33", catch_exceptions=True)
         vector_source = blocks.vector_source_c(self._tx_waveform.tolist(), True, 1, [])
         tx_gain_block = blocks.multiply_const_cc(1.0)
         tx_sink_vec = None
@@ -2400,7 +2678,7 @@ class FDIDMHardwareTest:
         usrp_source = None
         usrp_sink = None
         throttle_block = None
-        live_tdl_needed = uses_tdl and not (uses_rf and self._tdl_before_rf_enabled() and self.tx_prerender_tdl_before_rf)
+        live_tdl_needed = uses_tdl and not self._tdl_before_rf_enabled()
         tdl_channel_block = self._make_tdl_channel_block() if live_tdl_needed else None
 
         tx_min_buf = int(max(32768, min(max(self._tx_waveform.size // 4, 32768), 262144)))
@@ -2412,80 +2690,59 @@ class FDIDMHardwareTest:
 
         tb.connect((vector_source, 0), (tx_gain_block, 0))
 
-        if uses_rf:
-            if uhd is None:
-                raise RuntimeError("GNU Radio UHD module is unavailable but RF path requires USRP.")
-            usrp_source = uhd.usrp_source(
-                ",".join(("", self._usrp_args)),
-                uhd.stream_args(cpu_format="fc32", args=self._rx_stream_args(), channels=list(range(0, 1))),
-            )
-            usrp_source.set_subdev_spec("A:A", 0)
-            usrp_source.set_samp_rate(self.sample_rate)
-            usrp_source.set_time_unknown_pps(uhd.time_spec(0))
-            usrp_source.set_center_freq(self.carrier_freq, 0)
-            usrp_source.set_antenna(self.rx_antenna, 0)
-            usrp_source.set_gain(self.rx_gain, 0)
-            try:
-                usrp_source.set_min_output_buffer(max(32768, int(self._rx_probe_len)))
-            except Exception:
-                pass
-            usrp_sink = uhd.usrp_sink(
-                ",".join(("", self._usrp_args)),
-                uhd.stream_args(cpu_format="fc32", args=self._tx_stream_args(), channels=list(range(0, 1))),
-                "",
-            )
-            usrp_sink.set_subdev_spec("A:A", 0)
-            usrp_sink.set_samp_rate(self.sample_rate)
-            usrp_sink.set_time_unknown_pps(uhd.time_spec(0))
-            usrp_sink.set_center_freq(self.carrier_freq, 0)
-            usrp_sink.set_antenna(self.tx_antenna, 0)
-            usrp_sink.set_gain(self.tx_gain, 0)
-            if uses_tdl and self._tdl_before_rf_enabled():
-                if self.tx_prerender_tdl_before_rf:
-                    tb.connect((tx_gain_block, 0), (usrp_sink, 0))
-                    rx_input = usrp_source
-                    log_label = "software TDL pre-rendered into TX vector before USRP RF"
-                else:
-                    tb.connect((tx_gain_block, 0), (tdl_channel_block, 0))
-                    tb.connect((tdl_channel_block, 0), (usrp_sink, 0))
-                    rx_input = usrp_source
-                    log_label = "LIVE software TDL before USRP RF (underflow risk)"
-            else:
-                tb.connect((tx_gain_block, 0), (usrp_sink, 0))
-                rx_input = usrp_source
-                log_label = "USRP RF only"
-                if uses_tdl:
-                    tb.connect((usrp_source, 0), (tdl_channel_block, 0))
-                    rx_input = tdl_channel_block
-                    log_label = "USRP RF before software TDL"
-            if uses_tdl:
-                try:
-                    if tdl_channel_block is not None:
-                        self._debug("INFO", f"hybrid configured ({log_label}): " + tdl_channel_block.channel_summary())
-                    else:
-                        self._debug("INFO", f"hybrid configured ({log_label}); live GNU Radio TX path has no Python TDL block")
-                except Exception:
-                    pass
-            if rx_stream_to_vector is not None:
-                tb.connect((rx_input, 0), (rx_stream_to_vector, 0))
-                tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
-            else:
-                tb.connect((rx_input, 0), (rx_sink_vec, 0))
+        if uhd is None:
+            raise RuntimeError("GNU Radio UHD module is unavailable but RF path requires USRP.")
+        usrp_source = uhd.usrp_source(
+            ",".join(("", self._usrp_args)),
+            uhd.stream_args(cpu_format="fc32", args=self._rx_stream_args(), channels=list(range(0, 1))),
+        )
+        usrp_source.set_subdev_spec("A:A", 0)
+        usrp_source.set_samp_rate(self.sample_rate)
+        usrp_source.set_time_unknown_pps(uhd.time_spec(0))
+        usrp_source.set_center_freq(self.carrier_freq, 0)
+        usrp_source.set_antenna(self.rx_antenna, 0)
+        usrp_source.set_gain(self.rx_gain, 0)
+        try:
+            usrp_source.set_min_output_buffer(max(32768, int(self._rx_probe_len)))
+        except Exception:
+            pass
+
+        usrp_sink = uhd.usrp_sink(
+            ",".join(("", self._usrp_args)),
+            uhd.stream_args(cpu_format="fc32", args=self._tx_stream_args(), channels=list(range(0, 1))),
+            "",
+        )
+        usrp_sink.set_subdev_spec("A:A", 0)
+        usrp_sink.set_samp_rate(self.sample_rate)
+        usrp_sink.set_time_unknown_pps(uhd.time_spec(0))
+        usrp_sink.set_center_freq(self.carrier_freq, 0)
+        usrp_sink.set_antenna(self.tx_antenna, 0)
+        usrp_sink.set_gain(self.tx_gain, 0)
+
+        tb.connect((tx_gain_block, 0), (usrp_sink, 0))
+        rx_input = usrp_source
+        log_label = "USRP RF only"
+        if uses_tdl and self._tdl_before_rf_enabled():
+            log_label = "software TDL pre-rendered into TX vector before USRP RF"
         elif uses_tdl:
-            throttle_block = blocks.throttle(gr.sizeof_gr_complex, float(self.sample_rate), True)
-            tb.connect((tx_gain_block, 0), (throttle_block, 0))
-            tb.connect((throttle_block, 0), (tdl_channel_block, 0))
-            if rx_stream_to_vector is not None:
-                tb.connect((tdl_channel_block, 0), (rx_stream_to_vector, 0))
-                tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
-            else:
-                tb.connect((tdl_channel_block, 0), (rx_sink_vec, 0))
+            tb.connect((usrp_source, 0), (tdl_channel_block, 0))
+            rx_input = tdl_channel_block
+            log_label = "USRP RF before software TDL"
+
+        if uses_tdl:
             try:
-                self._debug("INFO", "pure software channel configured: " + tdl_channel_block.channel_summary())
-            except Exception:
-                pass
+                if tdl_channel_block is not None:
+                    self._debug("INFO", f"hybrid configured ({log_label}): " + tdl_channel_block.channel_summary())
+                else:
+                    self._debug("INFO", f"hybrid configured ({log_label}); live GNU Radio TX path has no Python TDL block")
+            except Exception as e:
+                self._debug("WARN", f"TDL summary unavailable: {type(e).__name__}: {e}")
+
+        if rx_stream_to_vector is not None:
+            tb.connect((rx_input, 0), (rx_stream_to_vector, 0))
+            tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
         else:
-            raise RuntimeError(f"Unsupported channel_mode={self.channel_mode}")
+            tb.connect((rx_input, 0), (rx_sink_vec, 0))
 
         self._tb = tb
         self._usrp_source = usrp_source
@@ -2538,6 +2795,92 @@ class FDIDMHardwareTest:
             self._rx_probe_total_est = 0
             self._rx_probe_last_fp = None
             self._last_processed_abs_start = -10 ** 18
+        self._needs_top_block_rebuild = False
+
+    def _current_cfo_mode_key(self) -> str:
+        return (
+            f"mode={getattr(self, 'channel_mode', 'rf')}|Fs={float(getattr(self, 'sample_rate', 0.0)):.3f}|"
+            f"M={int(getattr(self, 'M', 0))}|N={int(getattr(self, 'N', 0))}|"
+            f"fc={float(getattr(self, 'carrier_freq', 0.0)):.3f}|"
+            f"tdl_fd={float(getattr(self, 'tdl_doppler_hz', 0.0)):.3f}"
+        )
+
+    def _reset_rx_runtime_state(self, reason: str = "reset", reset_counters: bool = False):
+        """Clear RX/probe/decoder state after any graph or waveform transition.
+
+        This prevents stale probe vectors or half-old/half-new frames from being
+        interpreted as valid FDIDM frames after a parameter switch.  TX preview
+        data is intentionally left intact.
+        """
+        with self._lock:
+            try:
+                self._rx_buffer.clear()
+            except Exception:
+                pass
+            self._latest_rx_samples = np.zeros(4096, dtype=np.complex64)
+            self._latest_rx_frame_samples = np.zeros(0, dtype=np.complex64)
+            self._latest_rx_data_samples = np.zeros(0, dtype=np.complex64)
+            self._latest_rx_pilot_samples = np.zeros(0, dtype=np.complex64)
+            self._latest_constellation = np.zeros(0, dtype=np.complex64)
+            self._latest_constellation_post_eq = np.zeros(0, dtype=np.complex64)
+            self._latest_constellation_post_eq_raw = np.zeros(0, dtype=np.complex64)
+            self._latest_constellation_pre_eq = np.zeros(0, dtype=np.complex64)
+            self._latest_constellation_tf = np.zeros(0, dtype=np.complex64)
+            self._last_constellation_is_good = False
+            self._last_constellation_source = "none"
+            self.last_constellation_source = "none"
+            self.last_constellation_points = 0
+            self.last_constellation_quality = "reset"
+            self._rx_text = ""
+            self._decode_ok = False
+            self._match_bytes = 0
+            self._ber_estimate = float("nan")
+            self._last_fec_bit_ber = float("nan")
+            self._last_raw_bit_ber = float("nan")
+            self.last_frame_ok = False
+            self.last_bad_reason = reason
+            self.last_sync_metric = 0.0
+            self.last_cfo_est_hz = 0.0
+            self.last_cfo_preamble_hz = 0.0
+            self.last_cfo_source = "reset"
+            self._last_cfo_alias_hz = float("nan")
+            self._last_cfo_scan_score = float("nan")
+            self.last_evm_instant_percent = float("nan")
+            self.last_evm_average_percent = float("nan")
+            self._evm_history.clear()
+            self._rx_last_new_samples = 0
+            self._rx_stream_updates = 0
+            self._rx_latest_window_len = 0
+            self._rx_last_update_wall = 0.0
+            self._rx_spectrum_stale = True
+            self._rx_spectrum_stale_sec = float("inf")
+            self._rx_samples_seen = 0
+            self._rx_probe_total_est = 0
+            self._rx_probe_last_fp = None
+            self._last_processed_abs_start = -10 ** 18
+            self._last_process_t = 0.0
+            if reset_counters:
+                self._frames_processed = 0
+                self._frames_decode_ok = 0
+                self._ber_hist_t.clear()
+                self._ber_hist_v.clear()
+        self._debug("INFO", f"runtime RX state reset: reason={reason}, reset_counters={bool(reset_counters)}")
+
+    def _arm_startup_settle(self):
+        now = time.time()
+        self._rx_settle_until_wall = now + float(getattr(self, "startup_settle_sec", 0.0))
+        self._rx_settle_windows_remaining = int(max(0, getattr(self, "startup_settle_windows", 0)))
+        self._debug("INFO",
+                    f"startup settle armed: {self.startup_settle_sec*1000:.0f} ms + "
+                    f"{self._rx_settle_windows_remaining} fresh RX vector(s)")
+
+    def _in_startup_settle(self, rx_new_samples: int) -> bool:
+        now = time.time()
+        settling_time = now < float(getattr(self, "_rx_settle_until_wall", 0.0))
+        if int(rx_new_samples) > 0 and int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0:
+            self._rx_settle_windows_remaining = max(0, int(self._rx_settle_windows_remaining) - 1)
+        settling_windows = int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0
+        return bool(settling_time or settling_windows)
 
     def _waveform_fingerprint(self) -> str:
 
@@ -2574,35 +2917,30 @@ class FDIDMHardwareTest:
         return self._waveform_fingerprint()
 
     def _sync_waveform_to_top_block(self):
+        """Push the current TX vector into the GNU Radio source.
+
+        v32/v33-pre rebuilt the entire top_block from this offline path.  That made one
+        UI parameter application trigger two UHD teardown/build cycles: once
+        here and once again in configure().  v33 keeps this method side-effect
+        bounded: when stopped, it updates vector_source_c in place whenever
+        possible and only queues a rebuild if the vector source cannot be
+        updated or configure() already knows the graph structure changed.
+        """
 
         if self._tb is None or self._vector_source is None:
-            self._debug("WARN", "_sync_waveform_to_top_block: no top_block yet, skipping")
+            self._debug("WARN", "_sync_waveform_to_top_block: no top_block/vector_source yet; queued rebuild")
+            self._needs_top_block_rebuild = True
             return
 
         fingerprint = self._waveform_fingerprint()
-
-        if not self._running:
-            self._debug("INFO", f"sync (offline rebuild path): {fingerprint}")
-            try:
-                self._build_top_block()
-                self._needs_top_block_rebuild = False
-            except Exception as e:
-                self._debug("ERROR", f"offline rebuild failed: {type(e).__name__}: {e}")
-                self._needs_top_block_rebuild = True
-            return
-
-        # Running path: live swap.
-        self._debug("INFO", f"sync (live swap path): {fingerprint}")
+        data_list = self._tx_waveform.astype(np.complex64).tolist()
+        path = "live swap" if self._running else "offline set_data"
+        self._debug("INFO", f"sync ({path} path): {fingerprint}")
         try:
-            data_list = self._tx_waveform.astype(np.complex64).tolist()
-            # set_data() in modern GR (3.8+) takes (data, tags); older accept
-            # just (data). Try both.
             try:
                 self._vector_source.set_data(data_list, [])
             except TypeError:
                 self._vector_source.set_data(data_list)
-            # Force the source to restart from offset 0 so we don't emit a
-            # half-old / half-new transient frame.
             try:
                 self._vector_source.rewind()
             except Exception:
@@ -2613,11 +2951,12 @@ class FDIDMHardwareTest:
                 except Exception:
                     pass
             self._needs_top_block_rebuild = False
-            self._debug("INFO", "live set_data() + rewind ok")
+            self._reset_rx_runtime_state(reason=f"waveform_sync_{path.replace(' ', '_')}", reset_counters=False)
+            self._debug("INFO", f"{path}: set_data() + rewind ok")
         except Exception as e:
             self._debug("WARN",
-                        f"live set_data() failed ({type(e).__name__}: {e}); "
-                        f"flagging rebuild for next stop/start")
+                        f"{path}: set_data() failed ({type(e).__name__}: {e}); "
+                        f"queued top_block rebuild for next start/configure")
             self._needs_top_block_rebuild = True
 
     # Legacy alias kept for any external caller.
@@ -2654,6 +2993,13 @@ class FDIDMHardwareTest:
             tx_max_waveform_samples: Optional[int] = None,
             tx_prerender_tdl_before_rf: Optional[bool] = None,
             enable_realtime_scheduling: Optional[bool] = None,
+            cfo_search_enable: Optional[bool] = None,
+            cfo_search_max_hz: Optional[float] = None,
+            residual_cfo_max_hz: Optional[float] = None,
+            startup_settle_ms: Optional[float] = None,
+            startup_settle_windows: Optional[int] = None,
+            cfo_scan_min_score: Optional[float] = None,
+            cfo_scan_jump_guard_hz: Optional[float] = None,
             coding_scheme: Optional[str] = None,
             coding_interleaver: Optional[bool] = None,
             channel_mode: Optional[str] = None,
@@ -2673,8 +3019,8 @@ class FDIDMHardwareTest:
     ):
 
         if self._running:
-            # We allow hot-swapping a small subset of params while running.
-            # Software-channel settings rebuild the top_block, so stop first.
+            # Only gain-like live changes are accepted while running.
+            # Structural/channel changes rebuild the waveform or the UHD graph.
             hot_swap_ok = all(v is None for v in (samp_rate, fdidm_m, fdidm_n, cp_len,
                                                   alpha, beta, mod_order, device_type, channel_estimator,
                                                   channel_mode, software_channel_model,
@@ -2684,7 +3030,10 @@ class FDIDMHardwareTest:
                                                   tdl_param_num_sinusoids, tdl_param_max_paths,
                                                   tdl_param_ridge, tdl_param_prune_db,
                                                   tx_min_waveform_duration_ms, tx_max_waveform_samples,
-                                                  tx_prerender_tdl_before_rf, coding_scheme, coding_interleaver,
+                                                  tx_prerender_tdl_before_rf, cfo_search_enable, cfo_search_max_hz,
+                                                  residual_cfo_max_hz, startup_settle_ms, startup_settle_windows,
+                                                  cfo_scan_min_score, cfo_scan_jump_guard_hz,
+                                                  coding_scheme, coding_interleaver,
                                                   auto_tdl_param_for_software))
             if not hot_swap_ok:
                 raise RuntimeError("Cannot reconfigure structural/channel parameters while running; stop first.")
@@ -2750,18 +3099,21 @@ class FDIDMHardwareTest:
         if fdidm_m is not None:
             new_m = int(max(4, min(int(fdidm_m), 64)))
             if new_m != self.M:
-                self.M = new_m;
+                self.M = new_m
                 rebuild_waveform = True
+                rebuild_top_block = True
         if fdidm_n is not None:
             new_n = int(max(1, min(int(fdidm_n), 64)))
             if new_n != self.N:
-                self.N = new_n;
+                self.N = new_n
                 rebuild_waveform = True
+                rebuild_top_block = True
         if cp_len is not None:
             new_cp = int(max(0, min(int(cp_len), max(self.M - 1, 0))))
             if new_cp != self.cp_len:
-                self.cp_len = new_cp;
+                self.cp_len = new_cp
                 rebuild_waveform = True
+                rebuild_top_block = True
         if tx_frame_count is not None:
             new_fc = int(max(1, min(int(tx_frame_count), 32)))
             if new_fc != self.tx_frame_count:
@@ -2770,8 +3122,9 @@ class FDIDMHardwareTest:
         if inter_frame_guard_len is not None:
             new_ig = int(max(0, min(int(inter_frame_guard_len), 8192)))
             if new_ig != self.inter_frame_guard_len:
-                self.inter_frame_guard_len = new_ig;
+                self.inter_frame_guard_len = new_ig
                 rebuild_waveform = True
+                rebuild_top_block = True
         if evm_average_frames is not None:
             new_ev = int(max(1, min(int(evm_average_frames), 128)))
             if new_ev != self.evm_average_frames:
@@ -2788,8 +3141,9 @@ class FDIDMHardwareTest:
         if max_full_htf_order is not None:
             new_max = int(max(16, max_full_htf_order))
             if new_max != self.max_full_htf_order:
-                self.max_full_htf_order = new_max;
+                self.max_full_htf_order = new_max
                 rebuild_waveform = True
+                rebuild_top_block = True
         if channel_estimator is not None:
             new_ce = str(channel_estimator).lower()
             if new_ce in ("tdl", "tdl_path", "tdl_paths", "tdl_parametric", "tdl_param_est"):
@@ -2799,6 +3153,7 @@ class FDIDMHardwareTest:
             if new_ce != self.channel_estimator:
                 self.channel_estimator = new_ce
                 rebuild_waveform = True
+                rebuild_top_block = True
         if full_htf_update_interval_frames is not None:
             self.full_htf_update_interval_frames = int(max(1, min(int(full_htf_update_interval_frames), 10_000)))
         if process_interval_ms is not None:
@@ -2816,14 +3171,31 @@ class FDIDMHardwareTest:
             if v != self.tx_max_waveform_samples:
                 self.tx_max_waveform_samples = v
                 rebuild_waveform = True
-        if tx_prerender_tdl_before_rf is not None:
-            v = bool(tx_prerender_tdl_before_rf)
-            if v != self.tx_prerender_tdl_before_rf:
-                self.tx_prerender_tdl_before_rf = v
-                rebuild_waveform = True
-                rebuild_top_block = True
+        if tx_prerender_tdl_before_rf is not None and not bool(tx_prerender_tdl_before_rf):
+            self._debug("WARN", "TDL->RF live Python channel was requested but is disabled in v33; TX-side TDL remains pre-rendered to protect UHD from underflow")
+        self.tx_prerender_tdl_before_rf = True
         if enable_realtime_scheduling is not None:
             self.enable_realtime_scheduling = bool(enable_realtime_scheduling)
+        if cfo_search_enable is not None:
+            v = bool(cfo_search_enable)
+            if v != self.cfo_search_enable:
+                self.cfo_search_enable = v
+        if cfo_search_max_hz is not None:
+            v = float(max(0.0, min(float(cfo_search_max_hz), max(self.sample_rate / 2.0, 1.0))))
+            if v != self.cfo_search_max_hz:
+                self.cfo_search_max_hz = v
+        if residual_cfo_max_hz is not None:
+            v = float(max(0.0, min(float(residual_cfo_max_hz), max(self.sample_rate / 4.0, 1.0))))
+            if v != self.residual_cfo_max_hz:
+                self.residual_cfo_max_hz = v
+        if startup_settle_ms is not None:
+            self.startup_settle_sec = float(max(0.0, min(float(startup_settle_ms) / 1000.0, 5.0)))
+        if startup_settle_windows is not None:
+            self.startup_settle_windows = int(max(0, min(int(startup_settle_windows), 32)))
+        if cfo_scan_min_score is not None:
+            self.cfo_scan_min_score = float(max(0.0, min(float(cfo_scan_min_score), 1.0)))
+        if cfo_scan_jump_guard_hz is not None:
+            self.cfo_scan_jump_guard_hz = float(max(0.0, min(float(cfo_scan_jump_guard_hz), max(self.sample_rate / 2.0, 1.0))))
         if coding_scheme is not None:
             v = self._normalize_coding_scheme(coding_scheme)
             if v != self.coding_scheme:
@@ -2839,17 +3211,24 @@ class FDIDMHardwareTest:
         if auto_tdl_param_for_software is not None:
             self.auto_tdl_param_for_software = bool(auto_tdl_param_for_software)
 
-        # Software channel settings.  Any change invalidates one-shot CSI and
-        # rebuilds the flowgraph because the channel is a live GNU Radio block.
+        # Channel settings. Every mode traverses USRP RF; optional TDL stages either
+        # run after RX or are pre-rendered before TX. Any change invalidates CSI.
         new_channel_mode = None
+        if software_channel_model is not None or channel_mode is not None:
+            self._channel_mode_note = ""
         if software_channel_model is not None:
             new_channel_mode = self._normalize_channel_mode(software_channel_model)
         elif channel_mode is not None:
             new_channel_mode = self._normalize_channel_mode(channel_mode)
+        if getattr(self, "_channel_mode_note", ""):
+            self._debug("WARN", self._channel_mode_note)
         if new_channel_mode is not None and new_channel_mode != self.channel_mode:
+            old_channel_mode = str(self.channel_mode)
             self.channel_mode = new_channel_mode
             rebuild_top_block = True
+            rebuild_waveform = True  # channel direction can change whether TX is TDL-pre-rendered
             self._clear_channel_cache()
+            self._debug("INFO", f"channel_mode changed: {old_channel_mode} -> {self.channel_mode}; TX waveform/graph will be refreshed")
 
         if tdl_rms_delay_spread_ns is not None:
             v = float(max(0.0, float(tdl_rms_delay_spread_ns)))
@@ -2891,7 +3270,7 @@ class FDIDMHardwareTest:
             if v != self.tdl_param_num_sinusoids:
                 self.tdl_param_num_sinusoids = v
                 self._clear_channel_cache()
-                if self._tdl_before_rf_enabled() and self.tx_prerender_tdl_before_rf:
+                if self._tdl_before_rf_enabled():
                     rebuild_waveform = True
         if tdl_param_max_paths is not None:
             v = int(max(1, min(int(tdl_param_max_paths), 512)))
@@ -2907,9 +3286,9 @@ class FDIDMHardwareTest:
             if v != self.tdl_param_prune_db:
                 self.tdl_param_prune_db = v
 
-        if rebuild_top_block and self._tdl_before_rf_enabled() and self.tx_prerender_tdl_before_rf:
-            # The live graph is RF-only in TDL->RF pre-render mode, so any TDL
-            # parameter/mode change must also regenerate the TX vector.
+        if rebuild_top_block and self._tdl_before_rf_enabled():
+            # TDL->RF uses an RF-only live TX graph; TDL changes must regenerate
+            # the pre-rendered TX vector as well as rebuild the RX graph.
             rebuild_waveform = True
 
         self._estimator_auto_note = ""
@@ -2941,12 +3320,10 @@ class FDIDMHardwareTest:
                 self._debug("WARN", self._estimator_auto_note)
             self._set_tx_text_internal(self._tx_text if tx_text is None else str(tx_text))
             self._tx_buffer.write(self._tx_waveform.astype(np.complex64, copy=False))
-            # v17.1 fix: ALWAYS sync the new waveform to the GR top_block,
-            # not just when running. When the UI does stop()->configure()->start()
-            # we are *not* running between configure and start, so the old gating
-            # `if self._running:` was the reason alpha/beta changes had no effect
-            # on TX-side: the USRP just kept replaying the old vector_source data.
+            # Always sync the new waveform to the GNU Radio vector source, even
+            # while stopped, so the next start cannot replay stale samples.
             self._sync_waveform_to_top_block()
+            self._debug("INFO", self._format_link_limit_summary())
 
         if rebuild_top_block and not self._running:
             self._debug("INFO",
@@ -2955,6 +3332,7 @@ class FDIDMHardwareTest:
                         f"spread={self.tdl_doppler_spread_hz:.1f}Hz, SNR={self.tdl_snr_db:.1f}dB")
             self._usrp_args = self._build_device_args()
             self._build_top_block()
+            self._debug("INFO", self._format_link_limit_summary())
 
     # =========================================================
     # Runtime
@@ -2973,6 +3351,8 @@ class FDIDMHardwareTest:
             except Exception as e:
                 self._debug("ERROR", f"start(): queued rebuild failed: {type(e).__name__}: {e}")
                 raise
+        self._run_id = int(getattr(self, "_run_id", 0)) + 1
+        self._reset_rx_runtime_state(reason=f"start_run_{self._run_id}", reset_counters=True)
         if bool(getattr(self, "enable_realtime_scheduling", True)):
             try:
                 rt = self._gr.enable_realtime_scheduling()
@@ -2990,6 +3370,7 @@ class FDIDMHardwareTest:
         self._tb.start()
         self._tx_preview_start_t = time.time()
         self._rx_probe_start_t = time.time()
+        self._arm_startup_settle()
         self._last_process_t = 0.0
         self._rx_probe_total_est = 0
         self._rx_probe_last_fp = None
@@ -3122,7 +3503,15 @@ class FDIDMHardwareTest:
                                 f"frames_processed={self._frames_processed}, "
                                 f"frames_decode_ok={self._frames_decode_ok}")
                     self._monitor_last_log_t = now
-                if rx_data_size > 0 and rx_window.size >= self.frame_len:
+                settling = self._in_startup_settle(rx_data_size)
+                if settling and rx_data_size > 0:
+                    self._last_process_t = now
+                    if self._monitor_cycles <= 8 or now - self._monitor_last_log_t > 1.0:
+                        self._debug("DEBUG",
+                                    f"startup settle: dropping RX vector, new={rx_data_size}, "
+                                    f"remaining_windows={int(getattr(self, '_rx_settle_windows_remaining', 0))}, "
+                                    f"time_left={max(0.0, float(getattr(self, '_rx_settle_until_wall', 0.0)) - now):.3f}s")
+                if (not settling) and rx_data_size > 0 and rx_window.size >= self.frame_len:
                     if now - self._last_process_t >= float(self.process_interval_sec):
                         self._last_process_t = now
                         rx_window = rx_window[-process_window_len:]
@@ -3183,7 +3572,9 @@ class FDIDMHardwareTest:
         attempts = 0
         for coarse in peaks:
             attempts += 1
-            sync_start = self._refine_sync_start(sync_rx, coarse, search_radius=max(16, self.M // 2))
+            sync_start, cfo_scan_hz, cfo_scan_score, cfo_alias_hz = self._refine_sync_and_cfo(
+                sync_rx, coarse, search_radius=max(16, self.M // 2)
+            )
             frame_start = sync_start - self.pre_guard_len
             frame_end = frame_start + self.frame_len
             if frame_start < 0 or frame_end > rx_window.size:
@@ -3198,14 +3589,14 @@ class FDIDMHardwareTest:
                             f"(last_processed={self._last_processed_abs_start})")
                 continue
 
-            cfo_hz_preamble = self._estimate_cfo_from_preamble(rx_window, sync_start)
+            cfo_hz_preamble = float(cfo_scan_hz)
             cfo_known = self._software_known_cfo_for_current_mode()
             if cfo_known is not None:
                 cfo_hz = float(cfo_known)
                 cfo_source = "software_known_common_doppler"
             else:
                 cfo_hz = float(cfo_hz_preamble)
-                cfo_source = "preamble"
+                cfo_source = "preamble_scan" if abs(float(cfo_scan_hz) - float(cfo_alias_hz)) > 0.5 else "preamble"
             frame_raw = rx_window[frame_start:frame_end].copy()
             t_idx = np.arange(frame_raw.size, dtype=np.float64)
             frame = frame_raw * np.exp(-1j * 2.0 * np.pi * cfo_hz * t_idx / max(self.sample_rate, 1e-12))
@@ -3315,6 +3706,7 @@ class FDIDMHardwareTest:
             sync_here = float(metric[min(max(int(coarse), 0), len(metric) - 1)])
             self._debug("DEBUG",
                         f"candidate #{attempts}: sync={sync_here:.3f}, CFO={cfo_hz:.1f} Hz({cfo_source}), rawCFO={cfo_hz_preamble:.1f} Hz, "
+                        f"alias={float(cfo_alias_hz):.1f}Hz, scanScore={float(cfo_scan_score):.3f}, "
                         f"res_CFO={res_cfo:.1f} Hz, cond={cond_val:.2e}, noise_var={noise_var:.3e}, "
                         f"BER={ber:.3e}, EVM={evm_inst:.2f}%, decode_ok={decode_ok}, "
                         f"match={match_bytes}/{len(self._tx_payload)}, frame_start={frame_start}")
@@ -3328,6 +3720,7 @@ class FDIDMHardwareTest:
                 score=score, frame_start=int(frame_start),
                 abs_frame_start=int(abs_frame_start),
                 sync_metric=sync_here, cfo_hz=float(cfo_hz), cfo_hz_preamble=float(cfo_hz_preamble), cfo_source=str(cfo_source),
+                cfo_alias_hz=float(cfo_alias_hz), cfo_scan_score=float(cfo_scan_score),
                 htf_leakage=float(leakage), cond_h=float(cond_val),
                 noise_var=float(noise_var),
                 warning=warning, ber=float(ber),
@@ -3386,7 +3779,7 @@ class FDIDMHardwareTest:
             self.last_evm_instant_percent = float(best["evm_inst"])
         if good_quality:
             self._update_evm_history(best["evm_inst"])
-        # v29: always publish the best candidate constellation as a diagnostic,
+        # Always publish the best candidate constellation as a diagnostic,
         # even if CRC/BER quality gates fail.  The status field
         # last_constellation_source tells the UI whether it is a good frame or a
         # failed-frame diagnostic cloud.
@@ -3403,6 +3796,13 @@ class FDIDMHardwareTest:
             self.last_cfo_est_hz = float(best["cfo_hz"])
             self.last_cfo_preamble_hz = float(best.get("cfo_hz_preamble", best["cfo_hz"]))
             self.last_cfo_source = str(best.get("cfo_source", "preamble"))
+            self._last_cfo_alias_hz = float(best.get("cfo_alias_hz", float("nan")))
+            self._last_cfo_scan_score = float(best.get("cfo_scan_score", float("nan")))
+            self._last_cfo_unambiguous_hz = float(self._preamble_cfo_unambiguous_hz())
+            if good_quality and np.isfinite(float(best["cfo_hz"])):
+                self._last_good_cfo_hz = float(best["cfo_hz"])
+                self._last_good_cfo_wall = time.time()
+                self._last_good_cfo_mode_key = self._current_cfo_mode_key()
             self.last_htf_nmse = float(best["htf_leakage"])
             self.last_cond_h_cross = float(best["cond_h"])
             self.last_noise_var = float(best["noise_var"])
@@ -3441,9 +3841,10 @@ class FDIDMHardwareTest:
             self._status = "running"
         self._debug(
             "INFO",
-            f"v29 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
+            f"v33 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
+            f"alias={best.get('cfo_alias_hz', float('nan')):.1f}Hz, scanScore={best.get('cfo_scan_score', float('nan')):.3f}, "
             f"Hleak={best['htf_leakage']:.3f}, cond={best['cond_h']:.2e}, "
-            f"BER={best['ber']:.3e}, EVM={best['evm_inst']:.2f}%, "
+            f"BER={best['ber']:.3e}, rawBER={float(getattr(self, '_last_raw_bit_ber', float('nan'))):.3e}, FECBER={float(getattr(self, '_last_fec_bit_ber', float('nan'))):.3e}, EVM={best['evm_inst']:.2f}%, "
             f"noise_var={best['noise_var']:.2e}, "
             f"TDLfit={float(getattr(self, '_last_tdl_param_fit_nmse', float('nan'))):.2e}/"
             f"{int(getattr(self, 'last_tdl_param_path_count', 0))}p, "
@@ -3556,6 +3957,42 @@ class FDIDMHardwareTest:
         if was_running:
             self.start()
 
+    def _create_python_logger(self) -> logging.Logger:
+        """Create optional standard-logging handlers for backend diagnostics."""
+        logger = logging.getLogger(f"fdidm.hardware.{id(self):x}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+        fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(name)s: %(message)s")
+        if bool(getattr(self, "log_to_stdout", False)):
+            sh = logging.StreamHandler()
+            sh.setLevel(logging.DEBUG)
+            sh.setFormatter(fmt)
+            logger.addHandler(sh)
+        path = str(getattr(self, "log_file_path", "") or "").strip()
+        if path:
+            try:
+                fh = logging.FileHandler(path, encoding="utf-8")
+                fh.setLevel(logging.DEBUG)
+                fh.setFormatter(fmt)
+                logger.addHandler(fh)
+            except Exception:
+                # Keep the in-memory/UI log operational even if the file cannot be opened.
+                pass
+        return logger
+
+    def export_debug_log(self, path: Optional[str] = None, max_entries: int = 2000, min_level: str = "DEBUG") -> str:
+        """Write recent backend diagnostics to a text file and return the path."""
+        if path is None or str(path).strip() == "":
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = f"fdidm_debug_{ts}.log"
+        entries = self.get_debug_log(max_entries=max_entries, min_level=min_level)
+        with open(str(path), "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(f"{e['seq']:06d} {e['t']:10.3f}s {e['level']:<5} {e['msg']}\n")
+        return str(path)
+
     def _debug(self, level: str, msg: str):
 
         try:
@@ -3578,6 +4015,13 @@ class FDIDMHardwareTest:
             self._last_error = text
         elif level == "INFO":
             self._last_info = text
+        logger = getattr(self, "_py_logger", None)
+        if logger is not None and getattr(logger, "handlers", None):
+            py_level = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARNING, "ERROR": logging.ERROR}.get(str(level).upper(), logging.INFO)
+            try:
+                logger.log(py_level, text)
+            except Exception:
+                pass
 
     def get_debug_log(self, max_entries: int = 200, min_level: str = "INFO") -> List[Dict[str, Any]]:
         """Return the last `max_entries` log records at >= `min_level`.
@@ -3792,6 +4236,11 @@ class FDIDMHardwareTest:
                 "cfo_est_hz": float(self.last_cfo_est_hz),
                 "cfo_preamble_hz": float(getattr(self, "last_cfo_preamble_hz", self.last_cfo_est_hz)),
                 "cfo_source": str(getattr(self, "last_cfo_source", "preamble")),
+                "cfo_alias_hz": float(getattr(self, "_last_cfo_alias_hz", float("nan"))),
+                "cfo_scan_score": float(getattr(self, "_last_cfo_scan_score", float("nan"))),
+                "cfo_last_good_hz": float(getattr(self, "_last_good_cfo_hz", float("nan"))),
+                "startup_settling": bool(time.time() < float(getattr(self, "_rx_settle_until_wall", 0.0)) or int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0),
+                "startup_settle_windows_remaining": int(getattr(self, "_rx_settle_windows_remaining", 0)),
                 "ber": float(self._ber_estimate) if np.isfinite(self._ber_estimate) else float("nan"),
                 "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
                 "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
@@ -3958,6 +4407,19 @@ class FDIDMHardwareTest:
             "cfo_est_hz": snap["cfo_est_hz"],
             "cfo_preamble_hz": snap.get("cfo_preamble_hz", snap["cfo_est_hz"]),
             "cfo_source": snap.get("cfo_source", "preamble"),
+            "cfo_alias_hz": float(snap.get("cfo_alias_hz", getattr(self, "_last_cfo_alias_hz", float("nan")))),
+            "cfo_scan_score": float(snap.get("cfo_scan_score", getattr(self, "_last_cfo_scan_score", float("nan")))),
+            "cfo_unambiguous_hz": float(getattr(self, "_last_cfo_unambiguous_hz", self._preamble_cfo_unambiguous_hz())),
+            "cfo_search_enable": bool(getattr(self, "cfo_search_enable", True)),
+            "cfo_search_max_hz": float(getattr(self, "cfo_search_max_hz", 0.0)),
+            "residual_cfo_max_hz": float(getattr(self, "residual_cfo_max_hz", 0.0)),
+            "startup_settle_ms": float(getattr(self, "startup_settle_sec", 0.0) * 1000.0),
+            "startup_settle_windows": int(getattr(self, "startup_settle_windows", 0)),
+            "startup_settling": bool(snap.get("startup_settling", False)),
+            "cfo_scan_min_score": float(getattr(self, "cfo_scan_min_score", 0.55)),
+            "cfo_scan_jump_guard_hz": float(getattr(self, "cfo_scan_jump_guard_hz", 12000.0)),
+            "cfo_last_good_hz": float(snap.get("cfo_last_good_hz", getattr(self, "_last_good_cfo_hz", float("nan")))),
+            "parameter_limits": self.compute_parameter_limits(),
             "estimator_forced_reason": str(getattr(self, "_estimator_forced_reason", "")),
             "estimator_auto_note": str(getattr(self, "_estimator_auto_note", "")),
             "auto_tdl_param_for_software": bool(getattr(self, "auto_tdl_param_for_software", True)),
@@ -4012,7 +4474,7 @@ class FDIDMHardwareTest:
 if __name__ == "__main__":
     tb = FDIDMHardwareTest(fdidm_m=16, fdidm_n=16, channel_mode="tdl_a_rf")
     st = tb.get_status()
-    print(f"v30 TDL/RF cascade ready: chain={st['chain']}, channel={st['channel_mode']}, "
+    print(f"v33 hardware-only FDIDM ready: chain={st['chain']}, channel={st['channel_mode']}, "
           f"coding={st['coding_summary']}, tx_vector={st['tx_waveform_samples']} samples, "
           f"frame_len={st['frame_len']} samples "
           f"({st['frame_len'] / st['sample_rate'] * 1000:.2f} ms at {st['sample_rate'] / 1e6:.2f} MHz)")

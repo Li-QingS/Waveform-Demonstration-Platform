@@ -8,11 +8,11 @@ from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QSignalBlocker
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton,
     QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QSplitter,
-    QScrollArea, QSizePolicy, QCheckBox,
+    QScrollArea, QSizePolicy, QCheckBox, QFileDialog,
 )
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -38,9 +38,15 @@ class FDIDMHardwareTestTab(QWidget):
         self._last_runtime_log_time = 0.0
         self._last_debug_seq = 0
         self._auto_debug_level = "INFO"
+        self._applying_params = False
+        self._pending_apply = False
+        self._suppress_param_signals = False
         self._init_ui()
         self._init_plot_style()
         self._connect_signals()
+        self._apply_debounce_timer = QTimer(self)
+        self._apply_debounce_timer.setSingleShot(True)
+        self._apply_debounce_timer.timeout.connect(self._apply_params_to_backend)
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._refresh_plots)
 
@@ -84,7 +90,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.alpha_spin = self._dspin(-2.0, 2.0, 0.5, 1, "", 0.1)
         self.beta_spin = self._dspin(-2.0, 2.0, 1.0, 1, "", 0.1)
         self.m_spin = self._spin(4, 64, 16)
-        # v30 默认 N=16：给 rate-1/2 卷积码留出容量，同时把物理帧拉长，
+        # 默认 N=16：给 rate-1/2 卷积码留出容量，同时把物理帧拉长，
         # 减少超短 TX 向量反复 wrap 对 UHD 调度的压力。
         self.n_spin = self._spin(1, 64, 16)
         self.cp_spin = self._spin(0, 63, 4)
@@ -107,11 +113,11 @@ class FDIDMHardwareTestTab(QWidget):
         self.coding_interleaver_check.setChecked(True)
         self.uhd_buf_spin = self._spin(32, 4096, 2048)
         self.tx_vec_ms_spin = self._spin(0, 5000, 500)
-        self.prerender_tdl_check = QCheckBox("TDL→RF预渲染")
+        self.prerender_tdl_check = QCheckBox("TDL→RF固定预渲染")
         self.prerender_tdl_check.setChecked(True)
+        self.prerender_tdl_check.setEnabled(False)
         self.channel_mode_combo = self._combo([
             ("RF", "rf"),
-            ("纯A", "tdl_a"), ("纯C", "tdl_c"), ("纯D", "tdl_d"),
             ("RF→A", "rf_tdl_a"), ("RF→C", "rf_tdl_c"), ("RF→D", "rf_tdl_d"),
             ("A→RF", "tdl_a_rf"), ("C→RF", "tdl_c_rf"), ("D→RF", "tdl_d_rf"),
         ], current=0, chars=8)
@@ -158,7 +164,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.auto_apply_check = QCheckBox("参数改动自动应用")
         self.auto_apply_check.setChecked(False)
         fd.addWidget(self.auto_apply_check, 16, 0, 1, 4)
-        note = QLabel("v30建议先用RF链路验证无U；TDL→RF默认离线预渲染，避免Python TDL块进入USRP TX实时链路。纯TDL不走USRP；RF→TDL先过真实RF再叠加软件信道。")
+        note = QLabel("v33：所有模式都经过真实RF；TDL→RF固定离线预渲染。参数切换采用原子化应用、启动丢弃脏窗口，并对CFO别名扫描增加错锁保护。")
         note.setWordWrap(True)
         fd.addWidget(note, 17, 0, 1, 4)
         layout.addWidget(fd_group)
@@ -204,11 +210,13 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_connect = QPushButton("连接/配置")
         self.btn_start_test = QPushButton("开始测试")
         self.btn_stop_test = QPushButton("停止测试")
+        self.btn_export_log = QPushButton("导出日志")
         self.btn_start_test.setEnabled(False)
         self.btn_stop_test.setEnabled(False)
         btn_l.addWidget(self.btn_connect)
         btn_l.addWidget(self.btn_start_test)
         btn_l.addWidget(self.btn_stop_test)
+        btn_l.addWidget(self.btn_export_log)
         layout.addWidget(btn_group)
         layout.addStretch()
         self._compact_left_controls(panel)
@@ -354,6 +362,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_connect.clicked.connect(self._on_connect_clicked)
         self.btn_start_test.clicked.connect(self._on_start_test_clicked)
         self.btn_stop_test.clicked.connect(self._on_stop_test_clicked)
+        self.btn_export_log.clicked.connect(self._on_export_log_clicked)
         self.btn_apply_params.clicked.connect(self._apply_params_to_backend)
         self.btn_ofdm.clicked.connect(lambda: self._set_indices(0.0, 0.0))
         self.btn_otfs.clicked.connect(lambda: self._set_indices(1.0, 1.0))
@@ -386,7 +395,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
             self._push_const_mode()
-            self._log("FDIDM 后端已配置 v30。")
+            self._log("FDIDM 后端已配置 v33。")
             self._log(self._backend_summary())
             self.btn_connect.setEnabled(False)
             self.btn_start_test.setEnabled(True)
@@ -413,7 +422,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
-            self._log("v30 测试已启动。")
+            self._log("v33 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
             self.test_running = False
@@ -449,6 +458,22 @@ class FDIDMHardwareTestTab(QWidget):
         except Exception as e:
             self._log(f"清空缓存失败: {type(e).__name__}: {e}")
 
+    def _on_export_log_clicked(self):
+        default_name = f"fdidm_debug_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        path, _ = QFileDialog.getSaveFileName(self, "导出 FDIDM 日志", default_name, "Log Files (*.log);;Text Files (*.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            if self.backend is not None and hasattr(self.backend, "export_debug_log"):
+                saved = self.backend.export_debug_log(path, max_entries=5000, min_level="DEBUG")
+                self._log(f"后端日志已导出：{saved}")
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.log_text.toPlainText())
+                self._log(f"界面日志已导出：{path}")
+        except Exception as e:
+            self._log(f"导出日志失败: {type(e).__name__}: {e}")
+
     # ---------------- backend config ----------------
     def _current_data(self, combo: QComboBox, default: str):
         data = combo.currentData()
@@ -463,25 +488,12 @@ class FDIDMHardwareTestTab(QWidget):
     def _selected_channel_estimator(self) -> str:
         est = self._current_data(self.channel_estimator_combo, "tdl_param")
         ch = self._selected_channel_mode()
-        # (A) Any real-RF path carries the physical RF channel response (cable/
-        # antenna multipath + USRP analog filtering).  The pure parametric TDL
-        # basis cannot represent it, and the MN-dimensional full-H_TF inverse is
-        # ill-conditioned on it.  For a CP-fitting link the TF channel is diagonal,
-        # so the per-subcarrier diag_tf estimator is the correct, well-conditioned
-        # default -> redirect the tdl_param default to diag_tf for every RF mode.
+        # v33 所有链路都经过真实 RF。真实 RF 响应不属于参数化 TDL 基，
+        # RF+TDL 级联上的 full-H_TF 也容易病态，因此默认落到 diag-TF。
         if self._mode_involves_rf(ch) and est == "tdl_param":
             return "diag_tf"
-        # (A2) An RF *cascade* (RF + a software TDL stage) still carries the physical
-        # RF response, so the MN-dimensional full-H_TF inverse is ill-conditioned on
-        # it -> mirror the backend resolver and redirect full_htf to diag_tf as well.
-        # (Pure "rf" mode keeps full_htf so the static MN-probe study stays available.)
         if self._mode_involves_rf(ch) and ch != "rf" and est == "full_htf":
             return "diag_tf"
-        # (B) A time-varying *software* TDL channel is not diagonal in TF; full_htf
-        # is reserved for static studies, so steer dynamic software runs to the
-        # parametric path-gain estimator (original behaviour, kept intact).
-        if ch != "rf" and est == "full_htf" and (abs(self.tdl_fd_spin.value()) > 1e-9 or self.tdl_spread_spin.value() > 1e-9):
-            return "tdl_param"
         return est
 
     def _selected_channel_mode(self) -> str:
@@ -511,12 +523,19 @@ class FDIDMHardwareTestTab(QWidget):
             full_htf_once=self.htf_once_check.isChecked(), process_interval_ms=self.process_interval_spin.value(),
             usrp_buffer_frames=self.uhd_buf_spin.value(),
             tx_min_waveform_duration_ms=self.tx_vec_ms_spin.value(),
-            tx_prerender_tdl_before_rf=self.prerender_tdl_check.isChecked(),
+            tx_prerender_tdl_before_rf=True,
             coding_scheme=self._current_data(self.coding_combo, "conv12"),
             coding_interleaver=self.coding_interleaver_check.isChecked(),
             channel_mode=self._selected_channel_mode(),
             tdl_rms_delay_spread_ns=self.tdl_ds_spin.value(), tdl_doppler_hz=self.tdl_fd_spin.value(),
             tdl_doppler_spread_hz=self.tdl_spread_spin.value(), tdl_snr_db=self.tdl_snr_spin.value(),
+            cfo_search_enable=True,
+            cfo_search_max_hz=50_000.0,
+            residual_cfo_max_hz=5_000.0,
+            startup_settle_ms=800.0,
+            startup_settle_windows=3,
+            cfo_scan_min_score=0.55,
+            cfo_scan_jump_guard_hz=12_000.0,
             auto_tdl_param_for_software=True,
         )
 
@@ -527,49 +546,90 @@ class FDIDMHardwareTestTab(QWidget):
             self.backend.configure(**self._backend_kwargs(tx_text))
         self._push_const_mode()
 
+    def _schedule_param_apply(self, delay_ms: int = 250):
+        if self.backend is None or self._suppress_param_signals:
+            return
+        try:
+            self._apply_debounce_timer.start(max(0, int(delay_ms)))
+        except Exception:
+            self._apply_params_to_backend()
+
     def _apply_params_to_backend(self):
         if self.backend is None:
             return
-        was_running = self.test_running
+        if self._applying_params:
+            self._pending_apply = True
+            return
+        self._applying_params = True
+        self._pending_apply = False
+        was_running = bool(self.test_running)
+        try:
+            self._apply_debounce_timer.stop()
+        except Exception:
+            pass
         try:
             if was_running:
-                self.update_timer.stop(); self.backend.stop()
+                self.test_running = False
+                self.update_timer.stop()
+                self.backend.stop()
+                if hasattr(self.backend, "wait"):
+                    self.backend.wait()
             self._configure_backend(self.tx_text_edit.toPlainText())
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             if was_running:
-                self.backend.start(); self.update_timer.start(100)
+                self.backend.start()
+                self.test_running = True
+                self.update_timer.start(100)
             self._reset_runtime_curves(); self._refresh_tx_plot_only()
-            self._log("FDIDM 参数已应用。")
+            self._log("FDIDM 参数已原子化应用。")
             self._log(self._backend_summary())
             self._drain_debug_to_log()
         except Exception as e:
             self._log(f"应用参数失败: {type(e).__name__}: {e}")
+            self.test_running = False
         finally:
-            self.test_running = was_running
+            self._applying_params = False
+            if self._pending_apply:
+                self._pending_apply = False
+                self._schedule_param_apply(300)
 
     def _set_indices(self, alpha: float, beta: float):
-        self.alpha_spin.setValue(float(alpha)); self.beta_spin.setValue(float(beta))
-        if not self.auto_apply_check.isChecked():
-            self._apply_params_to_backend()
+        self._suppress_param_signals = True
+        blockers = [QSignalBlocker(self.alpha_spin), QSignalBlocker(self.beta_spin)]
+        try:
+            self.alpha_spin.setValue(float(alpha))
+            self.beta_spin.setValue(float(beta))
+        finally:
+            del blockers
+            self._suppress_param_signals = False
+        if self.backend is not None:
+            self._schedule_param_apply(0)
 
     def _on_params_changed(self, *_args):
+        if self._suppress_param_signals:
+            return
         if self.auto_apply_check.isChecked():
-            self._apply_params_to_backend()
+            self._schedule_param_apply(250)
 
     def _on_mod_or_eq_changed(self, *_args):
-        if self.backend is not None:
-            self._apply_params_to_backend()
+        if self.backend is not None and not self._suppress_param_signals:
+            self._schedule_param_apply(0)
 
     def _on_channel_mode_changed(self, *_args):
-        mode = self._selected_channel_mode()
-        # RF-involving links default to the diagonal per-subcarrier estimator;
-        # pure-software TDL links default to the parametric path-gain estimator.
-        target = "diag_tf" if self._mode_involves_rf(mode) else "tdl_param"
-        for i in range(self.channel_estimator_combo.count()):
-            if self.channel_estimator_combo.itemData(i) == target:
-                self.channel_estimator_combo.setCurrentIndex(i)
-                break
-        self._on_params_changed()
+        # All v33 channel modes traverse the USRP RF path, so diag-TF is the
+        # safe default whenever the path selection changes.  Block the estimator
+        # signal so one channel-mode click cannot produce two stop/config/start cycles.
+        target = "diag_tf"
+        blocker = QSignalBlocker(self.channel_estimator_combo)
+        try:
+            for i in range(self.channel_estimator_combo.count()):
+                if self.channel_estimator_combo.itemData(i) == target:
+                    self.channel_estimator_combo.setCurrentIndex(i)
+                    break
+        finally:
+            del blocker
+        if self.backend is not None:
+            self._schedule_param_apply(250 if self.auto_apply_check.isChecked() else 0)
 
     def _apply_gain(self, which: str, value: float):
         if self.backend is None or not self.test_running:
@@ -664,6 +724,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"{'CRC通过' if ok else '未恢复'} | frames={int(status.get('frames_decode_ok',0))}/{int(status.get('frames_processed',0))}, "
             f"Sync={float(status.get('sync_metric',0.0)):.3f}, CFO={float(status.get('cfo_est_hz',0.0)):.1f}Hz/"
             f"{status.get('cfo_source','')}, raw={float(status.get('cfo_preamble_hz',0.0)):.1f}, "
+            f"alias={float(status.get('cfo_alias_hz',np.nan)):.1f}, scan={float(status.get('cfo_scan_score',np.nan)):.2f}, "
             f"BER(FEC)={float(status.get('fec_bit_ber', status.get('ber',np.nan))):.3g}, "
             f"raw={float(status.get('raw_bit_ber',np.nan)):.3g}, EVM={evm_txt}, cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, code={status.get('coding_scheme','')}, "
@@ -676,10 +737,11 @@ class FDIDMHardwareTestTab(QWidget):
             return
         self._last_runtime_log_time = now
         self._log(
-            "v30 runtime: "
+            "v33 runtime: "
             f"reason={status.get('reason','')}, frames={int(status.get('frames_decode_ok',0))}/{int(status.get('frames_processed',0))}, "
             f"rx_new={int(status.get('rx_last_new_samples',0))}, stale={bool(status.get('rx_spectrum_stale',True))}, "
             f"Sync={float(status.get('sync_metric',0.0)):.3f}, CFO={float(status.get('cfo_est_hz',0.0)):.1f}/{status.get('cfo_source','')}, "
+            f"alias={float(status.get('cfo_alias_hz',np.nan)):.1f}, scan={float(status.get('cfo_scan_score',np.nan)):.2f}, "
             f"BERfec={float(status.get('fec_bit_ber',status.get('ber',np.nan))):.3g}, raw={float(status.get('raw_bit_ber',np.nan)):.3g}, "
             f"EVM={float(status.get('evm_average_percent',np.nan)):.2f}%, "
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, fd={float(status.get('tdl_doppler_hz',0.0)):.1f}, "
@@ -770,6 +832,8 @@ class FDIDMHardwareTestTab(QWidget):
             f"调制={st.get('mod_order')}, EQ={st.get('equalizer')}, 编码={st.get('coding_summary')}, "
             f"α/β={st.get('alpha'):.2f}/{st.get('beta'):.2f}, frame={st.get('frame_len')} samples, "
             f"TX向量={st.get('tx_waveform_samples')} samples, UHD帧={st.get('usrp_buffer_frames')}, "
+            f"CFO无歧义±{float(st.get('cfo_unambiguous_hz', np.nan)):.0f}Hz, "
+            f"CFO扫描±{float(st.get('cfo_search_max_hz', np.nan)):.0f}Hz, "
             f"TDL预渲染={st.get('tx_tdl_prerendered')}"
         )
 
