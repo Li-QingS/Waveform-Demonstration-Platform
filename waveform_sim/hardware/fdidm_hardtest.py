@@ -344,7 +344,7 @@ class FDIDMHardwareTest:
             training_amplitude: float = 1.0,
             training_probe_guard_len: int = 16,  # legacy; ignored in v17
             max_full_htf_order: int = 4096,  # maximum order for full paper H_TF estimation
-            channel_estimator: str = "tdl_param",  # "tdl_param" = software TDL path receiver; "full_htf" = paper-strict; "diag_tf" = fast loopback mode
+            channel_estimator: str = "full_htf",  # "full_htf" = paper Eq.(20)/(29) matrix receiver; "tdl_param" = software-TDL basis; "diag_tf" = fast diagnostic mode
             full_htf_update_interval_frames: int = 10000,  # kept for backward compatibility; one-shot mode ignores it
             full_htf_once: bool = True,
             process_interval_ms: float = 200.0,      # throttle heavy Python decoding to avoid UHD RX overflow
@@ -414,11 +414,12 @@ class FDIDMHardwareTest:
         # Legacy parameters kept only so old UI calls do not break.
         self.training_probe_guard_len = int(max(0, min(int(training_probe_guard_len), 8192)))
         self.max_full_htf_order = int(max(16, max_full_htf_order))
-        self.channel_estimator = str(channel_estimator or "tdl_param").lower()
-        if self.channel_estimator in ("tdl", "tdl_path", "tdl_paths", "tdl_parametric", "tdl_param_est"):
-            self.channel_estimator = "tdl_param"
-        if self.channel_estimator not in ("full_htf", "diag_tf", "tdl_param"):
-            raise ValueError("channel_estimator must be 'full_htf', 'diag_tf', or 'tdl_param'")
+        # Requested and effective estimators are tracked separately.
+        # self.channel_estimator is always the backend-effective source of truth.
+        self.requested_channel_estimator = self._normalize_channel_estimator(channel_estimator or "full_htf")
+        self.channel_estimator = self.requested_channel_estimator
+        self.estimator_effective_reason = "as_requested"
+        self._estimator_forced_reason = ""
         self.full_htf_update_interval_frames = int(max(1, min(int(full_htf_update_interval_frames), 10_000)))
         self.full_htf_once = bool(full_htf_once)
         self.process_interval_sec = max(0.03, float(process_interval_ms) / 1000.0)
@@ -474,12 +475,12 @@ class FDIDMHardwareTest:
         self.tdl_param_ridge = float(max(0.0, float(tdl_param_ridge)))
         self.tdl_param_prune_db = float(min(0.0, float(tdl_param_prune_db)))
         self._estimator_auto_note = ""
-        self._guard_estimator_for_software_tdl()
+        self._resolve_effective_channel_estimator()
 
         # Hardware/sync frame structure.
         # Frame = [pre_guard][sync_preamble][pilot_frame][data_frame][post_guard]
         self._recompute_strict_frame_timing()
-        self.strict_chain_name = "FDIDM_HW_ONLY_v33_ATOMIC_SWITCH_CFO_GUARD"
+        self.strict_chain_name = "FDIDM_HW_ONLY_v34_PAPER_ALIGNED_UI_SYNC"
 
         # Tunables.
         self.sync_metric_threshold = 0.30
@@ -632,8 +633,8 @@ class FDIDMHardwareTest:
         self._set_tx_text_internal(tx_text)
         self._build_top_block()
         self._debug("INFO",
-                    f"FDIDM backend v33 ready: chain={self.strict_chain_name}, "
-                    f"estimator={self.channel_estimator}, use_full_htf={self.use_full_htf}, "
+                    f"FDIDM backend v34 ready: chain={self.strict_chain_name}, "
+                    f"estimator={self.channel_estimator} (requested={getattr(self, 'requested_channel_estimator', self.channel_estimator)}), use_full_htf={self.use_full_htf}, "
                     f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames} frame(s), "
                     f"channel_mode={self.channel_mode}, "
                     f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f} ns, fd={self.tdl_doppler_hz:.1f} Hz, "
@@ -712,6 +713,67 @@ class FDIDMHardwareTest:
         # Cross-domain equivalent kept only for diagnostics / back-compat
         # (FDIT is the exact inverse of the IFDIT used on the data path).
         self._pilot_X_cross = self._fdit(self._pilot_X_tf)
+
+    # =========================================================
+    # Estimator selection helpers
+    # =========================================================
+    @staticmethod
+    def _normalize_channel_estimator(estimator: str) -> str:
+        e = str(estimator or "full_htf").strip().lower().replace("-", "_").replace(" ", "_")
+        if e in ("tdl", "tdl_param", "tdl_path", "tdl_paths", "tdl_parametric", "tdl_param_est", "tdl_parameter", "tdl_parameters"):
+            return "tdl_param"
+        if e in ("full_h", "full_h_tf", "fullhtf", "full_htf", "paper", "paper_strict"):
+            return "full_htf"
+        if e in ("diag", "diag_tf", "diagonal", "diagonal_tf", "fast"):
+            return "diag_tf"
+        raise ValueError("channel_estimator must be 'full_htf', 'diag_tf', or 'tdl_param'")
+
+    def _resolve_effective_channel_estimator(self) -> bool:
+        """Resolve requested estimator into the executable backend mode.
+
+        Grounding:
+        - full_htf implements the paper Eq.(20)/(29) matrix receiver already
+          present in this codebase;
+        - tdl_param is a compact receiver for the known software-TDL basis and
+          is not the paper's general H_TF measurement;
+        - diag_tf is retained as the existing fast diagnostic fallback when a
+          requested full H_TF order exceeds max_full_htf_order.
+        """
+        requested = self._normalize_channel_estimator(
+            getattr(self, "requested_channel_estimator", getattr(self, "channel_estimator", "full_htf"))
+        )
+        old_effective = str(getattr(self, "channel_estimator", requested))
+        effective = requested
+        reason = "as_requested"
+        K = int(max(1, int(getattr(self, "M", 1)) * int(getattr(self, "N", 1))))
+        max_k = int(max(16, int(getattr(self, "max_full_htf_order", 4096))))
+        rf_path = bool(self._rf_path_enabled()) if hasattr(self, "_rf_path_enabled") else False
+        software_tdl = bool(self._software_channel_enabled()) if hasattr(self, "_software_channel_enabled") else False
+
+        if requested == "full_htf" and K > max_k:
+            effective = "diag_tf"
+            reason = f"requested full_htf but M*N={K} exceeds max_full_htf_order={max_k}; effective estimator is diag_tf"
+        elif requested == "tdl_param" and rf_path:
+            # Every supported v33/v34 mode traverses real RF. A pure software-TDL
+            # basis is incomplete for that composite channel; use the paper H_TF
+            # measurement if the configured order allows it.
+            if K <= max_k:
+                effective = "full_htf"
+                reason = (f"requested tdl_param on a path containing real RF; tdl_param models only the known software TDL basis "
+                          f"(software_tdl={software_tdl}), while the paper Eq.(20)/(29) receiver is full_htf")
+            else:
+                effective = "diag_tf"
+                reason = (f"requested tdl_param on real RF path but full H_TF order M*N={K} exceeds max_full_htf_order={max_k}; "
+                          "effective estimator is diag_tf")
+        elif requested == "tdl_param":
+            reason = "tdl_param uses the configured software TDL basis; full_htf is the paper Eq.(20)/(29) matrix receiver"
+
+        self.requested_channel_estimator = requested
+        self.channel_estimator = effective
+        self.estimator_effective_reason = reason
+        self._estimator_forced_reason = "" if effective == requested else reason
+        self._estimator_auto_note = "" if reason == "as_requested" else reason
+        return old_effective != effective
 
     # =========================================================
     # Parameter limit / link budget helpers
@@ -1275,17 +1337,56 @@ class FDIDMHardwareTest:
         self._gamma_cache[key] = G
         return G
 
+    @staticmethod
+    def _dft_power_apply_axis(arr: np.ndarray, power: int, axis: int) -> np.ndarray:
+        """Apply the unitary DFT matrix power F^p along one matrix axis.
+
+        This is the FFT-form counterpart of the dense matrix powers used in
+        _gamma(). It follows the same unitary DFT convention as
+        _unitary_dft_matrix(): F is fft/sqrt(n), F^2 is the DFT permutation,
+        and F^3 is ifft*sqrt(n).
+        """
+        x = np.asarray(arr, dtype=np.complex128)
+        axis = int(axis) % x.ndim
+        n = int(x.shape[axis])
+        p = int(power) % 4
+        if p == 0 or n <= 1:
+            return x.astype(np.complex128, copy=True)
+        if p == 1:
+            return (np.fft.fft(x, axis=axis) / np.sqrt(float(n))).astype(np.complex128)
+        if p == 3:
+            return (np.fft.ifft(x, axis=axis) * np.sqrt(float(n))).astype(np.complex128)
+        idx = np.concatenate(([0], np.arange(n - 1, 0, -1))).astype(np.int64)
+        return np.take(x, idx, axis=axis).astype(np.complex128)
+
+    def _apply_gamma_axis(self, arr: np.ndarray, eps: float, axis: int) -> np.ndarray:
+        """Apply Gamma^(eps) along one axis using the paper's 4-DFT sum.
+
+        The paper's complexity comparison decomposes FDIT into groups of DFTs
+        instead of dense Gamma matrix multiplication. This helper implements
+        that decomposition for modulation/demodulation while _gamma() remains
+        available for the paper Eq.(29) matrix receiver.
+        """
+        x = np.asarray(arr, dtype=np.complex128)
+        e = self._wrap_index(float(eps))
+        out = np.zeros_like(x, dtype=np.complex128)
+        for p in range(4):
+            w = self._ap_weight(p, e)
+            if abs(w) > 1e-14:
+                out += w * self._dft_power_apply_axis(x, p, axis=axis)
+        return out.astype(np.complex128)
+
     def _ifdit(self, x_cross: np.ndarray) -> np.ndarray:
-        # Paper Eq. 6: X_TF = Gamma_M(alpha) @ X @ Gamma_N(-beta)
-        gm = self._gamma(self.M, self.alpha)
-        gn = self._gamma(self.N, -self.beta)
-        return (gm @ np.asarray(x_cross, dtype=np.complex128) @ gn).astype(np.complex128)
+        # Paper Eq. 6: X_TF = Gamma_M(alpha) @ X @ Gamma_N(-beta).
+        # Implemented through the paper's 4-DFT decomposition rather than
+        # dense Gamma matrix multiplication.
+        x = np.asarray(x_cross, dtype=np.complex128)
+        return self._apply_gamma_axis(self._apply_gamma_axis(x, self.alpha, axis=0), -self.beta, axis=1)
 
     def _fdit(self, y_tf: np.ndarray) -> np.ndarray:
-        # Paper Eq. 13: Y = Gamma_M(-alpha) @ Y_TF @ Gamma_N(beta)
-        gm = self._gamma(self.M, -self.alpha)
-        gn = self._gamma(self.N, self.beta)
-        return (gm @ np.asarray(y_tf, dtype=np.complex128) @ gn).astype(np.complex128)
+        # Paper Eq. 13: Y = Gamma_M(-alpha) @ Y_TF @ Gamma_N(beta).
+        y = np.asarray(y_tf, dtype=np.complex128)
+        return self._apply_gamma_axis(self._apply_gamma_axis(y, -self.alpha, axis=0), self.beta, axis=1)
 
     # =========================================================
     # Heisenberg / Wigner
@@ -2457,28 +2558,8 @@ class FDIDMHardwareTest:
         return None
 
     def _guard_estimator_for_software_tdl(self) -> bool:
-        """Auto-correct estimator choices that are physically mismatched.
-
-        Any supported mode carries the physical RF response. The parametric TDL
-        basis describes only the optional software NTN-TDL stage and cannot
-        represent cable/antenna multipath or USRP analog filtering. For RF
-        cascades, full-H_TF is also noisy/ill-conditioned at practical M*N, so
-        the default receiver is the robust per-subcarrier diagonal estimator.
-        """
-        if not bool(getattr(self, "auto_tdl_param_for_software", True)):
-            return False
-        est = str(getattr(self, "channel_estimator", "")).lower()
-        rf_path = self._rf_path_enabled()
-        rf_cascade = rf_path and self._software_channel_enabled()
-        if rf_path and (est == "tdl_param" or (rf_cascade and est == "full_htf")):
-            self.channel_estimator = "diag_tf"
-            self._estimator_auto_note = (
-                f"auto-switched estimator {est} -> diag_tf because the channel includes a "
-                "real RF path; the parametric TDL basis cannot represent hardware RF response, "
-                "and full-H_TF on an RF+TDL cascade is usually ill-conditioned."
-            )
-            return True
-        return False
+        """Backward-compatible alias for estimator resolution."""
+        return self._resolve_effective_channel_estimator()
 
     def _make_tdl_channel_block(self):
         """Create a GNU Radio Python sync_block wrapping _NTNTDLChannel."""
@@ -2497,19 +2578,31 @@ class FDIDMHardwareTest:
 
         class _TDLChannelBlock(gr.sync_block):
             def __init__(self):
-                gr.sync_block.__init__(self, name="ntn_tdl_channel_v33", in_sig=[np.complex64], out_sig=[np.complex64])
+                gr.sync_block.__init__(self, name="ntn_tdl_channel_v34", in_sig=[np.complex64], out_sig=[np.complex64])
                 self.channel = channel
+                self._channel_lock = threading.RLock()
 
             def work(self, input_items, output_items):
-                y = self.channel.process(input_items[0])
+                # Runtime parameter updates can arrive from the UI thread.  Keep
+                # channel.configure()/reset() mutually exclusive with process()
+                # so a partial tap-table update cannot leak into one scheduler call.
+                with self._channel_lock:
+                    y = self.channel.process(input_items[0])
                 output_items[0][:len(y)] = y
                 return len(y)
 
             def reset_channel(self):
-                self.channel.reset()
+                with self._channel_lock:
+                    self.channel.reset()
+
+            def configure_channel(self, **kwargs: Any):
+                with self._channel_lock:
+                    self.channel.configure(**kwargs)
+                    self.channel.reset()
 
             def channel_summary(self) -> str:
-                return self.channel.summary()
+                with self._channel_lock:
+                    return self.channel.summary()
 
         return _TDLChannelBlock()
 
@@ -3019,27 +3112,65 @@ class FDIDMHardwareTest:
     ):
 
         if self._running:
-            # Only gain-like live changes are accepted while running.
-            # Structural/channel changes rebuild the waveform or the UHD graph.
-            hot_swap_ok = all(v is None for v in (samp_rate, fdidm_m, fdidm_n, cp_len,
-                                                  alpha, beta, mod_order, device_type, channel_estimator,
-                                                  channel_mode, software_channel_model,
-                                                  tdl_rms_delay_spread_ns, tdl_doppler_hz,
-                                                  tdl_doppler_spread_hz, tdl_snr_db,
-                                                  tdl_seed, tdl_normalize_power,
-                                                  tdl_param_num_sinusoids, tdl_param_max_paths,
-                                                  tdl_param_ridge, tdl_param_prune_db,
-                                                  tx_min_waveform_duration_ms, tx_max_waveform_samples,
-                                                  tx_prerender_tdl_before_rf, cfo_search_enable, cfo_search_max_hz,
-                                                  residual_cfo_max_hz, startup_settle_ms, startup_settle_windows,
-                                                  cfo_scan_min_score, cfo_scan_jump_guard_hz,
-                                                  coding_scheme, coding_interleaver,
-                                                  auto_tdl_param_for_software))
-            if not hot_swap_ok:
+            # Reject only *changed* parameters that alter the GNU Radio/UHD graph
+            # shape or the monitor thread's frame/probe geometry.  The UI passes
+            # the full parameter set on every Apply, so checking only for None
+            # would incorrectly force a restart for every harmless SNR/alpha edit.
+            must_stop = False
+            if samp_rate is not None and float(samp_rate) != self.sample_rate:
+                must_stop = True
+            if device_type is not None and str(device_type) != self.device_type:
+                must_stop = True
+            if fdidm_m is not None and int(max(4, min(int(fdidm_m), 64))) != self.M:
+                must_stop = True
+            if fdidm_n is not None and int(max(1, min(int(fdidm_n), 64))) != self.N:
+                must_stop = True
+            if cp_len is not None and int(max(0, min(int(cp_len), max(self.M - 1, 0)))) != self.cp_len:
+                must_stop = True
+            if inter_frame_guard_len is not None and int(max(0, min(int(inter_frame_guard_len), 8192))) != self.inter_frame_guard_len:
+                must_stop = True
+            if max_full_htf_order is not None and int(max(16, max_full_htf_order)) != self.max_full_htf_order:
+                must_stop = True
+            if usrp_buffer_frames is not None and int(max(32, min(int(usrp_buffer_frames), 4096))) != self.usrp_buffer_frames:
+                must_stop = True
+            if channel_estimator is not None:
+                try:
+                    must_stop = must_stop or (self._normalize_channel_estimator(channel_estimator) != self.requested_channel_estimator)
+                except Exception:
+                    must_stop = True
+            requested_mode = None
+            if software_channel_model is not None:
+                requested_mode = self._normalize_channel_mode(software_channel_model)
+            elif channel_mode is not None:
+                requested_mode = self._normalize_channel_mode(channel_mode)
+            if requested_mode is not None and requested_mode != self.channel_mode:
+                must_stop = True
+            if must_stop:
                 raise RuntimeError("Cannot reconfigure structural/channel parameters while running; stop first.")
 
         rebuild_waveform = False
         rebuild_top_block = False
+        tdl_live_reconfigure = False
+        tdl_metadata_only_changed = False
+
+        def _mark_tdl_parameter_changed(clear_cache: bool = True):
+            """Route TDL parameter updates to the cheapest safe path.
+
+            - RF-only: record the value for future software-TDL runs; do not
+              touch UHD or the TX vector because no software channel is active.
+            - TDL->RF: regenerate the pre-rendered TX vector and push it to the
+              existing vector_source_c; no UHD graph rebuild is needed.
+            - RF->TDL: reconfigure the live software channel block in place.
+            """
+            nonlocal rebuild_waveform, tdl_live_reconfigure, tdl_metadata_only_changed
+            if clear_cache:
+                self._clear_channel_cache()
+            if self._tdl_before_rf_enabled():
+                rebuild_waveform = True
+            elif self._tdl_after_rf_enabled():
+                tdl_live_reconfigure = True
+            else:
+                tdl_metadata_only_changed = True
 
         if device_type is not None and str(device_type) != self.device_type:
             self.device_type = str(device_type);
@@ -3145,11 +3276,8 @@ class FDIDMHardwareTest:
                 rebuild_waveform = True
                 rebuild_top_block = True
         if channel_estimator is not None:
-            new_ce = str(channel_estimator).lower()
-            if new_ce in ("tdl", "tdl_path", "tdl_paths", "tdl_parametric", "tdl_param_est"):
-                new_ce = "tdl_param"
-            if new_ce not in ("full_htf", "diag_tf", "tdl_param"):
-                raise ValueError("channel_estimator must be 'full_htf', 'diag_tf', or 'tdl_param'")
+            new_ce = self._normalize_channel_estimator(channel_estimator)
+            self.requested_channel_estimator = new_ce
             if new_ce != self.channel_estimator:
                 self.channel_estimator = new_ce
                 rebuild_waveform = True
@@ -3159,8 +3287,10 @@ class FDIDMHardwareTest:
         if process_interval_ms is not None:
             self.process_interval_sec = max(0.03, float(process_interval_ms) / 1000.0)
         if usrp_buffer_frames is not None:
-            self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
-            rebuild_top_block = True
+            v = int(max(32, min(int(usrp_buffer_frames), 4096)))
+            if v != self.usrp_buffer_frames:
+                self.usrp_buffer_frames = v
+                rebuild_top_block = True
         if tx_min_waveform_duration_ms is not None:
             v = float(max(0.0, min(float(tx_min_waveform_duration_ms), 5000.0)))
             if v != self.tx_min_waveform_duration_ms:
@@ -3234,44 +3364,40 @@ class FDIDMHardwareTest:
             v = float(max(0.0, float(tdl_rms_delay_spread_ns)))
             if v != self.tdl_rms_delay_spread_ns:
                 self.tdl_rms_delay_spread_ns = v
-                rebuild_top_block = True
-                self._clear_channel_cache()
+                _mark_tdl_parameter_changed(clear_cache=True)
         if tdl_doppler_hz is not None:
             v = float(tdl_doppler_hz)
             if v != self.tdl_doppler_hz:
                 self.tdl_doppler_hz = v
-                rebuild_top_block = True
-                self._clear_channel_cache()
+                _mark_tdl_parameter_changed(clear_cache=True)
         if tdl_doppler_spread_hz is not None:
             v = float(max(0.0, float(tdl_doppler_spread_hz)))
             if v != self.tdl_doppler_spread_hz:
                 self.tdl_doppler_spread_hz = v
-                rebuild_top_block = True
-                self._clear_channel_cache()
+                _mark_tdl_parameter_changed(clear_cache=True)
         if tdl_snr_db is not None:
             v = float(tdl_snr_db)
             if v != self.tdl_snr_db:
                 self.tdl_snr_db = v
-                rebuild_top_block = True
+                # SNR does not change deterministic CSI, but it does change the
+                # active software channel if one is present.  In RF-only mode it
+                # is only a stored value for the next software-TDL run.
+                _mark_tdl_parameter_changed(clear_cache=False)
         if tdl_seed is not None:
             v = int(tdl_seed) & 0xFFFFFFFF
             if v != self.tdl_seed:
                 self.tdl_seed = v
-                rebuild_top_block = True
-                self._clear_channel_cache()
+                _mark_tdl_parameter_changed(clear_cache=True)
         if tdl_normalize_power is not None:
             v = bool(tdl_normalize_power)
             if v != self.tdl_normalize_power:
                 self.tdl_normalize_power = v
-                rebuild_top_block = True
-                self._clear_channel_cache()
+                _mark_tdl_parameter_changed(clear_cache=True)
         if tdl_param_num_sinusoids is not None:
             v = int(max(4, min(int(tdl_param_num_sinusoids), 64)))
             if v != self.tdl_param_num_sinusoids:
                 self.tdl_param_num_sinusoids = v
-                self._clear_channel_cache()
-                if self._tdl_before_rf_enabled():
-                    rebuild_waveform = True
+                _mark_tdl_parameter_changed(clear_cache=True)
         if tdl_param_max_paths is not None:
             v = int(max(1, min(int(tdl_param_max_paths), 512)))
             if v != self.tdl_param_max_paths:
@@ -3294,7 +3420,42 @@ class FDIDMHardwareTest:
         self._estimator_auto_note = ""
         if self._guard_estimator_for_software_tdl():
             rebuild_waveform = True
+            rebuild_top_block = True
             self._clear_channel_cache()
+
+        if tdl_live_reconfigure and not rebuild_waveform and not rebuild_top_block:
+            block = getattr(self, "_tdl_channel_block", None)
+            if block is not None and hasattr(block, "configure_channel"):
+                block.configure_channel(
+                    sample_rate=self.sample_rate,
+                    model=self._tdl_model_for_current_mode(),
+                    rms_delay_spread_ns=self.tdl_rms_delay_spread_ns,
+                    doppler_hz=self.tdl_doppler_hz,
+                    doppler_spread_hz=self.tdl_doppler_spread_hz,
+                    snr_db=self.tdl_snr_db,
+                    seed=self.tdl_seed,
+                    normalize_power=self.tdl_normalize_power,
+                    num_sinusoids=self.tdl_param_num_sinusoids,
+                )
+                self._clear_channel_cache()
+                self._reset_rx_runtime_state(reason="tdl_live_reconfigure", reset_counters=False)
+                if self._running:
+                    self._arm_startup_settle()
+                self._debug("INFO",
+                            f"live software TDL channel updated without UHD rebuild: "
+                            f"mode={self.channel_mode}, DS={self.tdl_rms_delay_spread_ns:.1f}ns, "
+                            f"fd={self.tdl_doppler_hz:.1f}Hz, spread={self.tdl_doppler_spread_hz:.1f}Hz, "
+                            f"SNR={self.tdl_snr_db:.1f}dB")
+            elif self._tdl_after_rf_enabled():
+                if self._running:
+                    raise RuntimeError("Cannot live-update RF->TDL block because the TDL block is unavailable; stop first.")
+                rebuild_top_block = True
+
+        if tdl_metadata_only_changed and not (rebuild_waveform or rebuild_top_block or tdl_live_reconfigure):
+            self._debug("INFO",
+                        f"TDL parameter recorded for future software-channel use only: "
+                        f"channel_mode={self.channel_mode}, SNR={self.tdl_snr_db:.1f}dB; "
+                        "active RF-only graph/waveform left unchanged")
 
         tx_text_changed = (tx_text is not None and str(tx_text) != self._tx_text)
         if rebuild_waveform or tx_text_changed:
@@ -3323,6 +3484,8 @@ class FDIDMHardwareTest:
             # Always sync the new waveform to the GNU Radio vector source, even
             # while stopped, so the next start cannot replay stale samples.
             self._sync_waveform_to_top_block()
+            if self._running:
+                self._arm_startup_settle()
             self._debug("INFO", self._format_link_limit_summary())
 
         if rebuild_top_block and not self._running:
@@ -4291,6 +4454,10 @@ class FDIDMHardwareTest:
                 "coding_interleaver": bool(getattr(self, "coding_interleaver", False)),
                 "tx_coded_bits_len": int(getattr(self, "_tx_coded_bits_len", 0)),
                 "tx_uncoded_bits_len": int(getattr(self, "_tx_uncoded_bits_len", 0)),
+                "requested_channel_estimator": str(getattr(self, "requested_channel_estimator", self.channel_estimator)),
+                "effective_channel_estimator": str(getattr(self, "channel_estimator", "")),
+                "estimator_effective_reason": str(getattr(self, "estimator_effective_reason", "")),
+                "fdidm_transform_impl": "fft_4_dft_sum_for_fdit_ifdit",
                 "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),
                 "full_htf_once": bool(self.full_htf_once),
                 "full_htf_cached": bool(self._cached_htf_full is not None),
@@ -4342,6 +4509,10 @@ class FDIDMHardwareTest:
             "htf_training_blocks": int(self.htf_training_blocks),
             "full_htf_order": int(self.M * self.N),
             "channel_estimator": self.channel_estimator,
+            "effective_channel_estimator": self.channel_estimator,
+            "requested_channel_estimator": str(getattr(self, "requested_channel_estimator", self.channel_estimator)),
+            "estimator_effective_reason": str(getattr(self, "estimator_effective_reason", "")),
+            "fdidm_transform_impl": "fft_4_dft_sum_for_fdit_ifdit",
             "estimator_auto_note": str(getattr(self, "_estimator_auto_note", "")),
             "use_full_htf": bool(self.use_full_htf),
             "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),

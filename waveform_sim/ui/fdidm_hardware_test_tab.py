@@ -563,25 +563,46 @@ class FDIDMHardwareTestTab(QWidget):
         self._applying_params = True
         self._pending_apply = False
         was_running = bool(self.test_running)
+        live_applied = False
+        restarted = False
         try:
             self._apply_debounce_timer.stop()
         except Exception:
             pass
         try:
             if was_running:
-                self.test_running = False
-                self.update_timer.stop()
-                self.backend.stop()
-                if hasattr(self.backend, "wait"):
-                    self.backend.wait()
-            self._configure_backend(self.tx_text_edit.toPlainText())
+                try:
+                    # Preferred path: backend distinguishes live-safe changes
+                    # from structural changes.  This avoids the old stop -> UHD
+                    # rebuild -> start cycle for SNR, alpha/beta, text, coding,
+                    # modulation, and TDL pre-rendered waveform updates.
+                    self._configure_backend(self.tx_text_edit.toPlainText())
+                    live_applied = True
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "stop first" not in msg and "Cannot reconfigure" not in msg:
+                        raise
+                    self._log("参数涉及帧结构/UHD图结构，执行一次受控停止-重启。")
+                    self.test_running = False
+                    self.update_timer.stop()
+                    self.backend.stop()
+                    if hasattr(self.backend, "wait"):
+                        self.backend.wait()
+                    self._configure_backend(self.tx_text_edit.toPlainText())
+                    self.backend.start()
+                    self.test_running = True
+                    self.update_timer.start(100)
+                    restarted = True
+            else:
+                self._configure_backend(self.tx_text_edit.toPlainText())
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
-            if was_running:
-                self.backend.start()
-                self.test_running = True
-                self.update_timer.start(100)
             self._reset_runtime_curves(); self._refresh_tx_plot_only()
-            self._log("FDIDM 参数已原子化应用。")
+            if live_applied:
+                self._log("FDIDM 参数已热更新，未重启 UHD。")
+            elif restarted:
+                self._log("FDIDM 参数已通过受控重启应用。")
+            else:
+                self._log("FDIDM 参数已应用。")
             self._log(self._backend_summary())
             self._drain_debug_to_log()
         except Exception as e:
@@ -612,7 +633,7 @@ class FDIDMHardwareTestTab(QWidget):
             self._schedule_param_apply(250)
 
     def _on_mod_or_eq_changed(self, *_args):
-        if self.backend is not None and not self._suppress_param_signals:
+        if self.backend is not None and not self._suppress_param_signals and self.auto_apply_check.isChecked():
             self._schedule_param_apply(0)
 
     def _on_channel_mode_changed(self, *_args):
@@ -628,8 +649,10 @@ class FDIDMHardwareTestTab(QWidget):
                     break
         finally:
             del blocker
-        if self.backend is not None:
-            self._schedule_param_apply(250 if self.auto_apply_check.isChecked() else 0)
+        if self.backend is not None and self.auto_apply_check.isChecked():
+            self._schedule_param_apply(250)
+        elif self.backend is not None:
+            self._log("链路模式已选择；点击“应用参数”后生效。")
 
     def _apply_gain(self, which: str, value: float):
         if self.backend is None or not self.test_running:
