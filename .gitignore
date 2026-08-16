@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 调试日志
+*.log
+
+# 压缩包 / 备份
+*.zip
+
+# 系统文件
+Thumbs.db
+.DS_Store
