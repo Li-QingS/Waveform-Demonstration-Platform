@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import zlib
@@ -380,6 +381,23 @@ class FDIDMHardwareTest:
             tdl_param_ridge: float = 1e-7,
             tdl_param_prune_db: float = -90.0,
             auto_tdl_param_for_software: bool = True,
+            # Paper-guided, channel-adaptive alpha/beta control.  The optimizer
+            # uses the measured H_TF and noise variance, evaluates the paper's
+            # ZF/MMSE SER objective over alpha,beta in [0, 2], and publishes a
+            # recommendation.  The UI applies it in its own thread so the RX
+            # monitor never performs a live GNU Radio waveform swap.
+            adaptive_alpha_beta_enable: bool = False,
+            adaptive_alpha_beta_coarse_step: float = 0.25,
+            adaptive_alpha_beta_fine_step: float = 0.05,
+            adaptive_alpha_beta_interval_frames: int = 8,
+            adaptive_alpha_beta_min_improvement_db: float = 0.5,
+            adaptive_alpha_beta_stability_evals: int = 2,
+            adaptive_alpha_beta_cooldown_frames: int = 16,
+            adaptive_alpha_beta_integer_margin_db: float = 0.10,
+            adaptive_alpha_beta_max_order: int = 512,
+            adaptive_alpha_beta_min_sync_metric: float = 0.30,
+            adaptive_alpha_beta_require_good_frame: bool = False,
+            adaptive_alpha_beta_rcond: float = 1e-6,
             **_legacy_ignored: Any,
     ):
         self.carrier_freq = float(carrier_freq)
@@ -474,13 +492,31 @@ class FDIDMHardwareTest:
         self.tdl_param_max_paths = int(max(1, min(int(tdl_param_max_paths), 512)))
         self.tdl_param_ridge = float(max(0.0, float(tdl_param_ridge)))
         self.tdl_param_prune_db = float(min(0.0, float(tdl_param_prune_db)))
+
+        # Channel-adaptive alpha/beta optimizer configuration.  The search
+        # resolution follows Section VI-B of the paper; coarse-to-fine search
+        # keeps the real-time hardware path responsive while retaining a fine
+        # step below 0.1 by default.
+        self.adaptive_alpha_beta_enable = bool(adaptive_alpha_beta_enable)
+        self.adaptive_alpha_beta_coarse_step = float(max(0.05, min(float(adaptive_alpha_beta_coarse_step), 1.0)))
+        self.adaptive_alpha_beta_fine_step = float(max(0.01, min(float(adaptive_alpha_beta_fine_step), self.adaptive_alpha_beta_coarse_step)))
+        self.adaptive_alpha_beta_interval_frames = int(max(1, min(int(adaptive_alpha_beta_interval_frames), 1024)))
+        self.adaptive_alpha_beta_min_improvement_db = float(max(0.0, min(float(adaptive_alpha_beta_min_improvement_db), 30.0)))
+        self.adaptive_alpha_beta_stability_evals = int(max(1, min(int(adaptive_alpha_beta_stability_evals), 16)))
+        self.adaptive_alpha_beta_cooldown_frames = int(max(0, min(int(adaptive_alpha_beta_cooldown_frames), 4096)))
+        self.adaptive_alpha_beta_integer_margin_db = float(max(0.0, min(float(adaptive_alpha_beta_integer_margin_db), 6.0)))
+        self.adaptive_alpha_beta_max_order = int(max(16, min(int(adaptive_alpha_beta_max_order), 4096)))
+        self.adaptive_alpha_beta_min_sync_metric = float(max(0.0, min(float(adaptive_alpha_beta_min_sync_metric), 1.0)))
+        self.adaptive_alpha_beta_require_good_frame = bool(adaptive_alpha_beta_require_good_frame)
+        self.adaptive_alpha_beta_rcond = float(max(1e-12, min(float(adaptive_alpha_beta_rcond), 1e-1)))
+
         self._estimator_auto_note = ""
         self._resolve_effective_channel_estimator()
 
         # Hardware/sync frame structure.
         # Frame = [pre_guard][sync_preamble][pilot_frame][data_frame][post_guard]
         self._recompute_strict_frame_timing()
-        self.strict_chain_name = "FDIDM_HW_ONLY_v34_PAPER_ALIGNED_UI_SYNC"
+        self.strict_chain_name = "FDIDM_HW_ONLY_v35_CHANNEL_ADAPTIVE_AB"
 
         # Tunables.
         self.sync_metric_threshold = 0.30
@@ -620,6 +656,18 @@ class FDIDMHardwareTest:
         self._ber_hist_t: deque = deque(maxlen=200)
         self._ber_hist_v: deque = deque(maxlen=200)
 
+        # Alpha/Beta performance surface data consumed by the UI.  It records
+        # only metrics measured by the actual RX pipeline after each processed
+        # frame; no synthetic sweep values are injected.  The context key below
+        # excludes alpha/beta but includes modulation, channel, gain, coding,
+        # estimator, and TDL settings so the surface is cleared automatically
+        # when points would no longer be comparable.
+        self._ab_surface_quant_digits = 3
+        self._ab_surface_max_cells = 2048
+        self._ab_surface_samples_per_cell = int(max(1, min(int(self.evm_average_frames), 128)))
+        self._ab_metric_history: Dict[Tuple[float, float], Dict[str, Any]] = {}
+        self._ab_surface_context_key = self._alpha_beta_surface_context_key()
+
         # Runtime diagnostics consumed by the UI and optional Python logging handlers.
         self._debug_log: deque = deque(maxlen=int(self.debug_log_max_entries))
         self._py_logger = self._create_python_logger()
@@ -630,10 +678,32 @@ class FDIDMHardwareTest:
         self._monitor_last_log_t = 0.0
         self._needs_top_block_rebuild = False
 
+        # Alpha/beta optimization is deliberately isolated from the GNU Radio
+        # monitor thread.  The monitor only snapshots H_TF; a daemon worker
+        # computes the paper SER search, and the UI later applies a stable
+        # recommendation.
+        self._adaptive_ab_lock = threading.RLock()
+        self._adaptive_ab_event = threading.Event()
+        self._adaptive_ab_stop = threading.Event()
+        self._adaptive_ab_thread = None
+        self._adaptive_ab_snapshot = None
+        self._adaptive_ab_last_snapshot = None
+        self._adaptive_ab_snapshot_seq = 0
+        self._adaptive_ab_eval_seq = 0
+        self._adaptive_ab_last_queued_frame = -10**18
+        self._adaptive_ab_last_applied_frame = -10**18
+        self._adaptive_ab_last_htf_identity = None
+        self._adaptive_ab_force_next = False
+        self._adaptive_ab_state = "idle" if self.adaptive_alpha_beta_enable else "disabled"
+        self._adaptive_ab_last_error = ""
+        self._adaptive_ab_stable_key = None
+        self._adaptive_ab_stable_count = 0
+        self._adaptive_ab_recommendation: Dict[str, Any] = {}
+
         self._set_tx_text_internal(tx_text)
         self._build_top_block()
         self._debug("INFO",
-                    f"FDIDM backend v34 ready: chain={self.strict_chain_name}, "
+                    f"FDIDM backend v35 ready: chain={self.strict_chain_name}, "
                     f"estimator={self.channel_estimator} (requested={getattr(self, 'requested_channel_estimator', self.channel_estimator)}), use_full_htf={self.use_full_htf}, "
                     f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames} frame(s), "
                     f"channel_mode={self.channel_mode}, "
@@ -651,6 +721,13 @@ class FDIDMHardwareTest:
         if getattr(self, "_channel_mode_note", ""):
             self._debug("WARN", self._channel_mode_note)
         self._debug("INFO", self._format_link_limit_summary())
+        if self.adaptive_alpha_beta_enable:
+            self._ensure_alpha_beta_adaptation_worker()
+            self._debug("INFO",
+                        "channel-adaptive alpha/beta enabled: paper SER objective, "
+                        f"coarse={self.adaptive_alpha_beta_coarse_step:.2f}, "
+                        f"fine={self.adaptive_alpha_beta_fine_step:.2f}, "
+                        f"interval={self.adaptive_alpha_beta_interval_frames} frame(s)")
 
 
     # =========================================================
@@ -2609,6 +2686,7 @@ class FDIDMHardwareTest:
     def reset_full_htf_cache(self):
         """Public API used by the UI: clear CSI and cached parametric TDL bases."""
         self._clear_channel_cache()
+        self._invalidate_alpha_beta_adaptation(reason="csi_cache_reset", cooldown=False)
         try:
             self._tdl_param_basis_cache.clear()
         except Exception:
@@ -3108,8 +3186,22 @@ class FDIDMHardwareTest:
             tdl_param_ridge: Optional[float] = None,
             tdl_param_prune_db: Optional[float] = None,
             auto_tdl_param_for_software: Optional[bool] = None,
+            adaptive_alpha_beta_enable: Optional[bool] = None,
+            adaptive_alpha_beta_coarse_step: Optional[float] = None,
+            adaptive_alpha_beta_fine_step: Optional[float] = None,
+            adaptive_alpha_beta_interval_frames: Optional[int] = None,
+            adaptive_alpha_beta_min_improvement_db: Optional[float] = None,
+            adaptive_alpha_beta_stability_evals: Optional[int] = None,
+            adaptive_alpha_beta_cooldown_frames: Optional[int] = None,
+            adaptive_alpha_beta_integer_margin_db: Optional[float] = None,
+            adaptive_alpha_beta_max_order: Optional[int] = None,
+            adaptive_alpha_beta_min_sync_metric: Optional[float] = None,
+            adaptive_alpha_beta_require_good_frame: Optional[bool] = None,
+            adaptive_alpha_beta_rcond: Optional[float] = None,
             **_ignored: Any,
     ):
+
+        adaptive_context_before = self._alpha_beta_adaptation_context_key()
 
         if self._running:
             # Reject only *changed* parameters that alter the GNU Radio/UHD graph
@@ -3150,6 +3242,8 @@ class FDIDMHardwareTest:
 
         rebuild_waveform = False
         rebuild_top_block = False
+        alpha_beta_changed = False
+        adaptive_config_changed = False
         tdl_live_reconfigure = False
         tdl_metadata_only_changed = False
 
@@ -3222,11 +3316,15 @@ class FDIDMHardwareTest:
             if self.equalizer not in ("ZF", "MMSE"):
                 raise ValueError("Unsupported equalizer")
         if alpha is not None and float(alpha) != self.alpha:
-            self.alpha = float(alpha);
+            self.alpha = float(alpha)
             rebuild_waveform = True
+            alpha_beta_changed = True
         if beta is not None and float(beta) != self.beta:
-            self.beta = float(beta);
+            self.beta = float(beta)
             rebuild_waveform = True
+            alpha_beta_changed = True
+        if alpha_beta_changed:
+            self._note_alpha_beta_changed_for_adaptation(reason="configure_alpha_beta_changed")
         if fdidm_m is not None:
             new_m = int(max(4, min(int(fdidm_m), 64)))
             if new_m != self.M:
@@ -3261,6 +3359,7 @@ class FDIDMHardwareTest:
             if new_ev != self.evm_average_frames:
                 self.evm_average_frames = new_ev
                 self._evm_history = deque(maxlen=self.evm_average_frames)
+                self._ab_surface_samples_per_cell = int(max(1, min(int(self.evm_average_frames), 128)))
         if training_amplitude is not None:
             new_ta = float(max(0.05, min(float(training_amplitude), 4.0)))
             if new_ta != self.training_amplitude:
@@ -3340,6 +3439,66 @@ class FDIDMHardwareTest:
             self.full_htf_once = bool(full_htf_once)
         if auto_tdl_param_for_software is not None:
             self.auto_tdl_param_for_software = bool(auto_tdl_param_for_software)
+
+        if adaptive_alpha_beta_enable is not None:
+            v = bool(adaptive_alpha_beta_enable)
+            if v != self.adaptive_alpha_beta_enable:
+                self.adaptive_alpha_beta_enable = v
+                adaptive_config_changed = True
+        if adaptive_alpha_beta_coarse_step is not None:
+            v = float(max(0.05, min(float(adaptive_alpha_beta_coarse_step), 1.0)))
+            if v != self.adaptive_alpha_beta_coarse_step:
+                self.adaptive_alpha_beta_coarse_step = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_fine_step is not None:
+            v = float(max(0.01, min(float(adaptive_alpha_beta_fine_step), self.adaptive_alpha_beta_coarse_step)))
+            if v != self.adaptive_alpha_beta_fine_step:
+                self.adaptive_alpha_beta_fine_step = v; adaptive_config_changed = True
+        # Coarse may have been reduced after the fine value was read.
+        self.adaptive_alpha_beta_fine_step = min(self.adaptive_alpha_beta_fine_step, self.adaptive_alpha_beta_coarse_step)
+        if adaptive_alpha_beta_interval_frames is not None:
+            v = int(max(1, min(int(adaptive_alpha_beta_interval_frames), 1024)))
+            if v != self.adaptive_alpha_beta_interval_frames:
+                self.adaptive_alpha_beta_interval_frames = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_min_improvement_db is not None:
+            v = float(max(0.0, min(float(adaptive_alpha_beta_min_improvement_db), 30.0)))
+            if v != self.adaptive_alpha_beta_min_improvement_db:
+                self.adaptive_alpha_beta_min_improvement_db = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_stability_evals is not None:
+            v = int(max(1, min(int(adaptive_alpha_beta_stability_evals), 16)))
+            if v != self.adaptive_alpha_beta_stability_evals:
+                self.adaptive_alpha_beta_stability_evals = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_cooldown_frames is not None:
+            v = int(max(0, min(int(adaptive_alpha_beta_cooldown_frames), 4096)))
+            if v != self.adaptive_alpha_beta_cooldown_frames:
+                self.adaptive_alpha_beta_cooldown_frames = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_integer_margin_db is not None:
+            v = float(max(0.0, min(float(adaptive_alpha_beta_integer_margin_db), 6.0)))
+            if v != self.adaptive_alpha_beta_integer_margin_db:
+                self.adaptive_alpha_beta_integer_margin_db = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_max_order is not None:
+            v = int(max(16, min(int(adaptive_alpha_beta_max_order), 4096)))
+            if v != self.adaptive_alpha_beta_max_order:
+                self.adaptive_alpha_beta_max_order = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_min_sync_metric is not None:
+            v = float(max(0.0, min(float(adaptive_alpha_beta_min_sync_metric), 1.0)))
+            if v != self.adaptive_alpha_beta_min_sync_metric:
+                self.adaptive_alpha_beta_min_sync_metric = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_require_good_frame is not None:
+            v = bool(adaptive_alpha_beta_require_good_frame)
+            if v != self.adaptive_alpha_beta_require_good_frame:
+                self.adaptive_alpha_beta_require_good_frame = v; adaptive_config_changed = True
+        if adaptive_alpha_beta_rcond is not None:
+            v = float(max(1e-12, min(float(adaptive_alpha_beta_rcond), 1e-1)))
+            if v != self.adaptive_alpha_beta_rcond:
+                self.adaptive_alpha_beta_rcond = v; adaptive_config_changed = True
+
+        if adaptive_config_changed:
+            self._invalidate_alpha_beta_adaptation(reason="adaptive_config_changed", cooldown=False)
+            if self.adaptive_alpha_beta_enable:
+                self._ensure_alpha_beta_adaptation_worker()
+            else:
+                with self._adaptive_ab_lock:
+                    self._adaptive_ab_state = "disabled"
 
         # Channel settings. Every mode traverses USRP RF; optional TDL stages either
         # run after RX or are pre-rendered before TX. Any change invalidates CSI.
@@ -3457,6 +3616,10 @@ class FDIDMHardwareTest:
                         f"channel_mode={self.channel_mode}, SNR={self.tdl_snr_db:.1f}dB; "
                         "active RF-only graph/waveform left unchanged")
 
+        adaptive_context_after = self._alpha_beta_adaptation_context_key()
+        if adaptive_context_after != adaptive_context_before:
+            self._invalidate_alpha_beta_adaptation(reason="objective_context_changed", cooldown=False)
+
         tx_text_changed = (tx_text is not None and str(tx_text) != self._tx_text)
         if rebuild_waveform or tx_text_changed:
             self._debug("INFO",
@@ -3515,6 +3678,7 @@ class FDIDMHardwareTest:
                 self._debug("ERROR", f"start(): queued rebuild failed: {type(e).__name__}: {e}")
                 raise
         self._run_id = int(getattr(self, "_run_id", 0)) + 1
+        self._invalidate_alpha_beta_adaptation(reason=f"start_run_{self._run_id}", cooldown=False)
         self._reset_rx_runtime_state(reason=f"start_run_{self._run_id}", reset_counters=True)
         if bool(getattr(self, "enable_realtime_scheduling", True)):
             try:
@@ -3898,6 +4062,9 @@ class FDIDMHardwareTest:
                 pilot_samples=pilot_samples.astype(np.complex64),
                 data_samples=data_samples.astype(np.complex64),
                 evm_inst=float(evm_inst),
+                adaptive_htf=h_tf_est,
+                adaptive_htf_kind=("full" if (self.use_full_htf or self.use_tdl_param_htf) else "diag"),
+                adaptive_htf_source=("full_htf" if self.use_full_htf else ("tdl_param" if self.use_tdl_param_htf else "diag_tf")),
                 htf_cache_refreshing=bool(htf_cache_refreshing),
                 htf_old_snapshot=htf_old_snapshot,
             )
@@ -4002,6 +4169,37 @@ class FDIDMHardwareTest:
                 self._decode_ok = bool(best["decode_ok"])
                 self._match_bytes = int(best["match_bytes"])
             self._status = "running"
+            expected_payload = max(1, len(self._tx_payload))
+            self._record_alpha_beta_performance_sample_locked({
+                "evm_instant_percent": float(best.get("evm_inst", float("nan"))),
+                "evm_average_percent": float(self.last_evm_average_percent),
+                "evm_average_count": int(len(self._evm_history)),
+                "ber": float(best.get("ber", float("nan"))),
+                "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
+                "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
+                "sync_metric": float(best.get("sync_metric", float("nan"))),
+                "cond_h_cross": float(best.get("cond_h", float("nan"))),
+                "noise_var": float(best.get("noise_var", float("nan"))),
+                "htf_leakage": float(best.get("htf_leakage", float("nan"))),
+                "tdl_param_fit_nmse": float(getattr(self, "_last_tdl_param_fit_nmse", float("nan"))),
+                "cfo_abs_hz": abs(float(best.get("cfo_hz", 0.0))) if np.isfinite(float(best.get("cfo_hz", 0.0))) else float("nan"),
+                "decode_ok": bool(best.get("decode_ok", False)),
+                "match_ratio": float(best.get("match_bytes", 0)) / float(expected_payload),
+            })
+
+        adaptive_channel_valid = not (
+            self.use_full_htf and best.get("htf_cache_refreshing") and not good_quality
+        )
+        if adaptive_channel_valid:
+            self._maybe_queue_alpha_beta_adaptation(
+                h_tf_est=best.get("adaptive_htf"),
+                htf_kind=str(best.get("adaptive_htf_kind", "full")),
+                htf_source=str(best.get("adaptive_htf_source", self.channel_estimator)),
+                noise_var=float(best.get("noise_var", float("nan"))),
+                sync_metric=float(best.get("sync_metric", 0.0)),
+                good_quality=bool(good_quality),
+            )
+
         self._debug(
             "INFO",
             f"v33 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
@@ -4013,6 +4211,527 @@ class FDIDMHardwareTest:
             f"{int(getattr(self, 'last_tdl_param_path_count', 0))}p, "
             f"decode_ok={best['decode_ok']}, match={best['match_bytes']}/{len(self._tx_payload)}"
         )
+
+
+    # =========================================================
+    # Paper-guided channel-adaptive alpha/beta optimization
+    # =========================================================
+    def _alpha_beta_adaptation_context_key(self) -> Tuple[Any, ...]:
+        """Context that changes the paper SER objective, excluding alpha/beta."""
+        return (
+            int(getattr(self, "M", 0)), int(getattr(self, "N", 0)),
+            int(getattr(self, "cp_len", 0)), str(getattr(self, "mod_order", "")),
+            str(getattr(self, "equalizer", "")), str(getattr(self, "channel_estimator", "")),
+            str(getattr(self, "channel_mode", "")), round(float(getattr(self, "sample_rate", 0.0)), 3),
+            round(float(getattr(self, "carrier_freq", 0.0)), 3),
+            round(float(getattr(self, "tx_gain", 0.0)), 3),
+            round(float(getattr(self, "rx_gain", 0.0)), 3),
+            round(float(getattr(self, "training_amplitude", 0.0)), 6),
+            round(float(getattr(self, "tdl_rms_delay_spread_ns", 0.0)), 6),
+            round(float(getattr(self, "tdl_doppler_hz", 0.0)), 6),
+            round(float(getattr(self, "tdl_doppler_spread_hz", 0.0)), 6),
+            round(float(getattr(self, "tdl_snr_db", 0.0)), 6),
+        )
+
+    def _invalidate_alpha_beta_adaptation(self, reason: str = "context_change", cooldown: bool = False):
+        lock = getattr(self, "_adaptive_ab_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._adaptive_ab_snapshot_seq = int(getattr(self, "_adaptive_ab_snapshot_seq", 0)) + 1
+            self._adaptive_ab_snapshot = None
+            self._adaptive_ab_recommendation = {}
+            self._adaptive_ab_stable_key = None
+            self._adaptive_ab_stable_count = 0
+            self._adaptive_ab_last_htf_identity = None
+            self._adaptive_ab_last_error = ""
+            if cooldown:
+                self._adaptive_ab_last_applied_frame = int(getattr(self, "_frames_processed", 0))
+                self._adaptive_ab_state = "cooldown"
+            else:
+                self._adaptive_ab_state = "waiting_channel" if self.adaptive_alpha_beta_enable else "disabled"
+        try:
+            self._debug("DEBUG", f"alpha/beta adaptation invalidated: {reason}")
+        except Exception:
+            pass
+
+    def _note_alpha_beta_changed_for_adaptation(self, reason: str = "alpha_beta_changed"):
+        """Cancel stale recommendations after either manual or adaptive switching."""
+        self._invalidate_alpha_beta_adaptation(reason=reason, cooldown=True)
+
+    def _ensure_alpha_beta_adaptation_worker(self):
+        if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
+            return
+        with self._adaptive_ab_lock:
+            thread = getattr(self, "_adaptive_ab_thread", None)
+            if thread is not None and thread.is_alive():
+                return
+            self._adaptive_ab_stop.clear()
+            thread = threading.Thread(target=self._alpha_beta_adaptation_worker,
+                                      name=f"fdidm-ab-opt-{id(self):x}", daemon=True)
+            self._adaptive_ab_thread = thread
+            thread.start()
+
+    @staticmethod
+    def _adaptive_qam_order(mod_order: str) -> int:
+        return {"QPSK": 4, "16QAM": 16, "64QAM": 64}.get(str(mod_order).upper(), 4)
+
+    @staticmethod
+    def _adaptive_qfunc(values: np.ndarray) -> np.ndarray:
+        x = np.asarray(values, dtype=np.float64)
+        flat = x.reshape(-1)
+        out = np.fromiter((0.5 * math.erfc(float(v) / math.sqrt(2.0)) for v in flat),
+                          dtype=np.float64, count=flat.size)
+        return out.reshape(x.shape)
+
+    def _adaptive_ser_from_symbol_nsr(self, symbol_nsr: np.ndarray, mod_order: str) -> float:
+        """Paper Eq. (40), averaged as in Eq. (44)/(47)."""
+        xi = np.asarray(symbol_nsr, dtype=np.float64).reshape(-1)
+        xi = np.where(np.isfinite(xi), np.maximum(xi, 1e-15), np.inf)
+        Q = float(self._adaptive_qam_order(mod_order))
+        kappa = 1.0 - 1.0 / math.sqrt(Q)
+        argument = math.sqrt(3.0 / max(Q - 1.0, 1.0)) / xi
+        q = self._adaptive_qfunc(argument)
+        ser = 4.0 * kappa * q - 4.0 * (kappa ** 2) * (q ** 2)
+        ser = np.clip(ser, 0.0, 1.0)
+        return float(np.mean(ser)) if ser.size else float("inf")
+
+    @staticmethod
+    def _adaptive_grid_values(step: float) -> np.ndarray:
+        step = float(max(0.01, min(float(step), 2.0)))
+        count = int(math.floor(2.0 / step + 1e-9))
+        vals = [min(2.0, k * step) for k in range(count + 1)]
+        vals.extend([0.0, 1.0, 2.0])
+        return np.asarray(sorted(set(round(float(v), 9) for v in vals if -1e-9 <= v <= 2.0 + 1e-9)),
+                          dtype=np.float64)
+
+    @staticmethod
+    def _adaptive_canonical_index(value: float) -> float:
+        v = ((float(value) + 2.0) % 4.0) - 2.0
+        if v <= -2.0 + 1e-12:
+            v = 2.0
+        return float(abs(v))
+
+    def _adaptive_prepare_base(self, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+        """Prepare the exact paper SER objective in a transform-efficient form.
+
+        For H(alpha,beta)=Phi H_TF Phi^H, right multiplication by unitary Phi^H
+        does not change row norms.  Eq. (41) and Eq. (46) therefore require only
+        the left action of Phi.  A diagonal H_TF admits an even cheaper exact
+        form: row powers are |Phi|^2 times a per-TF-cell NSR vector.
+        """
+        M = int(snapshot["M"]); N = int(snapshot["N"]); K = M * N
+        htf_kind = str(snapshot.get("htf_kind", "full"))
+        raw = np.asarray(snapshot["htf"], dtype=np.complex128)
+        is_diag = htf_kind == "diag" or raw.shape == (M, N) or raw.ndim == 1
+
+        noise_var = float(snapshot.get("noise_var", float("nan")))
+        if is_diag:
+            diag = raw.reshape(-1, order="F")[:K]
+            if diag.size != K:
+                raise ValueError(f"adaptive diagonal H_TF size mismatch: {diag.size} != {K}")
+            if not np.all(np.isfinite(diag.real)) or not np.all(np.isfinite(diag.imag)):
+                raise ValueError("adaptive diagonal H_TF contains NaN/Inf")
+            signal_power = float(np.mean(np.abs(diag) ** 2))
+            if not np.isfinite(noise_var) or noise_var <= 0.0:
+                noise_var = max(signal_power * 1e-3, 1e-9)
+            noise_var = max(noise_var, 1e-12)
+            equalizer = str(snapshot.get("equalizer", "MMSE")).upper()
+            if equalizer == "ZF":
+                h_abs = np.abs(diag)
+                nz = h_abs[h_abs > 0.0]
+                med = float(np.median(nz)) if nz.size else 0.0
+                floor = max(med * 1e-3, 1e-10)
+                safe_abs = np.maximum(h_abs, floor)
+                nsr_power = noise_var / np.maximum(safe_abs ** 2, 1e-20)
+            else:
+                W = np.conj(diag) / (np.abs(diag) ** 2 + noise_var)
+                error = W * diag - 1.0
+                nsr_power = np.abs(error) ** 2 + noise_var * np.abs(W) ** 2
+            predicted_snr_db = 10.0 * math.log10(max(signal_power / noise_var, 1e-15))
+            return {
+                "kind": "diag_weights",
+                "weights": np.asarray(nsr_power, dtype=np.float64),
+            }, float(predicted_snr_db)
+
+        Htf = raw.reshape((K, K)).astype(np.complex128, copy=False)
+        if not np.all(np.isfinite(Htf.real)) or not np.all(np.isfinite(Htf.imag)):
+            raise ValueError("adaptive H_TF contains NaN/Inf")
+        signal_power = float(np.linalg.norm(Htf, "fro") ** 2 / max(K, 1))
+        if not np.isfinite(noise_var) or noise_var <= 0.0:
+            noise_var = max(signal_power * 1e-3, 1e-9)
+        noise_var = max(noise_var, 1e-12)
+        xi = math.sqrt(noise_var)  # normalized QAM symbols have Es=1
+        equalizer = str(snapshot.get("equalizer", "MMSE")).upper()
+        rcond = float(snapshot.get("rcond", 1e-6))
+        I = np.eye(K, dtype=np.complex128)
+
+        if equalizer == "ZF":
+            try:
+                inv_htf = np.linalg.solve(Htf, I)
+            except np.linalg.LinAlgError:
+                inv_htf = np.linalg.pinv(Htf, rcond=rcond)
+            base = xi * inv_htf
+        else:
+            Hh = Htf.conj().T
+            gram = Hh @ Htf
+            try:
+                Wtf = np.linalg.solve(gram + noise_var * I, Hh)
+            except np.linalg.LinAlgError:
+                load = max(noise_var, rcond * float(np.mean(np.abs(gram)) + 1e-12))
+                Wtf = np.linalg.solve(gram + load * I, Hh)
+            error_tf = Wtf @ Htf - I
+            # Eq. (46): ||row(WH-I)||^2 + xi^2 ||row(W)||^2.
+            base = np.concatenate((error_tf, xi * Wtf), axis=1)
+
+        predicted_snr_db = 10.0 * math.log10(max(signal_power / noise_var, 1e-15))
+        return {
+            "kind": "matrix",
+            "matrix": np.asarray(base, dtype=np.complex128),
+        }, float(predicted_snr_db)
+
+    def _adaptive_evaluate_candidates(self, prepared: Dict[str, Any], candidates: List[Tuple[float, float]],
+                                      M: int, N: int, mod_order: str) -> List[Dict[str, float]]:
+        """Evaluate candidate indices with exact paper ZF/MMSE row NSRs."""
+        groups: Dict[float, List[float]] = {}
+        for alpha, beta in candidates:
+            a = round(float(alpha), 9); bb = round(float(beta), 9)
+            groups.setdefault(a, []).append(bb)
+        results: List[Dict[str, float]] = []
+
+        if str(prepared.get("kind")) == "diag_weights":
+            weights = np.asarray(prepared["weights"], dtype=np.float64).reshape((M, N), order="F")
+            # For diagonal H_TF, diag(Phi C Phi^H) equals
+            # |Gamma_M(-alpha)|^2 W |Gamma_N(beta)|^{2T} exactly.
+            for alpha in sorted(groups):
+                GM2 = np.abs(self._gamma(M, -float(alpha))) ** 2
+                left = GM2 @ weights
+                for beta in sorted(set(groups[alpha])):
+                    GN2 = np.abs(self._gamma(N, float(beta))) ** 2
+                    power = left @ GN2.T
+                    symbol_nsr = np.sqrt(np.maximum(power.reshape(-1, order="F"), 0.0))
+                    ser = self._adaptive_ser_from_symbol_nsr(symbol_nsr, mod_order)
+                    results.append({"alpha": float(alpha), "beta": float(beta), "ser": float(ser)})
+            return results
+
+        K = int(M * N)
+        base = np.asarray(prepared["matrix"], dtype=np.complex128)
+        if base.shape[0] != K:
+            raise ValueError(f"adaptive base rows mismatch: {base.shape[0]} != {K}")
+        cube = base.reshape((M, N, base.shape[1]), order="F")
+        for alpha in sorted(groups):
+            after_alpha = self._apply_gamma_axis(cube, -float(alpha), axis=0)
+            for beta in sorted(set(groups[alpha])):
+                transformed = self._apply_gamma_axis(after_alpha, float(beta), axis=1)
+                power = np.sum(transformed.real * transformed.real + transformed.imag * transformed.imag, axis=2)
+                symbol_nsr = np.sqrt(np.maximum(power.reshape(-1, order="F"), 0.0))
+                ser = self._adaptive_ser_from_symbol_nsr(symbol_nsr, mod_order)
+                results.append({"alpha": float(alpha), "beta": float(beta), "ser": float(ser)})
+        return results
+
+    def _optimize_alpha_beta_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = time.time()
+        M = int(snapshot["M"]); N = int(snapshot["N"]); K = M * N
+        if K > int(snapshot.get("max_order", 512)):
+            raise ValueError(f"adaptive search skipped: M*N={K} exceeds max_order={snapshot.get('max_order')}")
+        prepared, predicted_snr_db = self._adaptive_prepare_base(snapshot)
+        diagonal_fast_path = str(prepared.get("kind")) == "diag_weights"
+        coarse_step = float(snapshot.get("coarse_step", 0.25))
+        fine_step = float(snapshot.get("fine_step", 0.05))
+        # Full H_TF searches are substantially heavier than diagonal-TF searches.
+        # A 0.5 coarse grid plus coordinate refinement keeps the optimizer from
+        # starving the hardware host while still finishing at the requested fine step.
+        effective_coarse = coarse_step if diagonal_fast_path else max(coarse_step, 0.50)
+        coarse_vals = self._adaptive_grid_values(effective_coarse)
+        coarse_candidates = [(float(a), float(bb)) for a in coarse_vals for bb in coarse_vals]
+        coarse_results = self._adaptive_evaluate_candidates(prepared, coarse_candidates, M, N, snapshot["mod_order"])
+        coarse_results.sort(key=lambda r: (r["ser"], r["alpha"], r["beta"]))
+
+        refine_candidates = set()
+        if diagonal_fast_path:
+            # Cheap exact two-dimensional refinement around three basins.
+            radius = max(effective_coarse, 2.0 * fine_step)
+            for seed in coarse_results[:3]:
+                a0 = float(seed["alpha"]); b0 = float(seed["beta"])
+                av = np.arange(max(0.0, a0 - radius), min(2.0, a0 + radius) + 0.5 * fine_step, fine_step)
+                bv = np.arange(max(0.0, b0 - radius), min(2.0, b0 + radius) + 0.5 * fine_step, fine_step)
+                for a in av:
+                    for bb in bv:
+                        refine_candidates.add((round(float(np.clip(a, 0.0, 2.0)), 9),
+                                               round(float(np.clip(bb, 0.0, 2.0)), 9)))
+        else:
+            # Full-matrix coordinate refinement around the two best coarse basins.
+            radius = max(0.5 * effective_coarse, 2.0 * fine_step)
+            for seed in coarse_results[:2]:
+                a0 = float(seed["alpha"]); b0 = float(seed["beta"])
+                av = np.arange(max(0.0, a0 - radius), min(2.0, a0 + radius) + 0.5 * fine_step, fine_step)
+                bv = np.arange(max(0.0, b0 - radius), min(2.0, b0 + radius) + 0.5 * fine_step, fine_step)
+                for a in av:
+                    refine_candidates.add((round(float(np.clip(a, 0.0, 2.0)), 9), round(b0, 9)))
+                for bb in bv:
+                    refine_candidates.add((round(a0, 9), round(float(np.clip(bb, 0.0, 2.0)), 9)))
+
+        current_alpha = float(snapshot.get("alpha", 0.0))
+        current_beta = float(snapshot.get("beta", 0.0))
+        current_canonical = (round(self._adaptive_canonical_index(current_alpha), 9),
+                             round(self._adaptive_canonical_index(current_beta), 9))
+        refine_candidates.update({current_canonical, (0.0, 0.0), (1.0, 1.0), (0.5, 1.0)})
+        fine_results = self._adaptive_evaluate_candidates(prepared, sorted(refine_candidates), M, N, snapshot["mod_order"])
+
+        by_key: Dict[Tuple[float, float], Dict[str, float]] = {}
+        for item in coarse_results + fine_results:
+            key = (round(item["alpha"], 9), round(item["beta"], 9))
+            old = by_key.get(key)
+            if old is None or item["ser"] < old["ser"]:
+                by_key[key] = item
+        all_results = list(by_key.values())
+        all_results.sort(key=lambda r: (r["ser"], r["alpha"], r["beta"]))
+        raw_best = all_results[0]
+
+        current_eval = self._adaptive_evaluate_candidates(
+            prepared, [(current_alpha, current_beta)], M, N, snapshot["mod_order"]
+        )[0]
+        current_ser = float(current_eval["ser"])
+
+        # Prefer the current point on a numerical tie; this prevents needless
+        # switching on a flat/identity channel.
+        tie_limit = float(raw_best["ser"]) * (1.0 + 1e-10) + 1e-15
+        tied = [r for r in all_results if r["ser"] <= tie_limit]
+        best = min(tied, key=lambda r: ((r["alpha"] - current_canonical[0]) ** 2 +
+                                        (r["beta"] - current_canonical[1]) ** 2,
+                                        r["alpha"], r["beta"]))
+
+        # Paper-aligned complexity policy: if an integer-index waveform is within
+        # a small SER margin of the fractional optimum, use the integer point.
+        margin_db = float(snapshot.get("integer_margin_db", 0.0))
+        integer_limit = float(best["ser"]) * (10.0 ** (margin_db / 10.0)) + 1e-15
+        integer_results = [r for r in all_results
+                           if abs(r["alpha"] - round(r["alpha"])) < 1e-9
+                           and abs(r["beta"] - round(r["beta"])) < 1e-9
+                           and r["ser"] <= integer_limit
+                           and r["ser"] < current_ser * (1.0 - 1e-10)]
+        if integer_results:
+            best = min(integer_results, key=lambda r: (r["ser"],
+                                                       (r["alpha"] - current_canonical[0]) ** 2 +
+                                                       (r["beta"] - current_canonical[1]) ** 2))
+
+        best_ser = float(best["ser"])
+        improvement_db = 10.0 * math.log10(max(current_ser, 1e-15) / max(best_ser, 1e-15))
+        ofdm = by_key.get((0.0, 0.0), {"ser": float("nan")})
+        otfs = by_key.get((1.0, 1.0), {"ser": float("nan")})
+        return {
+            "recommended_alpha": float(best["alpha"]),
+            "recommended_beta": float(best["beta"]),
+            "predicted_ser_current": current_ser,
+            "predicted_ser_best": best_ser,
+            "predicted_ser_ofdm": float(ofdm.get("ser", float("nan"))),
+            "predicted_ser_otfs": float(otfs.get("ser", float("nan"))),
+            "predicted_improvement_db": float(improvement_db),
+            "predicted_snr_db": float(predicted_snr_db),
+            "candidate_count": int(len(all_results) + 1),
+            "search_seconds": float(time.time() - t0),
+            "search_mode": "diag_2d" if diagonal_fast_path else "full_coordinate",
+            "htf_source": str(snapshot.get("htf_source", "unknown")),
+            "htf_kind": str(snapshot.get("htf_kind", "unknown")),
+            "equalizer": str(snapshot.get("equalizer", "")),
+            "mod_order": str(snapshot.get("mod_order", "")),
+            "frame_counter": int(snapshot.get("frame_counter", 0)),
+            "snapshot_seq": int(snapshot.get("snapshot_seq", 0)),
+        }
+
+    def _alpha_beta_adaptation_worker(self):
+        while not self._adaptive_ab_stop.is_set():
+            if not self._adaptive_ab_event.wait(timeout=0.5):
+                continue
+            self._adaptive_ab_event.clear()
+            with self._adaptive_ab_lock:
+                snapshot = self._adaptive_ab_snapshot
+                if snapshot is None or not self.adaptive_alpha_beta_enable:
+                    continue
+                snapshot = dict(snapshot)
+                expected_seq = int(snapshot.get("snapshot_seq", -1))
+                self._adaptive_ab_state = "optimizing"
+                self._adaptive_ab_last_error = ""
+            try:
+                result = self._optimize_alpha_beta_snapshot(snapshot)
+            except Exception as exc:
+                with self._adaptive_ab_lock:
+                    if expected_seq == int(self._adaptive_ab_snapshot_seq):
+                        self._adaptive_ab_last_error = f"{type(exc).__name__}: {exc}"
+                        self._adaptive_ab_state = "error"
+                self._debug("WARN", f"alpha/beta optimizer failed: {type(exc).__name__}: {exc}")
+                continue
+
+            with self._adaptive_ab_lock:
+                if expected_seq != int(self._adaptive_ab_snapshot_seq):
+                    # Alpha/beta or channel context changed during the search.
+                    continue
+                fine = max(float(self.adaptive_alpha_beta_fine_step), 1e-9)
+                key = (int(round(float(result["recommended_alpha"]) / fine)),
+                       int(round(float(result["recommended_beta"]) / fine)))
+                if key == self._adaptive_ab_stable_key:
+                    self._adaptive_ab_stable_count += 1
+                else:
+                    self._adaptive_ab_stable_key = key
+                    self._adaptive_ab_stable_count = 1
+                self._adaptive_ab_eval_seq += 1
+                result["recommendation_seq"] = int(self._adaptive_ab_eval_seq)
+                result["stable_count"] = int(self._adaptive_ab_stable_count)
+                result["stable_required"] = int(self.adaptive_alpha_beta_stability_evals)
+                result["minimum_improvement_db"] = float(self.adaptive_alpha_beta_min_improvement_db)
+                delta = abs(float(result["recommended_alpha"]) - float(snapshot.get("alpha", 0.0))) + \
+                        abs(float(result["recommended_beta"]) - float(snapshot.get("beta", 0.0)))
+                required_gain = max(float(self.adaptive_alpha_beta_min_improvement_db), 1e-6)
+                ready = (float(result["predicted_improvement_db"]) >= required_gain
+                         and int(self._adaptive_ab_stable_count) >= int(self.adaptive_alpha_beta_stability_evals)
+                         and delta >= 0.5 * fine)
+                result["ready"] = bool(ready)
+                result["pending"] = bool(ready)
+                self._adaptive_ab_recommendation = result
+                self._adaptive_ab_state = "ready" if ready else "tracking"
+            level = "INFO" if result.get("ready") else "DEBUG"
+            self._debug(level,
+                        "alpha/beta SER search: "
+                        f"current={result['predicted_ser_current']:.3e}, best={result['predicted_ser_best']:.3e}, "
+                        f"gain={result['predicted_improvement_db']:.2f}dB, "
+                        f"rec=({result['recommended_alpha']:.2f},{result['recommended_beta']:.2f}), "
+                        f"stable={result['stable_count']}/{result['stable_required']}, "
+                        f"source={result['htf_source']}, time={result['search_seconds']:.3f}s")
+
+    def _maybe_queue_alpha_beta_adaptation(self, h_tf_est: Any, htf_kind: str,
+                                           htf_source: str, noise_var: float,
+                                           sync_metric: float, good_quality: bool):
+        if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
+            return
+        self._ensure_alpha_beta_adaptation_worker()
+        K = int(self.M * self.N)
+        if K > int(self.adaptive_alpha_beta_max_order):
+            with self._adaptive_ab_lock:
+                self._adaptive_ab_state = "order_limited"
+                self._adaptive_ab_last_error = f"M*N={K} > adaptive max_order={self.adaptive_alpha_beta_max_order}"
+            return
+        if h_tf_est is None or not np.isfinite(float(sync_metric)):
+            return
+        if float(sync_metric) < float(self.adaptive_alpha_beta_min_sync_metric):
+            return
+        if self.adaptive_alpha_beta_require_good_frame and not bool(good_quality):
+            return
+
+        frame_counter = int(getattr(self, "_frames_processed", 0))
+        htf_identity = (str(htf_source), id(h_tf_est))
+        with self._adaptive_ab_lock:
+            force = bool(self._adaptive_ab_force_next)
+            if (not force and str(htf_source) == "full_htf" and bool(getattr(self, "full_htf_once", False))
+                    and htf_identity == self._adaptive_ab_last_htf_identity):
+                return
+            if not force:
+                if frame_counter - int(self._adaptive_ab_last_applied_frame) < int(self.adaptive_alpha_beta_cooldown_frames):
+                    self._adaptive_ab_state = "cooldown"
+                    return
+                if frame_counter - int(self._adaptive_ab_last_queued_frame) < int(self.adaptive_alpha_beta_interval_frames):
+                    return
+            self._adaptive_ab_force_next = False
+
+        raw = np.asarray(h_tf_est, dtype=np.complex128)
+        if str(htf_kind) == "diag" or raw.shape == (self.M, self.N):
+            htf_payload = raw.reshape(-1, order="F").copy()
+            htf_kind = "diag"
+        else:
+            if raw.size != K * K:
+                return
+            htf_payload = raw.reshape((K, K)).copy()
+            htf_kind = "full"
+        if not np.all(np.isfinite(htf_payload.real)) or not np.all(np.isfinite(htf_payload.imag)):
+            return
+
+        with self._adaptive_ab_lock:
+            self._adaptive_ab_snapshot_seq += 1
+            snapshot = {
+                "snapshot_seq": int(self._adaptive_ab_snapshot_seq),
+                "frame_counter": frame_counter,
+                "M": int(self.M), "N": int(self.N),
+                "alpha": float(self.alpha), "beta": float(self.beta),
+                "mod_order": str(self.mod_order), "equalizer": str(self.equalizer),
+                "noise_var": float(noise_var), "sync_metric": float(sync_metric),
+                "htf": htf_payload, "htf_kind": str(htf_kind), "htf_source": str(htf_source),
+                "coarse_step": float(self.adaptive_alpha_beta_coarse_step),
+                "fine_step": float(self.adaptive_alpha_beta_fine_step),
+                "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
+                "max_order": int(self.adaptive_alpha_beta_max_order),
+                "rcond": float(self.adaptive_alpha_beta_rcond),
+            }
+            self._adaptive_ab_snapshot = snapshot
+            self._adaptive_ab_last_snapshot = snapshot
+            self._adaptive_ab_last_queued_frame = frame_counter
+            self._adaptive_ab_last_htf_identity = htf_identity
+            self._adaptive_ab_state = "queued"
+            self._adaptive_ab_last_error = ""
+            self._adaptive_ab_event.set()
+
+    def request_alpha_beta_adaptation(self) -> bool:
+        """Request an immediate search using the latest H_TF, or the next valid frame."""
+        if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
+            return False
+        self._ensure_alpha_beta_adaptation_worker()
+        with self._adaptive_ab_lock:
+            last = self._adaptive_ab_last_snapshot
+            if last is None:
+                self._adaptive_ab_force_next = True
+                self._adaptive_ab_state = "waiting_channel"
+                return False
+            self._adaptive_ab_snapshot_seq += 1
+            snap = dict(last)
+            snap["snapshot_seq"] = int(self._adaptive_ab_snapshot_seq)
+            snap["frame_counter"] = int(getattr(self, "_frames_processed", 0))
+            snap["alpha"] = float(self.alpha); snap["beta"] = float(self.beta)
+            snap["mod_order"] = str(self.mod_order); snap["equalizer"] = str(self.equalizer)
+            snap["coarse_step"] = float(self.adaptive_alpha_beta_coarse_step)
+            snap["fine_step"] = float(self.adaptive_alpha_beta_fine_step)
+            snap["integer_margin_db"] = float(self.adaptive_alpha_beta_integer_margin_db)
+            snap["max_order"] = int(self.adaptive_alpha_beta_max_order)
+            snap["rcond"] = float(self.adaptive_alpha_beta_rcond)
+            self._adaptive_ab_snapshot = snap
+            self._adaptive_ab_last_snapshot = snap
+            self._adaptive_ab_state = "queued"
+            self._adaptive_ab_event.set()
+            return True
+
+    def get_alpha_beta_adaptation_status(self) -> Dict[str, Any]:
+        lock = getattr(self, "_adaptive_ab_lock", None)
+        if lock is None:
+            return {"enabled": False, "state": "uninitialized", "ready": False, "pending": False}
+        with lock:
+            rec = dict(getattr(self, "_adaptive_ab_recommendation", {}) or {})
+            return {
+                "enabled": bool(getattr(self, "adaptive_alpha_beta_enable", False)),
+                "state": str(getattr(self, "_adaptive_ab_state", "disabled")),
+                "last_error": str(getattr(self, "_adaptive_ab_last_error", "")),
+                "ready": bool(rec.get("ready", False)),
+                "pending": bool(rec.get("pending", False)),
+                "recommendation_seq": int(rec.get("recommendation_seq", 0)),
+                "recommended_alpha": float(rec.get("recommended_alpha", float("nan"))),
+                "recommended_beta": float(rec.get("recommended_beta", float("nan"))),
+                "predicted_ser_current": float(rec.get("predicted_ser_current", float("nan"))),
+                "predicted_ser_best": float(rec.get("predicted_ser_best", float("nan"))),
+                "predicted_ser_ofdm": float(rec.get("predicted_ser_ofdm", float("nan"))),
+                "predicted_ser_otfs": float(rec.get("predicted_ser_otfs", float("nan"))),
+                "predicted_improvement_db": float(rec.get("predicted_improvement_db", float("nan"))),
+                "predicted_snr_db": float(rec.get("predicted_snr_db", float("nan"))),
+                "stable_count": int(rec.get("stable_count", 0)),
+                "stable_required": int(rec.get("stable_required", self.adaptive_alpha_beta_stability_evals)),
+                "candidate_count": int(rec.get("candidate_count", 0)),
+                "search_seconds": float(rec.get("search_seconds", float("nan"))),
+                "htf_source": str(rec.get("htf_source", "")),
+                "htf_kind": str(rec.get("htf_kind", "")),
+                "coarse_step": float(self.adaptive_alpha_beta_coarse_step),
+                "fine_step": float(self.adaptive_alpha_beta_fine_step),
+                "interval_frames": int(self.adaptive_alpha_beta_interval_frames),
+                "minimum_improvement_db": float(self.adaptive_alpha_beta_min_improvement_db),
+                "cooldown_frames": int(self.adaptive_alpha_beta_cooldown_frames),
+                "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
+                "max_order": int(self.adaptive_alpha_beta_max_order),
+                "signaling_mode": str(getattr(self, "ALPHA_BETA_SIGNALING_MODE", "shared_memory")),
+            }
 
     # =========================================================
     # Display helpers
@@ -4088,7 +4807,10 @@ class FDIDMHardwareTest:
             self.constellation_display_mode = mode
 
     def set_tx_gain(self, value: float):
+        changed = float(value) != float(getattr(self, "tx_gain", value))
         self.tx_gain = float(value)
+        if changed:
+            self._invalidate_alpha_beta_adaptation(reason="tx_gain_changed", cooldown=False)
         if getattr(self, "_usrp_sink", None) is not None:
             try:
                 self._usrp_sink.set_gain(self.tx_gain, 0)
@@ -4096,7 +4818,10 @@ class FDIDMHardwareTest:
                 pass
 
     def set_rx_gain(self, value: float):
+        changed = float(value) != float(getattr(self, "rx_gain", value))
         self.rx_gain = float(value)
+        if changed:
+            self._invalidate_alpha_beta_adaptation(reason="rx_gain_changed", cooldown=False)
         if getattr(self, "_usrp_source", None) is not None:
             try:
                 self._usrp_source.set_gain(self.rx_gain, 0)
@@ -4388,7 +5113,317 @@ class FDIDMHardwareTest:
             return (np.array(self._ber_hist_t, dtype=np.float64),
                     np.array(self._ber_hist_v, dtype=np.float64))
 
+    # =========================================================
+    # Alpha/Beta performance surface for UI demonstration
+    # =========================================================
+    def _alpha_beta_surface_context_key(self) -> Tuple[Any, ...]:
+        """Comparable-context key for the alpha/beta performance surface.
+
+        The surface is meant to answer one question: under the same link,
+        modulation, estimator, gain, coding and channel settings, which
+        alpha/beta pair actually produced a better measured metric?  Alpha and
+        beta themselves are intentionally excluded so changing them adds a new
+        point; all other settings that would make points non-comparable are
+        included and trigger an automatic clear.
+        """
+        def _r(value: Any, digits: int = 6) -> float:
+            try:
+                v = float(value)
+                if not np.isfinite(v):
+                    return float("nan")
+                return round(v, int(digits))
+            except Exception:
+                return float("nan")
+
+        return (
+            str(getattr(self, "strict_chain_name", "")),
+            str(getattr(self, "device_type", "")),
+            str(getattr(self, "channel_mode", "")),
+            str(getattr(self, "channel_estimator", "")),
+            str(getattr(self, "requested_channel_estimator", "")),
+            str(getattr(self, "mod_order", "")),
+            str(getattr(self, "equalizer", "")),
+            str(getattr(self, "coding_scheme", "")),
+            bool(getattr(self, "coding_interleaver", False)),
+            int(getattr(self, "M", 0)),
+            int(getattr(self, "N", 0)),
+            int(getattr(self, "cp_len", 0)),
+            int(getattr(self, "max_full_htf_order", 0)),
+            int(getattr(self, "tx_frame_count", 0)),
+            int(getattr(self, "inter_frame_guard_len", 0)),
+            int(getattr(self, "evm_average_frames", 0)),
+            _r(getattr(self, "sample_rate", 0.0), 3),
+            _r(getattr(self, "carrier_freq", 0.0), 3),
+            _r(getattr(self, "tx_gain", 0.0), 3),
+            _r(getattr(self, "rx_gain", 0.0), 3),
+            _r(getattr(self, "training_amplitude", 0.0), 6),
+            _r(getattr(self, "tdl_rms_delay_spread_ns", 0.0), 6),
+            _r(getattr(self, "tdl_doppler_hz", 0.0), 6),
+            _r(getattr(self, "tdl_doppler_spread_hz", 0.0), 6),
+            _r(getattr(self, "tdl_snr_db", 0.0), 6),
+            int(getattr(self, "tdl_seed", 0)),
+            bool(getattr(self, "tdl_normalize_power", False)),
+            int(getattr(self, "tdl_param_num_sinusoids", 0)),
+            int(getattr(self, "tdl_param_max_paths", 0)),
+            _r(getattr(self, "tdl_param_ridge", 0.0), 12),
+            _r(getattr(self, "tdl_param_prune_db", 0.0), 6),
+            int(getattr(self, "_tx_coded_bits_len", 0)),
+            int(getattr(self, "_tx_uncoded_bits_len", 0)),
+        )
+
+    def _clear_alpha_beta_performance_surface_locked(self, reason: str = "context_change"):
+        self._ab_metric_history = {}
+        self._ab_surface_context_key = self._alpha_beta_surface_context_key()
+        try:
+            self._debug("INFO", f"alpha/beta performance surface cleared: {reason}")
+        except Exception:
+            pass
+
+    def clear_alpha_beta_performance_surface(self, reason: str = "manual"):
+        """Public UI hook: clear measured alpha/beta performance cells."""
+        with self._lock:
+            self._clear_alpha_beta_performance_surface_locked(reason=reason)
+
+    def _ensure_alpha_beta_surface_context_locked(self):
+        current_key = self._alpha_beta_surface_context_key()
+        if current_key != getattr(self, "_ab_surface_context_key", None):
+            self._clear_alpha_beta_performance_surface_locked(reason="non_alpha_beta_parameter_changed")
+
+    @staticmethod
+    def _finite_float_or_nan(value: Any) -> float:
+        try:
+            v = float(value)
+            return v if np.isfinite(v) else float("nan")
+        except Exception:
+            return float("nan")
+
+    def _alpha_beta_surface_target_samples_locked(self) -> int:
+        """Number of real RX frames used before one α/β point is frozen.
+
+        The UI asks for average metrics on the z-axis.  Therefore a point is
+        not published while the current α/β value is still accumulating its
+        averaging window.  Once this many processed frames have been collected,
+        the cell is finalized and will never be changed again unless the user
+        explicitly clears the surface or changes a non-α/β context parameter.
+        """
+        try:
+            n = int(getattr(self, "_ab_surface_samples_per_cell", 0))
+        except Exception:
+            n = 0
+        if n <= 0:
+            try:
+                n = int(getattr(self, "evm_average_frames", 1))
+            except Exception:
+                n = 1
+        return int(max(1, min(n, 128)))
+
+    def _finalize_alpha_beta_cell_locked(self, cell: Dict[str, Any]):
+        """Freeze all z-axis metrics for one measured α/β cell.
+
+        This is deliberately one-way: finalized cells are read-only.  It prevents
+        a previously measured column from moving while the live link keeps
+        processing repeated frames at the same α/β setting.
+        """
+        metric_store = cell.get("metrics", {}) if isinstance(cell, dict) else {}
+        final_metrics: Dict[str, float] = {}
+        final_counts: Dict[str, int] = {}
+
+        for name, samples in dict(metric_store).items():
+            try:
+                arr = np.asarray(list(samples), dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+            arr = arr[np.isfinite(arr)]
+            if arr.size <= 0:
+                continue
+            if str(name) == "evm_instant_percent":
+                # Keep the instantaneous diagnostic internally but do not expose it
+                # in the UI selector.  It is also the mathematically correct source
+                # for RMS average EVM over the finalized α/β window.
+                final_metrics[str(name)] = float(arr[-1])
+            elif str(name) == "evm_average_percent":
+                # This value is overwritten below from evm_instant_percent when
+                # available.  Keeping a fallback protects older call paths.
+                final_metrics[str(name)] = float(arr[-1])
+            else:
+                final_metrics[str(name)] = float(np.mean(arr))
+            final_counts[str(name)] = int(arr.size)
+
+        try:
+            inst = np.asarray(list(metric_store.get("evm_instant_percent", [])), dtype=np.float64).reshape(-1)
+            inst = inst[np.isfinite(inst)]
+        except Exception:
+            inst = np.zeros(0, dtype=np.float64)
+        if inst.size > 0:
+            final_metrics["evm_average_percent"] = float(np.sqrt(np.mean(inst ** 2)))
+            final_counts["evm_average_percent"] = int(inst.size)
+
+        sample_count = int(max(0, cell.get("sample_count", 0)))
+        decode_ok_count = int(max(0, cell.get("decode_ok_count", 0)))
+        final_metrics["decode_success_ratio"] = float(decode_ok_count) / max(float(sample_count), 1.0)
+        final_counts["decode_success_ratio"] = int(sample_count)
+
+        # A frozen cell with no finite metrics is not useful; leave it partial so
+        # a later valid frame under the same α/β can still complete it.
+        if not final_metrics:
+            return
+        cell["final_metrics"] = final_metrics
+        cell["final_metric_counts"] = final_counts
+        cell["finalized"] = True
+        cell["final_frame_counter"] = int(getattr(self, "_frames_processed", 0))
+        cell["final_wall"] = float(time.time())
+
+    def _record_alpha_beta_performance_sample_locked(self, metrics: Dict[str, Any]):
+        """Record one measured frame into the alpha/beta surface.
+
+        Caller must hold self._lock.  Values come from the same RX
+        sync/equalizer/decoder path that updates BER/EVM status.  A cell is
+        accumulated for a fixed averaging window and then frozen; finalized
+        points are never updated by later frames, so already measured columns
+        remain visually fixed while the operator moves to the next α/β setting.
+        """
+        self._ensure_alpha_beta_surface_context_locked()
+        try:
+            q_digits = int(getattr(self, "_ab_surface_quant_digits", 3))
+            a = round(float(getattr(self, "alpha", 0.0)), q_digits)
+            b = round(float(getattr(self, "beta", 0.0)), q_digits)
+        except Exception:
+            return
+        key = (a, b)
+        if key not in self._ab_metric_history and len(self._ab_metric_history) >= int(getattr(self, "_ab_surface_max_cells", 2048)):
+            oldest = min(self._ab_metric_history.items(), key=lambda kv: float(kv[1].get("last_wall", 0.0)))[0]
+            self._ab_metric_history.pop(oldest, None)
+
+        target = self._alpha_beta_surface_target_samples_locked()
+        cell = self._ab_metric_history.setdefault(key, {
+            "alpha": float(a),
+            "beta": float(b),
+            "metrics": {},
+            "sample_count": 0,
+            "decode_ok_count": 0,
+            "last_frame_counter": 0,
+            "last_wall": 0.0,
+            "target_sample_count": int(target),
+            "finalized": False,
+        })
+
+        # Finalized means finalized.  Do not refresh sample_count, last_frame,
+        # last_wall, or metrics; the visible bar and its metadata must remain
+        # fixed for repeatability.
+        if bool(cell.get("finalized", False)):
+            return
+
+        cell["target_sample_count"] = int(target)
+        cell["sample_count"] = int(cell.get("sample_count", 0)) + 1
+        if bool(metrics.get("decode_ok", False)):
+            cell["decode_ok_count"] = int(cell.get("decode_ok_count", 0)) + 1
+        cell["last_frame_counter"] = int(getattr(self, "_frames_processed", 0))
+        cell["last_wall"] = float(time.time())
+
+        metric_store = cell.setdefault("metrics", {})
+        # Keep the full target window.  No rolling maxlen is used because a point
+        # is frozen exactly once after target samples; losing early samples before
+        # finalization would make the average ambiguous.
+        for name, value in dict(metrics).items():
+            if name == "decode_ok":
+                value = 1.0 if bool(value) else 0.0
+            if name == "evm_average_count":
+                continue
+            v = self._finite_float_or_nan(value)
+            if not np.isfinite(v):
+                continue
+            if name not in metric_store:
+                metric_store[name] = []
+            metric_store[name].append(float(v))
+
+        # Decode-rate is recomputed from the whole cell window.
+        metric_store.setdefault("decode_success_ratio", [])
+        metric_store["decode_success_ratio"].append(
+            float(cell["decode_ok_count"]) / max(float(cell["sample_count"]), 1.0)
+        )
+
+        if int(cell.get("sample_count", 0)) >= int(target):
+            self._finalize_alpha_beta_cell_locked(cell)
+            if bool(cell.get("finalized", False)):
+                try:
+                    fm = cell.get("final_metrics", {})
+                    evm = fm.get("evm_average_percent", float("nan"))
+                    msg = (
+                        f"alpha/beta point frozen: alpha={float(a):.3f}, beta={float(b):.3f}, "
+                        f"samples={int(cell.get('sample_count', 0))}/{int(target)}"
+                    )
+                    if np.isfinite(float(evm)):
+                        msg += f", EVMavg={float(evm):.3f}%"
+                    self._debug("INFO", msg)
+                except Exception:
+                    pass
+
+    def get_alpha_beta_performance_surface(self, metric: str = "evm_average_percent") -> Dict[str, Any]:
+        """Return frozen measured alpha/beta surface points for one metric.
+
+        Only finalized cells are returned as visible bars.  Partially measured
+        cells are reported separately as progress metadata but are not drawn as
+        columns, which eliminates fast-changing bars during the averaging window.
+        """
+        metric = str(metric or "evm_average_percent")
+        with self._lock:
+            self._ensure_alpha_beta_surface_context_locked()
+            points: List[Dict[str, Any]] = []
+            partial_count = 0
+            active_key = None
+            try:
+                q_digits = int(getattr(self, "_ab_surface_quant_digits", 3))
+                active_key = (round(float(getattr(self, "alpha", 0.0)), q_digits),
+                              round(float(getattr(self, "beta", 0.0)), q_digits))
+            except Exception:
+                active_key = None
+            active_progress = {"sample_count": 0, "target_sample_count": self._alpha_beta_surface_target_samples_locked(), "finalized": False}
+
+            for key, cell in self._ab_metric_history.items():
+                finalized = bool(cell.get("finalized", False))
+                if key == active_key:
+                    active_progress = {
+                        "sample_count": int(cell.get("sample_count", 0)),
+                        "target_sample_count": int(cell.get("target_sample_count", self._alpha_beta_surface_target_samples_locked())),
+                        "finalized": finalized,
+                    }
+                if not finalized:
+                    partial_count += 1
+                    continue
+                metrics_out = dict(cell.get("final_metrics", {}))
+                counts_out = dict(cell.get("final_metric_counts", {}))
+                if not metrics_out:
+                    continue
+                z = self._finite_float_or_nan(metrics_out.get(metric, float("nan")))
+                points.append({
+                    "alpha": float(cell.get("alpha", 0.0)),
+                    "beta": float(cell.get("beta", 0.0)),
+                    "z": z,
+                    "metric": metric,
+                    "metrics": metrics_out,
+                    "metric_counts": counts_out,
+                    "sample_count": int(cell.get("sample_count", 0)),
+                    "decode_ok_count": int(cell.get("decode_ok_count", 0)),
+                    "target_sample_count": int(cell.get("target_sample_count", self._alpha_beta_surface_target_samples_locked())),
+                    "last_frame_counter": int(cell.get("final_frame_counter", cell.get("last_frame_counter", 0))),
+                    "last_wall": float(cell.get("final_wall", cell.get("last_wall", 0.0))),
+                    "finalized": True,
+                })
+            return {
+                "metric": metric,
+                "points": points,
+                "point_count": int(len(points)),
+                "partial_count": int(partial_count),
+                "active_progress": active_progress,
+                "current_alpha": float(getattr(self, "alpha", 0.0)),
+                "current_beta": float(getattr(self, "beta", 0.0)),
+                "context_key": repr(getattr(self, "_ab_surface_context_key", ())),
+                "quant_digits": int(getattr(self, "_ab_surface_quant_digits", 3)),
+                "samples_per_cell": int(self._alpha_beta_surface_target_samples_locked()),
+            }
+
     def get_debug_snapshot(self) -> Dict[str, Any]:
+        adaptive_ab = self.get_alpha_beta_adaptation_status()
         with self._lock:
             return {
                 "frame_ok": bool(self.last_frame_ok),
@@ -4439,6 +5474,26 @@ class FDIDMHardwareTest:
                 "tx_buf_size": len(self._tx_buffer),
                 "rx_buf_size": len(self._rx_buffer),
                 "debug_seq": int(self._debug_seq),
+                "alpha_beta_surface_points": int(sum(1 for _cell in getattr(self, "_ab_metric_history", {}).values() if bool(_cell.get("finalized", False)))),
+                "alpha_beta_surface_partial_points": int(sum(1 for _cell in getattr(self, "_ab_metric_history", {}).values() if not bool(_cell.get("finalized", False)))),
+                "alpha_beta_surface_context_key": repr(getattr(self, "_ab_surface_context_key", ())),
+                "adaptive_alpha_beta": adaptive_ab,
+                "adaptive_alpha_beta_enabled": bool(adaptive_ab.get("enabled", False)),
+                "adaptive_alpha_beta_state": str(adaptive_ab.get("state", "disabled")),
+                "adaptive_alpha_beta_ready": bool(adaptive_ab.get("ready", False)),
+                "adaptive_alpha_beta_pending": bool(adaptive_ab.get("pending", False)),
+                "adaptive_recommendation_seq": int(adaptive_ab.get("recommendation_seq", 0)),
+                "adaptive_recommended_alpha": float(adaptive_ab.get("recommended_alpha", float("nan"))),
+                "adaptive_recommended_beta": float(adaptive_ab.get("recommended_beta", float("nan"))),
+                "adaptive_predicted_ser_current": float(adaptive_ab.get("predicted_ser_current", float("nan"))),
+                "adaptive_predicted_ser_best": float(adaptive_ab.get("predicted_ser_best", float("nan"))),
+                "adaptive_predicted_improvement_db": float(adaptive_ab.get("predicted_improvement_db", float("nan"))),
+                "adaptive_predicted_snr_db": float(adaptive_ab.get("predicted_snr_db", float("nan"))),
+                "adaptive_stable_count": int(adaptive_ab.get("stable_count", 0)),
+                "adaptive_stable_required": int(adaptive_ab.get("stable_required", 0)),
+                "adaptive_htf_source": str(adaptive_ab.get("htf_source", "")),
+                "adaptive_search_seconds": float(adaptive_ab.get("search_seconds", float("nan"))),
+                "adaptive_last_error": str(adaptive_ab.get("last_error", "")),
                 "rx_probe_mode": str(self._rx_probe_mode),
                 "rx_probe_len": int(self._rx_probe_len),
                 "process_interval_ms": float(self.process_interval_sec * 1000.0),
@@ -4502,6 +5557,23 @@ class FDIDMHardwareTest:
             "beta": float(self.beta),
             "fdidm_alpha": float(self.alpha),
             "fdidm_beta": float(self.beta),
+            "adaptive_alpha_beta": snap.get("adaptive_alpha_beta", {}),
+            "adaptive_alpha_beta_enabled": bool(snap.get("adaptive_alpha_beta_enabled", False)),
+            "adaptive_alpha_beta_state": str(snap.get("adaptive_alpha_beta_state", "disabled")),
+            "adaptive_alpha_beta_ready": bool(snap.get("adaptive_alpha_beta_ready", False)),
+            "adaptive_alpha_beta_pending": bool(snap.get("adaptive_alpha_beta_pending", False)),
+            "adaptive_recommendation_seq": int(snap.get("adaptive_recommendation_seq", 0)),
+            "adaptive_recommended_alpha": float(snap.get("adaptive_recommended_alpha", float("nan"))),
+            "adaptive_recommended_beta": float(snap.get("adaptive_recommended_beta", float("nan"))),
+            "adaptive_predicted_ser_current": float(snap.get("adaptive_predicted_ser_current", float("nan"))),
+            "adaptive_predicted_ser_best": float(snap.get("adaptive_predicted_ser_best", float("nan"))),
+            "adaptive_predicted_improvement_db": float(snap.get("adaptive_predicted_improvement_db", float("nan"))),
+            "adaptive_predicted_snr_db": float(snap.get("adaptive_predicted_snr_db", float("nan"))),
+            "adaptive_stable_count": int(snap.get("adaptive_stable_count", 0)),
+            "adaptive_stable_required": int(snap.get("adaptive_stable_required", 0)),
+            "adaptive_htf_source": str(snap.get("adaptive_htf_source", "")),
+            "adaptive_search_seconds": float(snap.get("adaptive_search_seconds", float("nan"))),
+            "adaptive_last_error": str(snap.get("adaptive_last_error", "")),
             "fdidm_m": int(self.M),
             "fdidm_n": int(self.N),
             "cp_len": int(self.cp_len),
@@ -4628,6 +5700,9 @@ class FDIDMHardwareTest:
             "tx_buf_size": snap["tx_buf_size"],
             "rx_buf_size": snap["rx_buf_size"],
             "debug_seq": snap["debug_seq"],
+            "alpha_beta_surface_points": int(snap.get("alpha_beta_surface_points", 0)),
+            "alpha_beta_surface_partial_points": int(snap.get("alpha_beta_surface_partial_points", 0)),
+            "alpha_beta_surface_context_key": str(snap.get("alpha_beta_surface_context_key", "")),
             "needs_top_block_rebuild": bool(self._needs_top_block_rebuild),
             "rx_probe_mode": snap.get("rx_probe_mode", str(self._rx_probe_mode)),
             "rx_probe_len": snap.get("rx_probe_len", int(self._rx_probe_len)),
@@ -4645,7 +5720,7 @@ class FDIDMHardwareTest:
 if __name__ == "__main__":
     tb = FDIDMHardwareTest(fdidm_m=16, fdidm_n=16, channel_mode="tdl_a_rf")
     st = tb.get_status()
-    print(f"v33 hardware-only FDIDM ready: chain={st['chain']}, channel={st['channel_mode']}, "
+    print(f"v35 channel-adaptive FDIDM ready: chain={st['chain']}, channel={st['channel_mode']}, "
           f"coding={st['coding_summary']}, tx_vector={st['tx_waveform_samples']} samples, "
           f"frame_len={st['frame_len']} samples "
           f"({st['frame_len'] / st['sample_rate'] * 1000:.2f} ms at {st['sample_rate'] / 1e6:.2f} MHz)")
