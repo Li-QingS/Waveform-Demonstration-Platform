@@ -29,6 +29,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from waveform_sim.core.engine import LinkSimulator
+from waveform_sim.simulation.fdidm_adaptive import FDIDMSimAdaptiveMixin
 
 C_LIGHT = 299_792_458.0
 DEFAULT_FC_HZ = 20e9
@@ -174,7 +175,7 @@ class _MetricTracker:
         return float(3.0 / total)
 
 
-class _LegacyFDIDMTransceiver(threading.Thread):
+class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     _MOD_ORDERS = {"QPSK": 4, "16QAM": 16, "64QAM": 64}
 
     def __init__(
@@ -242,6 +243,7 @@ class _LegacyFDIDMTransceiver(threading.Thread):
             tf_notch_count=int(tf_notch_count),
         )
         self._lock = threading.RLock()
+        self._init_adaptive_state_locked()
         self._stop_event = threading.Event()
         self._rng = np.random.default_rng()
         self._metrics = _MetricTracker(history_len=300, window_len=80)
@@ -1101,6 +1103,7 @@ class _LegacyFDIDMTransceiver(threading.Thread):
             self._constellation_points = self._downsample_points(x_soft, 500)
             self._pre_eq_points = self._downsample_points(y, 500)
             self._last_metrics = self._make_metrics(bit_errors, bits.size, symbol_errors, self.K, evm, measured_noise_var, measured_eq_noise_var, expected_eq_noise_var, mse_clean)
+        self._adaptive_note_frame_processed()
 
     def _complex_awgn(self, n: int, var: float) -> np.ndarray:
         return np.sqrt(max(var, 1e-15) / 2.0) * (self._rng.standard_normal(n) + 1j * self._rng.standard_normal(n))

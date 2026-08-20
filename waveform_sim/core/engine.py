@@ -246,12 +246,20 @@ class LinkSimulator:
         self,
         config: Optional[AdaptiveConfig] = None,
         callback: Optional[Callable] = None,
+        **cfg,
     ) -> None:
         if config is not None:
             self.adaptive_config = config.normalized()
         backend = self._backend
-        if hasattr(backend, "start_adaptive_tuning"):
-            backend.start_adaptive_tuning(callback=callback)
+        fn = getattr(backend, "start_adaptive_tuning", None)
+        if fn is not None:
+            kwargs = dict(cfg)
+            if callback is not None:
+                kwargs["callback"] = callback
+            if kwargs:
+                fn(**kwargs)
+            else:
+                fn()
             return
         if hasattr(backend, "search_best_indices"):
             def worker():
@@ -271,10 +279,24 @@ class LinkSimulator:
             stop()
 
     def get_adaptive_status(self) -> Dict:
-        status = getattr(self._backend, "get_alpha_beta_adaptation_status", None)
-        if status is not None:
-            return status()
+        backend = self._backend
+        for name in ("get_adaptive_status", "get_alpha_beta_adaptation_status"):
+            fn = getattr(backend, name, None)
+            if fn is not None:
+                try:
+                    return fn()
+                except Exception:
+                    continue
         return {"active": False}
+
+    def get_adaptive_history(self, limit=None) -> list:
+        fn = getattr(self._backend, "get_adaptive_history", None)
+        if fn is not None:
+            try:
+                return fn(limit=limit)
+            except Exception:
+                return []
+        return []
 
     # ------------------------------------------------------------ experiment hooks
     def _log_event(self, event: str, payload: Dict) -> None:

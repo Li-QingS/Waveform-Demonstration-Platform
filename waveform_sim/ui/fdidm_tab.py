@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .base_waveform_tab import BaseWaveformTab
+from .fdidm_adaptive_widgets import AdaptiveProcessWidget
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -114,6 +115,17 @@ class FDIDMTab(BaseWaveformTab):
         self._add_fdidm_controls()
         self._connect_fdidm_signals()
         self._setup_plots()
+
+        self.adaptive_widget = AdaptiveProcessWidget()
+        self.adaptive_widget.config_changed.connect(self._on_adaptive_config_changed)
+        self.adaptive_widget.evaluate_requested.connect(self._on_adaptive_evaluate_clicked)
+        plot_layout = self.plot_panel.layout()
+        if plot_layout is not None:
+            plot_layout.insertWidget(1, self.adaptive_widget, stretch=2)
+        self.adaptive_timer = QTimer()
+        self.adaptive_timer.setInterval(250)
+        self.adaptive_timer.timeout.connect(self._refresh_adaptive_panel)
+        self.adaptive_timer.start()
 
         self.cfo_label.setVisible(False)
         self.cfo_spin.setVisible(False)
@@ -492,6 +504,11 @@ class FDIDMTab(BaseWaveformTab):
         try:
             self.tb = self._new_backend()
             self.tb.start()
+            if self.adaptive_widget.enable_check.isChecked():
+                try:
+                    self.tb.start_adaptive_tuning(**self.adaptive_widget.collect_config())
+                except Exception:
+                    pass
             self.update_timer.start(250)
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(True)
@@ -506,6 +523,10 @@ class FDIDMTab(BaseWaveformTab):
         self.update_timer.stop()
         if self.tb is not None:
             try:
+                self.tb.stop_adaptive_tuning()
+            except Exception:
+                pass
+            try:
                 self.tb.stop()
                 self.tb.wait(timeout=1.5)
             except Exception:
@@ -514,6 +535,49 @@ class FDIDMTab(BaseWaveformTab):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._update_info_panel(running=False)
+
+    # ------------------------------------------------------------------
+    # Adaptive process panel
+    # ------------------------------------------------------------------
+    def _on_adaptive_config_changed(self, *_args):
+        """Forward panel configuration to the running backend."""
+        tb = self.tb
+        if tb is None:
+            return
+        try:
+            cfg = self.adaptive_widget.collect_config()
+            if cfg.get("adaptive_enabled"):
+                tb.start_adaptive_tuning(**cfg)
+            else:
+                tb.stop_adaptive_tuning()
+        except Exception:
+            pass
+
+    def _on_adaptive_evaluate_clicked(self):
+        tb = self.tb
+        if tb is not None:
+            try:
+                tb.request_adaptive_evaluation()
+            except Exception:
+                pass
+
+    def _refresh_adaptive_panel(self):
+        """Poll backend adaptive status/history and repaint the panel."""
+        tb = self.tb
+        if tb is None:
+            return
+        try:
+            status = tb.get_adaptive_status()
+        except Exception:
+            return
+        if not bool(status.get("enabled", False)):
+            self.adaptive_widget.refresh(status, [])
+            return
+        try:
+            history = tb.get_adaptive_history(limit=2000)
+        except Exception:
+            history = []
+        self.adaptive_widget.refresh(status, history)
 
     def _hot_update_from_ui(self, *args):
         self._best_alpha = None
@@ -889,6 +953,15 @@ class FDIDMTab(BaseWaveformTab):
     def _on_qt_destroyed(self, *_args):
         """Stop background work when the Qt object is being destroyed."""
         self._qt_alive = False
+        try:
+            self.adaptive_timer.stop()
+        except Exception:
+            pass
+        if getattr(self, "tb", None) is not None:
+            try:
+                self.tb.stop_adaptive_tuning()
+            except Exception:
+                pass
         try:
             self._set_all_refresh_stops()
         except Exception:
