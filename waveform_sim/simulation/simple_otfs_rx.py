@@ -20,6 +20,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from waveform_sim.core.engine import LinkSimulator
+
 
 def _as_1d_float_array(x, fallback):
     if x is None:
@@ -311,7 +313,7 @@ class _EvmTracker:
         return float(self.last_evm_percent)
 
 
-class OTFSTransceiver:
+class _LegacyOTFSTransceiver:
     def __init__(
         self,
         delay_spread: int = 5,
@@ -601,6 +603,10 @@ class OTFSTransceiver:
             except Exception as e:
                 print(f"[OTFS Worker Error] {e}")
             time.sleep(self.update_period)
+
+    def step(self):
+        """单帧仿真（供统一引擎调用）。"""
+        self._simulate_one_frame()
 
     def _simulate_one_frame(self):
         with self._lock:
@@ -1400,6 +1406,27 @@ def dump_status(tb, idx=None):
         + f"pilot_nmse={snap['pilot_nmse']:.3f}",
         flush=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# 阶段4：统一引擎兼容壳
+# ---------------------------------------------------------------------------
+def _create_otfs_backend(**kwargs):
+    """供 waveform_sim.core.engine 构造 OTFS 后端。"""
+    return _LegacyOTFSTransceiver(**kwargs)
+
+
+class OTFSTransceiver(LinkSimulator):
+    """OTFS 兼容壳：继承统一引擎，委托 _LegacyOTFSTransceiver，公开接口不变。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(waveform="OTFS", **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
 
 
 if __name__ == "__main__":
