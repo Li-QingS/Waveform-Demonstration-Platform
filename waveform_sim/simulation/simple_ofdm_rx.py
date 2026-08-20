@@ -5,6 +5,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from waveform_sim.core.engine import LinkSimulator
+
 
 def _as_1d_float_array(x, fallback):
     if x is None:
@@ -339,7 +341,7 @@ class _EvmTracker:
         return float(self.last_evm_percent)
 
 
-class OfdmTransceiver(threading.Thread):
+class _LegacyOfdmTransceiver(threading.Thread):
     """
     公平性修正版 OFDM 收发链路仿真器。
 
@@ -467,6 +469,10 @@ class OfdmTransceiver(threading.Thread):
         while not self._stop_event.is_set():
             self._simulate_one_frame()
             time.sleep(0.1)
+
+    def step(self):
+        """单帧仿真（供统一引擎调用）。"""
+        self._simulate_one_frame()
 
     def set_snr_db(self, value: float):
         with self._lock:
@@ -981,6 +987,27 @@ class OfdmTransceiver(threading.Thread):
         keep = 131072
         merged = np.concatenate([self._spectrum_buffer, samples])
         self._spectrum_buffer = merged[-keep:]
+
+
+# ---------------------------------------------------------------------------
+# 阶段4：统一引擎兼容壳
+# ---------------------------------------------------------------------------
+def _create_ofdm_backend(**kwargs):
+    """供 waveform_sim.core.engine 构造 OFDM 后端。"""
+    return _LegacyOfdmTransceiver(**kwargs)
+
+
+class OfdmTransceiver(LinkSimulator):
+    """OFDM 兼容壳：继承统一引擎，委托 _LegacyOfdmTransceiver，公开接口不变。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(waveform="OFDM", **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@ _ALIASES = {
     "decoder": "detector",
     "fc_hz": "center_freq_hz",
     "channel_seed": "seed",
+    "fft_len": "fft_size",
+    "doppler_spread": "doppler_spread_hz",
+    "doppler_freq": "doppler_spread_hz",
+    "doppler_hz": "doppler_spread_hz",
+    "sample_rate": "sample_rate_hz",
 }
 
 
@@ -57,6 +62,18 @@ class LinkSimulator:
             from waveform_sim.simulation.simple_fdidm_rx import _create_fdidm_backend
 
             return _create_fdidm_backend(**self._fdidm_legacy_kwargs())
+        if self.config.waveform == "OFDM":
+            from waveform_sim.simulation.simple_ofdm_rx import _create_ofdm_backend
+
+            return _create_ofdm_backend(**self._ofdm_legacy_kwargs())
+        if self.config.waveform == "OTFS":
+            from waveform_sim.simulation.simple_otfs_rx import _create_otfs_backend
+
+            return _create_otfs_backend(**self._otfs_legacy_kwargs())
+        if self.config.waveform == "AFDM":
+            from waveform_sim.simulation.simple_afdm_rx import _create_afdm_backend
+
+            return _create_afdm_backend(**self._afdm_legacy_kwargs())
         raise NotImplementedError(
             f"LinkSimulator backend for {self.config.waveform} is not ready"
         )
@@ -90,6 +107,48 @@ class LinkSimulator:
             circular_channel=bool(c.circular_channel),
             tf_notch_depth_db=float(c.tf_notch_depth_db),
             tf_notch_count=int(c.tf_notch_count),
+        )
+
+    def _ofdm_legacy_kwargs(self) -> Dict:
+        c = self.config
+        return dict(
+            fft_len=int(c.fft_size),
+            cp_len=int(c.cp_len),
+            snr_db=float(c.snr_db),
+            cfo_hz=float(c.cfo_hz),
+            doppler_spread_hz=float(c.doppler_spread_hz),
+            delay_spread=int(c.delay_spread),
+            mod_order=str(c.mod_order),
+            payload_symbols=int(c.payload_symbols),
+        )
+
+    def _otfs_legacy_kwargs(self) -> Dict:
+        c = self.config
+        return dict(
+            delay_spread=int(c.delay_spread),
+            doppler_spread=float(c.doppler_spread_hz),
+            snr_db=float(c.snr_db),
+            mod_order=str(c.mod_order),
+            cfo_hz=float(c.cfo_hz),
+            n_subcarriers=int(c.n_subcarriers),
+            n_symbols=int(c.n_symbols),
+            sample_rate=float(c.sample_rate_hz),
+            update_period=float(c.update_period),
+            equalizer=str(c.equalizer),
+        )
+
+    def _afdm_legacy_kwargs(self) -> Dict:
+        c = self.config
+        return dict(
+            c1=float(c.c1),
+            c2=float(c.c2),
+            snr_db=float(c.snr_db),
+            mod_order=str(c.mod_order),
+            doppler_freq=float(c.doppler_spread_hz),
+            delay_spread=int(c.delay_spread),
+            cfo_hz=float(c.cfo_hz),
+            sample_rate=float(c.sample_rate_hz),
+            frame_size=int(c.frame_size),
         )
 
     # ------------------------------------------------------------ lifecycle
@@ -203,4 +262,3 @@ class LinkSimulator:
         if status is not None:
             return status()
         return {"active": False}
-

@@ -1,6 +1,8 @@
 """统一引擎与 FDIDM 兼容壳测试。"""
 import time
 
+import pytest
+
 from waveform_sim.core.config import WaveformConfig
 from waveform_sim.core.engine import LinkSimulator
 from waveform_sim.simulation.simple_fdidm_rx import (
@@ -71,3 +73,24 @@ def test_fdidm_shell_matches_legacy_metrics_keys():
         legacy.stop()
         shell.wait(timeout=3.0)
         legacy.wait(timeout=3.0)
+
+
+@pytest.mark.parametrize(
+    "waveform,kwargs,legacy_cls",
+    [
+        ("OFDM", dict(snr_db=15.0), "_LegacyOfdmTransceiver"),
+    ],
+)
+def test_engine_backend_smoke(waveform, kwargs, legacy_cls):
+    sim = LinkSimulator(WaveformConfig(waveform=waveform, **kwargs))
+    assert sim._backend.__class__.__name__ == legacy_cls
+    sim.start()
+    try:
+        ok = _wait_until(lambda: sim.get_last_metrics().get("total_bits", 0) > 0)
+        assert ok, f"{waveform} 超时未出帧"
+        m = sim.get_last_metrics()
+        assert "ber" in m and ("evm_db" in m or "evm_percent" in m)
+        assert 0.0 <= m["ber"] <= 1.0
+    finally:
+        sim.stop()
+        sim.wait(timeout=3.0)
