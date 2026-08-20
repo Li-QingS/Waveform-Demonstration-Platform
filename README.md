@@ -7,6 +7,7 @@
 ```text
 waveform_sim/
   main.py                       # 程序入口（PyQt5 主窗口）
+  core/                         # 工程化内核（统一配置，后续加入引擎/自适应/指标）
   ui/                           # GUI：FDIDM 仿真页、OFDM/OTFS/AFDM 仿真页、
                                 # FDIDM 硬件验证页、通用硬件测评页、波形对比页
   simulation/                   # 纯软件仿真后端
@@ -20,7 +21,9 @@ waveform_sim/
     ofdm_hardtest.py            #   OFDM 硬件测试
     otfs_hardtest.py            #   OTFS 硬件测试
     afdm_hardtest.py            #   AFDM 硬件测试
-markdown/                       # 设计、审查与调优文档
+markdown/                       # 工程化重构与设计文档
+scripts/                        # 环境检查等运维脚本
+tests/                          # 行为基线 / 回归测试
 ```
 
 ## 运行
@@ -34,10 +37,9 @@ python main.py
 
 ## 文档
 
-`markdown/` 下包含面向真实硬件链路的专业文档：
+`markdown/` 下包含工程化重构流程文档：
 
-- `01_code_review_fdidm_platform_professional.md`：代码审查与改进建议
-- `02_feature_hardware_logging_observability.md`：硬件链路观测与统一日志设计
-- `03_tuning_hardware_rf_link.md`：硬件链路稳定性与可调试性优化
-- `04_system_design_fdidm_hardware_platform.md`：平台模块化重构设计
-- `fdidm_v32_system_analysis.md`：多普勒/时延极限与 v32 收发流程分析
+- `06_platform_refactor_spec.md`：重构需求与验收标准
+- `07_platform_refactor_plan.md`：重构架构与分阶段实施计划
+- `08_platform_refactor_task_phase0_1.md` / `09_platform_refactor_checklist_phase0_1.md`：阶段 0~1 任务清单与验收清单
+- `TODO.md`：平台待办清单（自适应、对比展示、架构优化）
