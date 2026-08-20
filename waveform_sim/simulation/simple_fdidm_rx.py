@@ -28,6 +28,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from waveform_sim.core.engine import LinkSimulator
+
 C_LIGHT = 299_792_458.0
 DEFAULT_FC_HZ = 20e9
 
@@ -172,7 +174,7 @@ class _MetricTracker:
         return float(3.0 / total)
 
 
-class FDIDMTransceiver(threading.Thread):
+class _LegacyFDIDMTransceiver(threading.Thread):
     _MOD_ORDERS = {"QPSK": 4, "16QAM": 16, "64QAM": 64}
 
     def __init__(
@@ -311,6 +313,10 @@ class FDIDMTransceiver(threading.Thread):
         while not self._stop_event.is_set():
             self._simulate_one_frame()
             time.sleep(0.08)
+
+    def step(self):
+        """单帧仿真（供统一引擎调用）。"""
+        self._simulate_one_frame()
 
     # ----------------------------- config API -----------------------------
     def _apply_config_update(self, **kwargs):
@@ -1728,3 +1734,28 @@ class FDIDMTransceiver(threading.Thread):
             return x.astype(np.complex64)
         idx = np.linspace(0, x.size - 1, max_points, dtype=np.int64)
         return x[idx].astype(np.complex64)
+
+
+# ---------------------------------------------------------------------------
+# 阶段3：统一引擎兼容壳
+# ---------------------------------------------------------------------------
+def _create_fdidm_backend(**kwargs):
+    """供 waveform_sim.core.engine 构造 FDIDM 后端（过渡依赖）。"""
+    return _LegacyFDIDMTransceiver(**kwargs)
+
+
+class FDIDMTransceiver(LinkSimulator):
+    """FDIDM 兼容壳：继承统一引擎，委托 _LegacyFDIDMTransceiver，公开接口不变。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(waveform="FDIDM", **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
+
+    @staticmethod
+    def _build_gray_qam(order):
+        return _LegacyFDIDMTransceiver._build_gray_qam(order)
