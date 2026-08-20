@@ -11,6 +11,7 @@ class _StubBackend:
 
 CASES = [
     ("waveform_sim.hardware.afdm_hardtest", "AFDMHardwareTest", "_LegacyAFDMHardwareTest"),
+    ("waveform_sim.hardware.ofdm_hardtest", "OfdmHardwareTx", "_LegacyOfdmHardwareTx"),
 ]
 
 
@@ -22,4 +23,3 @@ def test_shell_delegates_to_backend(mod_name, shell_cls, legacy_cls):
     assert shell_cls.__name__ != legacy_cls.__name__
     shell = shell_cls(backend=_StubBackend())
     assert shell.get_status() == {"stub": True}
-
