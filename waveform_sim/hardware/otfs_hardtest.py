@@ -42,7 +42,7 @@ from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 
 
-class OTFSHardwareTest:
+class _LegacyOTFSHardwareTest:
     APP_MAGIC = b"MTPK"
 
     # =========================================================
@@ -1688,6 +1688,22 @@ class OTFSHardwareTest:
         self.configure(mod_order=mod_order)
         if was_running:
             self.start()
+
+
+# ---------------------------------------------------------------------------
+# 阶段6：统一硬件后端兼容壳
+# ---------------------------------------------------------------------------
+class OTFSHardwareTest:
+    """兼容壳：委托 _LegacyOTFSHardwareTest，公开接口不变。"""
+
+    def __init__(self, *args, backend=None, **kwargs):
+        self._backend = backend if backend is not None else _LegacyOTFSHardwareTest(*args, **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
 
 
 if __name__ == "__main__":
