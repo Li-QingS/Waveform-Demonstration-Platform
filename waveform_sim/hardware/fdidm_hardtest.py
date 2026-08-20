@@ -2182,7 +2182,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
     def _make_tdl_channel_block(self):
         """Create a GNU Radio Python sync_block wrapping _NTNTDLChannel."""
-        gr = self._gr
+        from .gr_flow import make_tdl_channel_block
+
         channel = _NTNTDLChannel(
             sample_rate=self.sample_rate,
             model=self._tdl_model_for_current_mode(),
@@ -2194,36 +2195,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             normalize_power=self.tdl_normalize_power,
             num_sinusoids=self.tdl_param_num_sinusoids,
         )
-
-        class _TDLChannelBlock(gr.sync_block):
-            def __init__(self):
-                gr.sync_block.__init__(self, name="ntn_tdl_channel_v34", in_sig=[np.complex64], out_sig=[np.complex64])
-                self.channel = channel
-                self._channel_lock = threading.RLock()
-
-            def work(self, input_items, output_items):
-                # Runtime parameter updates can arrive from the UI thread.  Keep
-                # channel.configure()/reset() mutually exclusive with process()
-                # so a partial tap-table update cannot leak into one scheduler call.
-                with self._channel_lock:
-                    y = self.channel.process(input_items[0])
-                output_items[0][:len(y)] = y
-                return len(y)
-
-            def reset_channel(self):
-                with self._channel_lock:
-                    self.channel.reset()
-
-            def configure_channel(self, **kwargs: Any):
-                with self._channel_lock:
-                    self.channel.configure(**kwargs)
-                    self.channel.reset()
-
-            def channel_summary(self) -> str:
-                with self._channel_lock:
-                    return self.channel.summary()
-
-        return _TDLChannelBlock()
+        return make_tdl_channel_block(channel)
 
     def reset_full_htf_cache(self):
         """Public API used by the UI: clear CSI and cached parametric TDL bases."""
@@ -2277,18 +2249,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         available.  The preferred v20 path below is entirely C++ in the live
         scheduler and therefore much less likely to overflow the B210 RX.
         """
-        gr = self._gr
-        outer = self
+        from .gr_flow import make_rx_ring_sink
 
-        class _RXRingSink(gr.sync_block):
-            def __init__(self):
-                gr.sync_block.__init__(self, name="rx_numpy_ring_sink_fallback", in_sig=[np.complex64], out_sig=[])
-
-            def work(self, input_items, output_items):
-                outer._rx_buffer.write(input_items[0])
-                return len(input_items[0])
-
-        return _RXRingSink()
+        return make_rx_ring_sink(self._rx_buffer)
 
     def _select_rx_probe_len(self) -> int:
         """Choose a contiguous RX window large enough for frame processing.
