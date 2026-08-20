@@ -666,21 +666,21 @@ class FDIDMTab(BaseWaveformTab):
         self._snr_active_token = None
         self._last_completion_token = None
 
-        alpha_ser_floor = alpha_ser_floor(
+        ser_floor = alpha_ser_floor(
             alpha_sweep_frames,
             int(base_kwargs.get("m_subcarriers", 8)),
             int(base_kwargs.get("n_symbols", 8)),
         )
-        self._alpha_ser_floor_by_token[token] = float(alpha_ser_floor)
+        self._alpha_ser_floor_by_token[token] = float(ser_floor)
         self._refresh_context_by_token[token] = {
             "base_kwargs": dict(base_kwargs),
             "alpha_sweep_frames": int(alpha_sweep_frames),
             "alpha_curve_mode": str(alpha_curve_mode),
-            "alpha_ser_floor": float(alpha_ser_floor),
+            "alpha_ser_floor": float(ser_floor),
             "reason": str(self._auto_scan_reason),
         }
 
-        self._clear_alpha_sweep_plot(alpha_curve_mode, floor=alpha_ser_floor)
+        self._clear_alpha_sweep_plot(alpha_curve_mode, floor=ser_floor)
         self._clear_ser_snr_plot()
         self._alpha_beta_curves.clear()
         self._alpha_beta_data.clear()
@@ -701,7 +701,7 @@ class FDIDMTab(BaseWaveformTab):
                 f"自动刷新启动：{self._auto_scan_reason}。\n"
                 f"信道统计模式：{dyn_note}；正在理论搜索 α*/β*。\n"
                 f"搜索结束后将启动双线程：{alpha_curve_text}；右下角：理论 SER-SNR 绘制。\n"
-                f"左下角显示下界=3/({alpha_sweep_frames}×{int(base_kwargs.get('m_subcarriers', 8))}×{int(base_kwargs.get('n_symbols', 8))})={alpha_ser_floor:.3e}；低于该值按下界连线显示。"
+                f"左下角显示下界=3/({alpha_sweep_frames}×{int(base_kwargs.get('m_subcarriers', 8))}×{int(base_kwargs.get('n_symbols', 8))})={ser_floor:.3e}；低于该值按下界连线显示。"
             )
         )
 
@@ -785,7 +785,7 @@ class FDIDMTab(BaseWaveformTab):
             beta_values = [round(float(b), 10) for b in self.ALPHA_SWEEP_BETAS]
             work_snr = float(base_kwargs.get("snr_db", 10.0))
             alpha_seed_base = int(base_kwargs.get("channel_seed", 42)) + 303_2026
-            alpha_ser_floor = float(self._alpha_ser_floor_by_token.get(
+            ser_floor = float(self._alpha_ser_floor_by_token.get(
                 int(token),
                 alpha_ser_floor(alpha_sweep_frames, int(base_kwargs.get("m_subcarriers", 8)), int(base_kwargs.get("n_symbols", 8))),
             ))
@@ -808,10 +808,10 @@ class FDIDMTab(BaseWaveformTab):
                             num_frames=int(alpha_sweep_frames),
                             seed=alpha_seed_base,  # common random numbers across all α/β points
                             stop_event=stop_event,
-                            ser_display_floor=alpha_ser_floor,
+                            ser_display_floor=ser_floor,
                         )
                         ser_raw = float(item.get("ser", np.nan))
-                    if not self._emit_signal_safe("alpha_beta_point", token, curve_name, float(a), float(ser_raw), float(alpha_ser_floor)):
+                    if not self._emit_signal_safe("alpha_beta_point", token, curve_name, float(a), float(ser_raw), float(ser_floor)):
                         return
         except Exception as exc:
             finish_reason = f"失败：{exc}"
