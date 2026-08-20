@@ -30,11 +30,11 @@
 
 **背景**：核心文件过大（如 `fdidm_hardtest.py` 约 5700 行），各波形实现重复度高，需要模块化与统一接口。
 
-- [ ] TODO: 拆分 `fdidm_hardtest.py` 为可维护模块（信道估计、FEC、自适应、日志等）
-- [ ] TODO: 抽取 OFDM / OTFS / AFDM / FDIDM 硬件后端的公共基类与统一接口，消除重复代码
-- [ ] TODO: 统一配置定义与参数校验层
-- [ ] TODO: 统一日志、状态快照与可观测性机制
-- [ ] TODO: 补充单元测试与链路级回归测试
+- [x] TODO: 拆分 `fdidm_hardtest.py` 为可维护模块（信道估计、FEC、自适应、日志等）——已拆为 stream/channel/fec/gr_flow/fdidm_adaptive
+- [x] TODO: 抽取 OFDM / OTFS / AFDM / FDIDM 硬件后端的公共基类与统一接口，消除重复代码——统一引擎 LinkSimulator + 四个 transceiver/hardtest 兼容壳
+- [x] TODO: 统一配置定义与参数校验层——`waveform_sim/core/config.py`
+- [x] TODO: 统一日志、状态快照与可观测性机制——`service/event_logger` + `diagnostics/*`
+- [x] TODO: 补充单元测试与链路级回归测试——pytest 66 用例
 - [ ] TODO: 优化运行时性能与稳定性（UHD overflow、实时调度、线程模型）
 - [ ] TODO: 架构评审与重构后全链路验证
 
