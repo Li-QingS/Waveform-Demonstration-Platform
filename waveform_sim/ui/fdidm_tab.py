@@ -39,13 +39,8 @@ from .base_waveform_tab import BaseWaveformTab
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
-@dataclass
-class _CurveSpec:
-    name: str
-    alpha: float
-    beta: float
-    pen: object
 
+from .fdidm_utils import _CurveSpec, alpha_ser_floor, copy_kwargs_with, merged_curve_specs
 
 class FDIDMTab(BaseWaveformTab):
     """Mode-A FDIDM soft modulation page."""
@@ -453,24 +448,8 @@ class FDIDMTab(BaseWaveformTab):
         mode = str(mode or self._selected_alpha_curve_mode())
         return "ZF理论值" if mode == "theory" else "Monte-Carlo实测"
 
-    @staticmethod
-    def _alpha_ser_floor(num_frames: int, m_subcarriers: int, n_symbols: int) -> float:
-        """Lower plotting bound for the left-bottom α-SER curves.
-
-        The left-bottom α-SER plot is a Monte-Carlo-oriented comparison.
-        Even when the selected value mode is theory, values below the
-        Monte-Carlo resolvability of the selected α-curve frame count are
-        clipped to the rule-of-three zero-error upper bound 3/(frames*M*N).
-        This prevents the plot from displaying artificial 1e-12 values that
-        cannot be supported by a 1000-frame run.
-        """
-        frames = int(max(1, num_frames))
-        m = int(max(1, m_subcarriers))
-        n = int(max(1, n_symbols))
-        return float(3.0 / (frames * m * n))
-
     def _current_alpha_ser_floor(self) -> float:
-        return self._alpha_ser_floor(
+        return alpha_ser_floor(
             int(self.alpha_mc_frames_spin.value()),
             int(self.m_spin.value()),
             int(self.n_spin.value()),
@@ -687,7 +666,7 @@ class FDIDMTab(BaseWaveformTab):
         self._snr_active_token = None
         self._last_completion_token = None
 
-        alpha_ser_floor = self._alpha_ser_floor(
+        alpha_ser_floor = alpha_ser_floor(
             alpha_sweep_frames,
             int(base_kwargs.get("m_subcarriers", 8)),
             int(base_kwargs.get("n_symbols", 8)),
@@ -808,7 +787,7 @@ class FDIDMTab(BaseWaveformTab):
             alpha_seed_base = int(base_kwargs.get("channel_seed", 42)) + 303_2026
             alpha_ser_floor = float(self._alpha_ser_floor_by_token.get(
                 int(token),
-                self._alpha_ser_floor(alpha_sweep_frames, int(base_kwargs.get("m_subcarriers", 8)), int(base_kwargs.get("n_symbols", 8))),
+                alpha_ser_floor(alpha_sweep_frames, int(base_kwargs.get("m_subcarriers", 8)), int(base_kwargs.get("n_symbols", 8))),
             ))
             mode = str(alpha_curve_mode or "mc").lower()
             for b in beta_values:
@@ -818,7 +797,7 @@ class FDIDMTab(BaseWaveformTab):
                         finish_reason = "已停止"
                         self._emit_signal_safe("alpha_beta_finished", token, finish_reason)
                         return
-                    tb_alpha = FDIDMTransceiver(**self._copy_kwargs_with(
+                    tb_alpha = FDIDMTransceiver(**copy_kwargs_with(
                         base_kwargs, alpha=float(a), beta=float(b), snr_db=work_snr
                     ))
                     if mode == "theory":
@@ -838,28 +817,6 @@ class FDIDMTab(BaseWaveformTab):
             finish_reason = f"失败：{exc}"
         self._emit_signal_safe("alpha_beta_finished", token, finish_reason)
 
-    @staticmethod
-    def _merged_curve_specs(raw_specs):
-        """Merge curves that are mathematically the same α/β point.
-
-        This prevents the right-bottom plot from drawing two permanently
-        overlapping curves, e.g. when the manual current point is exactly OFDM
-        (0,0), or when the searched optimum is exactly OTFS (1,1).
-        """
-        merged = OrderedDict()
-        for label, a, b in raw_specs:
-            key = (round(float(a), 10), round(float(b), 10))
-            if key not in merged:
-                merged[key] = {"labels": [str(label)], "alpha": float(a), "beta": float(b)}
-            else:
-                merged[key]["labels"].append(str(label))
-        out = []
-        for item in merged.values():
-            labels = item["labels"]
-            name = " / ".join(labels)
-            out.append((name, item["alpha"], item["beta"]))
-        return out
-
     def _theory_snr_worker(self, token: int, base_kwargs: dict, stop_event: threading.Event,
                            best_a: float, best_b: float):
         """Worker 2: draw right-bottom theory/proxy SER-SNR curves."""
@@ -874,9 +831,9 @@ class FDIDMTab(BaseWaveformTab):
                 (f"当前 α={current_a:.1f},β={current_b:.1f}", current_a, current_b),
                 (f"理论最优 α={float(best_a):.1f},β={float(best_b):.1f}", float(best_a), float(best_b)),
             ]
-            specs = self._merged_curve_specs(raw_specs)
+            specs = merged_curve_specs(raw_specs)
             for name, a, b in specs:
-                tb = FDIDMTransceiver(**self._copy_kwargs_with(base_kwargs, alpha=a, beta=b))
+                tb = FDIDMTransceiver(**copy_kwargs_with(base_kwargs, alpha=a, beta=b))
                 for snr in self.SER_SNR_POINTS:
                     if stop_event.is_set() or token != self._auto_scan_token:
                         finish_reason = "已停止"
@@ -928,12 +885,6 @@ class FDIDMTab(BaseWaveformTab):
         self.ber_snr_plot.setTitle("Theory SER vs Eb/N0")
         self.ber_snr_plot.enableAutoRange(axis='y', enable=True)
         self.ber_snr_plot.setXRange(min(self.SER_SNR_POINTS), max(self.SER_SNR_POINTS), padding=0)
-
-    @staticmethod
-    def _copy_kwargs_with(base_kwargs, **updates):
-        data = dict(base_kwargs)
-        data.update(updates)
-        return data
 
     def _on_qt_destroyed(self, *_args):
         """Stop background work when the Qt object is being destroyed."""
