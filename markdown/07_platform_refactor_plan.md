@@ -155,7 +155,7 @@ UI 页签 → Transceiver / HardwareTest（兼容壳）
 ### 阶段 10：文档与收尾
 
 **改动：**
-- 更新 README 与 `markdown/05_platform_introduction.md`；新增重构对照清单文档。
+- 更新 README 并重建平台介绍文档；新增重构对照清单文档。
 - 全量回归：pytest、compileall、自测、GUI 冒烟；确认可移除的临时文件。
 
 **验证：** AC1~AC6 全部通过。
