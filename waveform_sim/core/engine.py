@@ -11,6 +11,11 @@ from typing import Callable, Dict, Optional
 
 from .config import AdaptiveConfig, ExperimentConfig, WaveformConfig
 
+try:
+    from waveform_sim.service.experiment_service import ExperimentService
+except Exception:  # pragma: no cover - 部分安装时容错
+    ExperimentService = None
+
 
 _ALIASES = {
     "ebn0_db": "snr_db",
@@ -33,6 +38,7 @@ class LinkSimulator:
         *,
         adaptive: Optional[AdaptiveConfig] = None,
         experiment_service=None,
+        auto_start_run: bool = False,
         backend=None,
         **kwargs,
     ):
@@ -53,6 +59,9 @@ class LinkSimulator:
                 waveform=self.config, adaptive=self.adaptive_config
             ).normalized()
         self.experiment_service = experiment_service
+        if auto_start_run and ExperimentService is not None and self.experiment_service is None:
+            self.experiment_service = ExperimentService(self.experiment_config)
+            self.experiment_service.start_run()
         self._backend = backend if backend is not None else self._create_backend()
 
     # ------------------------------------------------------------ backend
@@ -154,15 +163,18 @@ class LinkSimulator:
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
         self._backend.start()
+        self._log_event("LINK_STARTED", {"waveform": self.config.waveform})
 
     def stop(self) -> None:
         self._backend.stop()
+        self._log_event("LINK_STOPPED", {"waveform": self.config.waveform})
 
     def wait(self, timeout: Optional[float] = None) -> None:
         self._backend.wait(timeout=timeout)
 
     def step(self) -> None:
         self._backend.step()
+        self._log_metric(self.get_last_metrics())
 
     # ------------------------------------------------------------ config
     def update_config(self, **kwargs) -> None:
@@ -179,6 +191,7 @@ class LinkSimulator:
         self.config.alpha = float(alpha)
         self.config.beta = float(beta)
         self._backend.set_indices(alpha, beta)
+        self._log_event("INDICES_SET", {"alpha": float(alpha), "beta": float(beta)})
 
     def update_runtime_parameters(self, **kwargs) -> None:
         self.update_config(**kwargs)
@@ -262,3 +275,20 @@ class LinkSimulator:
         if status is not None:
             return status()
         return {"active": False}
+
+    # ------------------------------------------------------------ experiment hooks
+    def _log_event(self, event: str, payload: Dict) -> None:
+        svc = getattr(self, "experiment_service", None)
+        if svc is not None:
+            try:
+                svc.log_event(event=event, module="link_simulator", payload=payload)
+            except Exception:
+                pass
+
+    def _log_metric(self, metrics: Dict) -> None:
+        svc = getattr(self, "experiment_service", None)
+        if svc is not None:
+            try:
+                svc.log_metrics(metrics)
+            except Exception:
+                pass
