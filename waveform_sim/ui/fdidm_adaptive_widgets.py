@@ -138,13 +138,14 @@ class AdaptiveProcessPlots(QWidget):
         self.traj_plot.addLegend(offset=(8, 8))
         self.applied_alpha_curve = self.traj_plot.plot(pen=pg.mkPen(MATLAB_BLUE, width=1.6),
                                                        name="α 已应用", stepMode="center")
-        self.applied_beta_curve = self.traj_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=1.6),
-                                                      name="β 已应用", stepMode="center")
+        self.applied_beta_curve = self.traj_plot.plot(
+            pen=pg.mkPen(MATLAB_ORANGE, width=1.6, style=Qt.DashDotLine),
+            name="β 已应用", stepMode="center")
         self.rec_alpha_curve = self.traj_plot.plot(pen=pg.mkPen(MATLAB_BLUE, width=1.2,
                                                                  style=Qt.DashLine),
                                                    name="α 推荐")
         self.rec_beta_curve = self.traj_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=1.2,
-                                                                style=Qt.DashLine),
+                                                                style=Qt.DotLine),
                                                   name="β 推荐")
         self.switch_alpha_marker = pg.ScatterPlotItem(size=10, brush=pg.mkBrush(*MATLAB_RED),
                                                       pen=pg.mkPen(None))
@@ -235,6 +236,8 @@ class AdaptiveProcessPlots(QWidget):
 
         enabled = bool(status.get("enabled", False))
         state = str(status.get("state", "disabled"))
+        cur_a = status.get("current_alpha")
+        cur_b = status.get("current_beta")
         rec_a = status.get("recommended_alpha")
         rec_b = status.get("recommended_beta")
         gain = status.get("predicted_improvement_db")
@@ -242,13 +245,18 @@ class AdaptiveProcessPlots(QWidget):
         required = int(status.get("stable_required", 0))
         err = str(status.get("last_error", "") or "")
         line1 = "自适应：开启  状态：" + str(state) if enabled else "自适应：关闭  状态：" + str(state)
-        line2 = ""
+        lines = []
+        if cur_a is not None and cur_b is not None:
+            try:
+                lines.append("当前 α=%.3f，β=%.3f" % (float(cur_a), float(cur_b)))
+            except Exception:
+                pass
         if rec_a is not None and rec_b is not None:
             try:
-                line2 = ("推荐 α=%.3f，β=%.3f，预测增益=%.3f dB，稳定 %d/%d"
-                         % (float(rec_a), float(rec_b), float(gain), int(stable), int(required)))
+                lines.append("推荐 α=%.3f，β=%.3f，预测增益=%.3f dB，稳定 %d/%d"
+                             % (float(rec_a), float(rec_b), float(gain), int(stable), int(required)))
             except Exception:
                 pass
         if err:
-            line2 += "  错误：" + str(err)
-        self.status_label.setText(line1 + ("\n" + line2 if line2 else ""))
+            lines.append("错误：" + str(err))
+        self.status_label.setText(line1 + (("\n" + "\n".join(lines)) if lines else ""))

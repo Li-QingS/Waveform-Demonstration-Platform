@@ -677,6 +677,8 @@ class FDIDMSimAdaptiveMixin:
                 "ready": bool(rec.get("ready", False)),
                 "pending": bool(rec.get("pending", False)),
                 "recommendation_seq": int(rec.get("recommendation_seq", 0)),
+                "current_alpha": float(getattr(self.config, "alpha", float("nan"))),
+                "current_beta": float(getattr(self.config, "beta", float("nan"))),
                 "recommended_alpha": float(rec.get("recommended_alpha", float("nan"))),
                 "recommended_beta": float(rec.get("recommended_beta", float("nan"))),
                 "predicted_ser_current": float(rec.get("predicted_ser_current", float("nan"))),
