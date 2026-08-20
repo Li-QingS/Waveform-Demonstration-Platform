@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""FDIDM simulation adaptive-process panel.
+"""FDIDM simulation adaptive-process UI pieces.
 
-Read-only UI for the predictive alpha/beta closed loop living in the FDIDM
-simulation backend.  The panel polls backend status/history and renders:
+The adaptive closed loop lives in the FDIDM simulation backend.  The UI is
+split into two lightweight pieces:
 
-  1) alpha/beta trajectories (applied step, recommended dashed, switch markers)
-  2) predicted SER comparison (current vs recommended, log y)
-  3) status text + controls that merely forward configuration to the backend.
+  * AdaptiveControlBox  - left-panel controls (enable / params / evaluate)
+  * AdaptiveProcessPlots - right-panel "自适应过程" tab (trajectories, SER
+    comparison, switch markers, status text)
 """
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 
@@ -35,27 +36,31 @@ MATLAB_RED = (162, 20, 47)
 MATLAB_PURPLE = (126, 47, 142)
 
 
-class AdaptiveProcessWidget(QGroupBox):
-    """Adaptive process control + analysis view for the FDIDM simulation tab."""
+class AdaptiveControlBox(QGroupBox):
+    """Left-panel adaptive controls; only forwards config to the backend."""
 
     config_changed = pyqtSignal()
     evaluate_requested = pyqtSignal()
 
     def __init__(self, parent=None):
-        super().__init__("自适应过程（α/β 预测式自适应）", parent)
-        root = QVBoxLayout(self)
-        root.setSpacing(6)
+        super().__init__("自适应", parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(5)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
-        # ------------------------------------------------------ controls
-        ctrl = QHBoxLayout()
-        ctrl.setSpacing(8)
         self.enable_check = QCheckBox("启用自适应")
         self.auto_apply_check = QCheckBox("自动应用")
         self.auto_apply_check.setChecked(True)
+        form.addRow(self.enable_check, self.auto_apply_check)
+
         self.eval_interval_spin = QSpinBox()
         self.eval_interval_spin.setRange(1, 1024)
         self.eval_interval_spin.setValue(8)
-        self.eval_interval_spin.setToolTip("评估间隔（帧）")
+        form.addRow("评估间隔/帧", self.eval_interval_spin)
+
         self.coarse_spin = QDoubleSpinBox()
         self.coarse_spin.setRange(0.01, 1.0)
         self.coarse_spin.setDecimals(2)
@@ -66,6 +71,8 @@ class AdaptiveProcessWidget(QGroupBox):
         self.fine_spin.setDecimals(3)
         self.fine_spin.setSingleStep(0.005)
         self.fine_spin.setValue(0.05)
+        form.addRow("粗/细步长", self._row(self.coarse_spin, self.fine_spin))
+
         self.stability_spin = QSpinBox()
         self.stability_spin.setRange(1, 16)
         self.stability_spin.setValue(2)
@@ -74,35 +81,55 @@ class AdaptiveProcessWidget(QGroupBox):
         self.min_gain_spin.setDecimals(2)
         self.min_gain_spin.setSingleStep(0.1)
         self.min_gain_spin.setValue(0.5)
+        form.addRow("稳定/增益", self._row(self.stability_spin, self.min_gain_spin))
+
         self.cooldown_spin = QSpinBox()
         self.cooldown_spin.setRange(0, 4096)
         self.cooldown_spin.setValue(20)
-        self.evaluate_btn = QPushButton("立即评估")
-
-        form = QFormLayout()
-        form.setHorizontalSpacing(6)
-        form.setVerticalSpacing(2)
-        form.addRow(self.enable_check, self.auto_apply_check)
-        form.addRow("评估间隔/帧", self.eval_interval_spin)
-        form.addRow("粗步长", self.coarse_spin)
-        form.addRow("细步长", self.fine_spin)
-        form.addRow("稳定次数", self.stability_spin)
-        form.addRow("最小增益/dB", self.min_gain_spin)
         form.addRow("冷却帧", self.cooldown_spin)
+
+        self.evaluate_btn = QPushButton("立即评估")
         form.addRow(self.evaluate_btn)
 
-        self.status_label = QLabel("自适应：关闭")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #444444;")
+        self.enable_check.stateChanged.connect(self.config_changed.emit)
+        self.auto_apply_check.stateChanged.connect(self.config_changed.emit)
+        for w in (self.eval_interval_spin, self.coarse_spin, self.fine_spin,
+                  self.stability_spin, self.min_gain_spin, self.cooldown_spin):
+            w.valueChanged.connect(self.config_changed.emit)
+        self.evaluate_btn.clicked.connect(self.evaluate_requested.emit)
 
-        left = QVBoxLayout()
-        left.addLayout(form)
-        left.addWidget(self.status_label)
-        ctrl.addLayout(left)
-        ctrl.addStretch(1)
-        root.addLayout(ctrl)
+    @staticmethod
+    def _row(w1, w2) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(w1)
+        row.addWidget(w2)
+        return row
 
-        # ------------------------------------------------------ plots
+    def collect_config(self) -> Dict[str, Any]:
+        """Return current panel configuration for backend start/update."""
+        return {
+            "adaptive_enabled": self.enable_check.isChecked(),
+            "adaptive_auto_apply": self.auto_apply_check.isChecked(),
+            "adaptive_interval_frames": int(self.eval_interval_spin.value()),
+            "adaptive_coarse_step": float(self.coarse_spin.value()),
+            "adaptive_fine_step": float(self.fine_spin.value()),
+            "adaptive_stability_evals": int(self.stability_spin.value()),
+            "adaptive_min_improvement_db": float(self.min_gain_spin.value()),
+            "adaptive_cooldown_frames": int(self.cooldown_spin.value()),
+        }
+
+
+class AdaptiveProcessPlots(QWidget):
+    """Right-panel adaptive analysis view: trajectories + SER + status."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(6)
+
         self.traj_plot = pg.PlotWidget(title="α/β 轨迹（实线=已应用，虚线=推荐，圆点=切换）")
         self.traj_plot.setBackground("w")
         self.traj_plot.showGrid(x=True, y=True, alpha=0.22)
@@ -138,32 +165,15 @@ class AdaptiveProcessWidget(QGroupBox):
         self.ser_best_curve = self.ser_plot.plot(pen=pg.mkPen(MATLAB_RED, width=1.6),
                                                  name="推荐参数")
 
+        self.status_label = QLabel("自适应：关闭")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #444444;")
+
         root.addWidget(self.traj_plot, stretch=3)
         root.addWidget(self.ser_plot, stretch=2)
+        root.addWidget(self.status_label)
 
         self._last_render_key: tuple = (0, 0)
-        self.enable_check.stateChanged.connect(self._emit_config_changed)
-        self.auto_apply_check.stateChanged.connect(self._emit_config_changed)
-        for w in (self.eval_interval_spin, self.coarse_spin, self.fine_spin,
-                  self.stability_spin, self.min_gain_spin, self.cooldown_spin):
-            w.valueChanged.connect(self._emit_config_changed)
-        self.evaluate_btn.clicked.connect(self.evaluate_requested.emit)
-
-    def _emit_config_changed(self, *_args) -> None:
-        self.config_changed.emit()
-
-    def collect_config(self) -> Dict[str, Any]:
-        """Return current panel configuration for backend start/update."""
-        return {
-            "adaptive_enabled": self.enable_check.isChecked(),
-            "adaptive_auto_apply": self.auto_apply_check.isChecked(),
-            "adaptive_interval_frames": int(self.eval_interval_spin.value()),
-            "adaptive_coarse_step": float(self.coarse_spin.value()),
-            "adaptive_fine_step": float(self.fine_spin.value()),
-            "adaptive_stability_evals": int(self.stability_spin.value()),
-            "adaptive_min_improvement_db": float(self.min_gain_spin.value()),
-            "adaptive_cooldown_frames": int(self.cooldown_spin.value()),
-        }
 
     @staticmethod
     def _finite(values) -> List[float]:
@@ -231,14 +241,14 @@ class AdaptiveProcessWidget(QGroupBox):
         stable = int(status.get("stable_count", 0))
         required = int(status.get("stable_required", 0))
         err = str(status.get("last_error", "") or "")
-        line1 = f"自适应：{'开启' if enabled else '关闭'}  状态：{state}"
+        line1 = "自适应：开启  状态：" + str(state) if enabled else "自适应：关闭  状态：" + str(state)
         line2 = ""
         if rec_a is not None and rec_b is not None:
             try:
-                line2 = (f"推荐 α={float(rec_a):.3f}，β={float(rec_b):.3f}，"
-                         f"预测增益={float(gain):.3f} dB，稳定 {stable}/{required}")
+                line2 = ("推荐 α=%.3f，β=%.3f，预测增益=%.3f dB，稳定 %d/%d"
+                         % (float(rec_a), float(rec_b), float(gain), int(stable), int(required)))
             except Exception:
                 pass
         if err:
-            line2 += f"  错误：{err}"
-        self.status_label.setText(f"{line1}\n{line2}" if line2 else line1)
+            line2 += "  错误：" + str(err)
+        self.status_label.setText(line1 + ("\n" + line2 if line2 else ""))

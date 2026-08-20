@@ -213,9 +213,13 @@ def test_fdidm_tab_adaptive_panel_smoke():
     tab = FDIDMTab()
     tab._search_worker = lambda *args, **kwargs: None
     try:
-        assert tab.adaptive_widget is not None
+        assert tab.plot_tabs.count() == 2
+        assert tab.plot_tabs.tabText(0) == "仿真图"
+        assert tab.plot_tabs.tabText(1) == "自适应过程"
+        assert tab.adaptive_controls is not None
+        assert tab.adaptive_plots is not None
         tab._on_start_clicked()
-        tab.adaptive_widget.enable_check.setChecked(True)
+        tab.adaptive_controls.enable_check.setChecked(True)
         tab._on_adaptive_config_changed()
         for _ in range(5):
             tab._refresh_adaptive_panel()

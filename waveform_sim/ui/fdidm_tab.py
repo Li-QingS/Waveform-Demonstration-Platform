@@ -32,10 +32,13 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from .base_waveform_tab import BaseWaveformTab
-from .fdidm_adaptive_widgets import AdaptiveProcessWidget
+from .fdidm_adaptive_widgets import AdaptiveControlBox, AdaptiveProcessPlots
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -116,12 +119,31 @@ class FDIDMTab(BaseWaveformTab):
         self._connect_fdidm_signals()
         self._setup_plots()
 
-        self.adaptive_widget = AdaptiveProcessWidget()
-        self.adaptive_widget.config_changed.connect(self._on_adaptive_config_changed)
-        self.adaptive_widget.evaluate_requested.connect(self._on_adaptive_evaluate_clicked)
+        self.adaptive_plots = AdaptiveProcessPlots()
+        self.adaptive_controls.config_changed.connect(self._on_adaptive_config_changed)
+        self.adaptive_controls.evaluate_requested.connect(self._on_adaptive_evaluate_clicked)
+
+        # 右侧绘图区页签化：仿真图（2x2 + 信息面板）/ 自适应过程（轨迹 + SER + 状态）
         plot_layout = self.plot_panel.layout()
-        if plot_layout is not None:
-            plot_layout.insertWidget(1, self.adaptive_widget, stretch=2)
+        grid_item = plot_layout.takeAt(0)
+        info_item = plot_layout.takeAt(0)
+        grid_layout = grid_item.layout()
+        grid_layout.setParent(None)
+        info_widget = info_item.widget()
+        info_widget.setParent(None)
+
+        sim_tab = QWidget()
+        sim_layout = QVBoxLayout(sim_tab)
+        sim_layout.setContentsMargins(6, 6, 6, 6)
+        sim_layout.setSpacing(8)
+        sim_layout.addLayout(grid_layout, stretch=4)
+        sim_layout.addWidget(info_widget, stretch=1)
+
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.addTab(sim_tab, "仿真图")
+        self.plot_tabs.addTab(self.adaptive_plots, "自适应过程")
+        plot_layout.addWidget(self.plot_tabs)
+
         self.adaptive_timer = QTimer()
         self.adaptive_timer.setInterval(250)
         self.adaptive_timer.timeout.connect(self._refresh_adaptive_panel)
@@ -198,7 +220,6 @@ class FDIDMTab(BaseWaveformTab):
         self.search_step_spin.setDecimals(1)
         self.search_step_spin.setSingleStep(0.1)
         self.search_step_spin.setValue(0.1)
-        idx_form.addRow("搜索步长:", self.search_step_spin)
 
         self.decoder_combo = QComboBox()
         self.decoder_combo.addItems(["ZF", "MMSE", "ZF-SIC"])
@@ -210,7 +231,6 @@ class FDIDMTab(BaseWaveformTab):
         self.snr_def_combo = QComboBox()
         self.snr_def_combo.addItems(["Eb/N0", "Es/N0"])
         self.snr_def_combo.setCurrentText("Eb/N0")
-        frame_form.addRow("SNR定义:", self.snr_def_combo)
 
         self.m_spin = QSpinBox()
         self.m_spin.setRange(4, 16)
@@ -253,26 +273,24 @@ class FDIDMTab(BaseWaveformTab):
         self.velocity_combo.setCurrentText("28080")
         ch_form.addRow("速度(km/h):", self.velocity_combo)
 
+        self.channel_dynamics_combo = QComboBox()
+        self.channel_dynamics_combo.addItems(["固定信道", "动态块衰落", "帧内快时变"])
+        self.channel_dynamics_combo.setCurrentText("固定信道")
+        ch_form.addRow("时变模式:", self.channel_dynamics_combo)
+
+        # 低频参数控件（挂入“高级参数”折叠组）
         self.radial_factor_spin = QDoubleSpinBox()
         self.radial_factor_spin.setRange(0.0, 1.0)
         self.radial_factor_spin.setDecimals(2)
         self.radial_factor_spin.setSingleStep(0.01)
         self.radial_factor_spin.setValue(0.10)
         self.radial_factor_spin.setToolTip("用于计算最大多普勒：fDmax = v × 径向系数 × fc / c")
-        ch_form.addRow("径向系数:", self.radial_factor_spin)
 
         self.random_channel_check = QCheckBox("随机路径相位/角度")
         self.random_channel_check.setChecked(True)
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(1, 2_147_483_647)
         self.seed_spin.setValue(42)
-        ch_form.addRow("随机信道:", self.random_channel_check)
-        ch_form.addRow("种子:", self.seed_spin)
-
-        self.channel_dynamics_combo = QComboBox()
-        self.channel_dynamics_combo.addItems(["固定信道", "动态块衰落", "帧内快时变"])
-        self.channel_dynamics_combo.setCurrentText("固定信道")
-        ch_form.addRow("时变模式:", self.channel_dynamics_combo)
 
         self.coherence_frames_spin = QSpinBox()
         self.coherence_frames_spin.setRange(1, 10000)
@@ -280,10 +298,10 @@ class FDIDMTab(BaseWaveformTab):
         self.fast_symbol_spin = QSpinBox()
         self.fast_symbol_spin.setRange(1, 64)
         self.fast_symbol_spin.setValue(1)
-        ch_form.addRow("相干帧/符号:", row2(self.coherence_frames_spin, self.fast_symbol_spin))
 
         # --- 曲线统计 ---
         stat_group, stat_form = form_group("曲线统计")
+        self.stat_group = stat_group  # 保留引用，避免控件被垃圾回收
         self.alpha_curve_mode_combo = QComboBox()
         self.alpha_curve_mode_combo.addItems(["ZF理论值"])
         self.alpha_curve_mode_combo.setCurrentText("ZF理论值")
@@ -317,7 +335,34 @@ class FDIDMTab(BaseWaveformTab):
             btn.setMinimumHeight(28)
             quick_layout.addWidget(btn)
 
-        for group in (idx_group, frame_group, ch_group, stat_group, quick_group):
+        # --- 高级参数（默认折叠） ---
+        adv_group = QGroupBox("高级参数")
+        adv_group.setCheckable(True)
+        adv_group.setChecked(False)
+        adv_container = QWidget()
+        adv_form = QFormLayout(adv_container)
+        adv_form.setContentsMargins(8, 8, 8, 8)
+        adv_form.setHorizontalSpacing(10)
+        adv_form.setVerticalSpacing(6)
+        adv_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        adv_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        adv_form.addRow("搜索步长:", self.search_step_spin)
+        adv_form.addRow("SNR定义:", self.snr_def_combo)
+        adv_form.addRow("径向系数:", self.radial_factor_spin)
+        adv_form.addRow("随机信道:", self.random_channel_check)
+        adv_form.addRow("种子:", self.seed_spin)
+        adv_form.addRow("相干帧/符号:", row2(self.coherence_frames_spin, self.fast_symbol_spin))
+        adv_layout = QVBoxLayout(adv_group)
+        adv_layout.setContentsMargins(8, 8, 8, 8)
+        adv_layout.addWidget(adv_container)
+        adv_group.toggled.connect(lambda on: adv_container.setVisible(on))
+        adv_container.setVisible(False)
+
+        # --- 自适应控制（左栏） ---
+        self.adaptive_controls = AdaptiveControlBox()
+
+        for group in (idx_group, frame_group, ch_group, self.adaptive_controls,
+                      quick_group, adv_group):
             self.param_layout.addWidget(group)
     def _connect_fdidm_signals(self):
         self.btn_start.clicked.connect(self._on_start_clicked)
@@ -504,9 +549,9 @@ class FDIDMTab(BaseWaveformTab):
         try:
             self.tb = self._new_backend()
             self.tb.start()
-            if self.adaptive_widget.enable_check.isChecked():
+            if self.adaptive_controls.enable_check.isChecked():
                 try:
-                    self.tb.start_adaptive_tuning(**self.adaptive_widget.collect_config())
+                    self.tb.start_adaptive_tuning(**self.adaptive_controls.collect_config())
                 except Exception:
                     pass
             self.update_timer.start(250)
@@ -545,7 +590,7 @@ class FDIDMTab(BaseWaveformTab):
         if tb is None:
             return
         try:
-            cfg = self.adaptive_widget.collect_config()
+            cfg = self.adaptive_controls.collect_config()
             if cfg.get("adaptive_enabled"):
                 tb.start_adaptive_tuning(**cfg)
             else:
@@ -571,13 +616,13 @@ class FDIDMTab(BaseWaveformTab):
         except Exception:
             return
         if not bool(status.get("enabled", False)):
-            self.adaptive_widget.refresh(status, [])
+            self.adaptive_plots.refresh(status, [])
             return
         try:
             history = tb.get_adaptive_history(limit=2000)
         except Exception:
             history = []
-        self.adaptive_widget.refresh(status, history)
+        self.adaptive_plots.refresh(status, history)
 
     def _hot_update_from_ui(self, *args):
         self._best_alpha = None
