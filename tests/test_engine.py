@@ -80,6 +80,7 @@ def test_fdidm_shell_matches_legacy_metrics_keys():
     [
         ("OFDM", dict(snr_db=15.0), "_LegacyOfdmTransceiver"),
         ("OTFS", dict(snr_db=15.0), "_LegacyOTFSTransceiver"),
+        ("AFDM", dict(snr_db=15.0), "_LegacyAFDMTransceiver"),
     ],
 )
 def test_engine_backend_smoke(waveform, kwargs, legacy_cls):

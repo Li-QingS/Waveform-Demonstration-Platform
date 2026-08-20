@@ -39,6 +39,8 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
+from waveform_sim.core.engine import LinkSimulator
+
 
 # =========================================================
 # Small utility layer
@@ -639,7 +641,7 @@ class _SearchConfig:
     fine_step_hz: float = 100.0
 
 
-class AFDMTransceiver:
+class _LegacyAFDMTransceiver:
     def __init__(
         self,
         c1=0.05,
@@ -1170,68 +1172,73 @@ class AFDMTransceiver:
     # =========================================================
     # Main simulation loop
     # =========================================================
+    def _process_one_frame(self):
+        params = self.get_params()
+        rx_td, x_hat_data, tx_bits, rx_bits, metrics = self._simulate_one_frame(params)
+
+        frame_bits = len(tx_bits)
+        frame_err = int(np.sum(tx_bits != rx_bits)) if len(rx_bits) == len(tx_bits) else frame_bits
+        frame_ber = frame_err / max(frame_bits, 1)
+        frame_error = 1.0 if frame_err > 0 else 0.0
+        metrics = dict(metrics)
+        metrics["bit_errors"] = int(frame_err)
+        metrics["total_bits"] = int(frame_bits)
+        metrics["ber"] = float(frame_ber)
+        metrics["fer"] = float(frame_error)
+        metrics["total_cfo_hz"] = float(metrics.get("refined_cfo_hz", metrics.get("coarse_cfo_hz", 0.0)))
+
+        with self._stats_lock:
+            t_now = time.time() - (self._start_time or time.time())
+            stats = self._metric_tracker.update(
+                bit_errors=frame_err,
+                total_bits=frame_bits,
+                frame_error=frame_error,
+                t_now=t_now,
+            )
+            evm_stats = self._evm_tracker.update(
+                evm_percent=metrics.get("evm_percent", float("nan")),
+                evm_db=metrics.get("evm_db", None),
+                valid=bool(metrics.get("evm_valid", False)),
+                t_now=t_now,
+            )
+            self._frame_count = stats["frame_count"]
+            self._total_bits = stats["total_bits"]
+            self._total_bit_errors = stats["total_bit_errors"]
+            self._last_frame_bits = stats["last_frame_bits"]
+            self._last_frame_bit_errors = stats["last_frame_bit_errors"]
+            self._last_frame_ber = stats["last_frame_ber"]
+
+            metrics["frame_ber"] = float(frame_ber)
+            metrics["ber"] = float(stats["ber_window"])
+            metrics["ber_ewma"] = float(stats["ber_ewma"])
+            metrics["fer"] = float(stats["fer_window"])
+            metrics["frame_error"] = float(frame_error)
+            metrics["evm_percent"] = float(evm_stats["evm_percent"])
+            metrics["evm_db"] = float(evm_stats["evm_db"])
+            metrics["evm_valid"] = bool(metrics.get("evm_valid", False))
+            self._last_metrics = dict(metrics)
+
+        with self._lock:
+            self._sample_buffer.extend(np.asarray(rx_td, dtype=np.complex64).tolist())
+            pts = _downsample_points(np.asarray(x_hat_data, dtype=np.complex64), 320)
+            if metrics.get("sync_metric", 0.0) >= self.sync_metric_threshold and len(pts) > 0:
+                self._constellation_points = pts
+                self._last_good_constellation = pts.copy()
+            else:
+                self._constellation_points = self._last_good_constellation.copy()
+
     def _worker_loop(self):
         frame_interval = 0.05
         while self._running:
             try:
-                params = self.get_params()
-                rx_td, x_hat_data, tx_bits, rx_bits, metrics = self._simulate_one_frame(params)
-
-                frame_bits = len(tx_bits)
-                frame_err = int(np.sum(tx_bits != rx_bits)) if len(rx_bits) == len(tx_bits) else frame_bits
-                frame_ber = frame_err / max(frame_bits, 1)
-                frame_error = 1.0 if frame_err > 0 else 0.0
-                metrics = dict(metrics)
-                metrics["bit_errors"] = int(frame_err)
-                metrics["total_bits"] = int(frame_bits)
-                metrics["ber"] = float(frame_ber)
-                metrics["fer"] = float(frame_error)
-                metrics["total_cfo_hz"] = float(metrics.get("refined_cfo_hz", metrics.get("coarse_cfo_hz", 0.0)))
-
-                with self._stats_lock:
-                    t_now = time.time() - (self._start_time or time.time())
-                    stats = self._metric_tracker.update(
-                        bit_errors=frame_err,
-                        total_bits=frame_bits,
-                        frame_error=frame_error,
-                        t_now=t_now,
-                    )
-                    evm_stats = self._evm_tracker.update(
-                        evm_percent=metrics.get("evm_percent", float("nan")),
-                        evm_db=metrics.get("evm_db", None),
-                        valid=bool(metrics.get("evm_valid", False)),
-                        t_now=t_now,
-                    )
-                    self._frame_count = stats["frame_count"]
-                    self._total_bits = stats["total_bits"]
-                    self._total_bit_errors = stats["total_bit_errors"]
-                    self._last_frame_bits = stats["last_frame_bits"]
-                    self._last_frame_bit_errors = stats["last_frame_bit_errors"]
-                    self._last_frame_ber = stats["last_frame_ber"]
-
-                    metrics["frame_ber"] = float(frame_ber)
-                    metrics["ber"] = float(stats["ber_window"])
-                    metrics["ber_ewma"] = float(stats["ber_ewma"])
-                    metrics["fer"] = float(stats["fer_window"])
-                    metrics["frame_error"] = float(frame_error)
-                    metrics["evm_percent"] = float(evm_stats["evm_percent"])
-                    metrics["evm_db"] = float(evm_stats["evm_db"])
-                    metrics["evm_valid"] = bool(metrics.get("evm_valid", False))
-                    self._last_metrics = dict(metrics)
-
-                with self._lock:
-                    self._sample_buffer.extend(np.asarray(rx_td, dtype=np.complex64).tolist())
-                    pts = _downsample_points(np.asarray(x_hat_data, dtype=np.complex64), 320)
-                    if metrics.get("sync_metric", 0.0) >= self.sync_metric_threshold and len(pts) > 0:
-                        self._constellation_points = pts
-                        self._last_good_constellation = pts.copy()
-                    else:
-                        self._constellation_points = self._last_good_constellation.copy()
-
+                self._process_one_frame()
             except Exception as e:
                 print(f"[AFDMTransceiver] worker exception: {e}")
-
             time.sleep(frame_interval)
+
+    def step(self):
+        """单帧仿真（供统一引擎调用）。"""
+        self._process_one_frame()
 
     def _simulate_one_frame(self, params):
         ebn0_db = params["snr_db"]
@@ -1412,6 +1419,27 @@ class AFDMTransceiver:
         }
 
         return rx_noisy, x_hat_data, tx_bits, rx_bits[: len(tx_bits)], metrics
+
+
+# ---------------------------------------------------------------------------
+# 阶段4：统一引擎兼容壳
+# ---------------------------------------------------------------------------
+def _create_afdm_backend(**kwargs):
+    """供 waveform_sim.core.engine 构造 AFDM 后端。"""
+    return _LegacyAFDMTransceiver(**kwargs)
+
+
+class AFDMTransceiver(LinkSimulator):
+    """AFDM 兼容壳：继承统一引擎，委托 _LegacyAFDMTransceiver，公开接口不变。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(waveform="AFDM", **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
 
 
 if __name__ == "__main__":
