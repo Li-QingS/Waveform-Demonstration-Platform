@@ -138,7 +138,7 @@ class OTFSTab(BaseWaveformTab):
         self._on_stop_clicked()
 
         try:
-            from simulation.simple_otfs_rx import OTFSTransceiver
+            from waveform_sim.simulation.simple_otfs_rx import OTFSTransceiver
 
             self.tb = OTFSTransceiver(
                 delay_spread=self.delay_spin.value(),
@@ -675,7 +675,7 @@ class OTFSTab(BaseWaveformTab):
             )
 
     def _create_ber_snr_sweep_transceiver(self, snr_db: float):
-        from simulation.simple_otfs_rx import OTFSTransceiver
+        from waveform_sim.simulation.simple_otfs_rx import OTFSTransceiver
         return OTFSTransceiver(
             delay_spread=self.delay_spin.value(),
             doppler_spread=self.doppler_spin.value(),

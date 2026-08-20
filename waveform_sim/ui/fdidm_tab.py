@@ -541,7 +541,7 @@ class FDIDMTab(BaseWaveformTab):
         )
 
     def _new_backend(self, alpha=None, beta=None, snr_db=None):
-        from simulation.simple_fdidm_rx import FDIDMTransceiver
+        from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
         return FDIDMTransceiver(**self._backend_kwargs(alpha=alpha, beta=beta, snr_db=snr_db))
 
     def _on_start_clicked(self):
@@ -824,7 +824,7 @@ class FDIDMTab(BaseWaveformTab):
     def _search_worker(self, token: int, base_kwargs: dict, stop_event: threading.Event, reason: str):
         """Worker 0: find best alpha/beta, then notify UI to start plot workers."""
         try:
-            from simulation.simple_fdidm_rx import FDIDMTransceiver
+            from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
             tb0 = FDIDMTransceiver(**base_kwargs)
             result = tb0.search_best_indices(
                 step=float(base_kwargs.get("search_step", 0.1)),
@@ -887,7 +887,7 @@ class FDIDMTab(BaseWaveformTab):
         """Worker 1: draw left-bottom SER-vs-alpha curves with alpha step fixed at 0.1."""
         finish_reason = "完成"
         try:
-            from simulation.simple_fdidm_rx import FDIDMTransceiver
+            from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
             current_b = float(base_kwargs.get("beta", 0.0))
             # Requirement: alpha increases by 0.1 for every plotted point.
             alpha_values = np.round(np.arange(0.0, 2.0 + 0.05, 0.1), 10)
@@ -931,7 +931,7 @@ class FDIDMTab(BaseWaveformTab):
         """Worker 2: draw right-bottom theory/proxy SER-SNR curves."""
         finish_reason = "完成"
         try:
-            from simulation.simple_fdidm_rx import FDIDMTransceiver
+            from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
             current_a = float(base_kwargs.get("alpha", 0.0))
             current_b = float(base_kwargs.get("beta", 0.0))
             raw_specs = [

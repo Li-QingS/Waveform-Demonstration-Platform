@@ -60,7 +60,7 @@ class _WaveformRunner:
         self.wave_type = wave_type
 
         if wave_type == "OFDM":
-            from simulation.simple_ofdm_rx import OfdmTransceiver
+            from waveform_sim.simulation.simple_ofdm_rx import OfdmTransceiver
             self.tb = OfdmTransceiver(
                 fft_len=64,
                 cp_len=16,
@@ -72,7 +72,7 @@ class _WaveformRunner:
             )
 
         elif wave_type == "OTFS":
-            from simulation.simple_otfs_rx import OTFSTransceiver
+            from waveform_sim.simulation.simple_otfs_rx import OTFSTransceiver
             self.tb = OTFSTransceiver(
                 delay_spread=5,
                 doppler_spread=doppler_hz,
@@ -86,7 +86,7 @@ class _WaveformRunner:
             )
 
         elif wave_type == "AFDM":
-            from simulation.simple_afdm_rx import AFDMTransceiver
+            from waveform_sim.simulation.simple_afdm_rx import AFDMTransceiver
             try:
                 self.tb = AFDMTransceiver(
                     c1=0.05,
@@ -251,7 +251,7 @@ class _ScanWorker(threading.Thread):
 
     def run(self):
         try:
-            from simulation.compare_scan_backend import WaveformScanSimulator
+            from waveform_sim.simulation.compare_scan_backend import WaveformScanSimulator
 
             sim = WaveformScanSimulator()
             waveforms = ["OFDM", "OTFS", "AFDM"]

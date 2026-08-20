@@ -437,6 +437,8 @@ class FDIDMSimAdaptiveMixin:
             htf_kind = "diag" if htf.ndim == 1 or htf.shape == (M, N) else "full"
 
         with self._adaptive_lock:
+            if not self._adaptive_cfg("enabled", False):
+                return
             self._adaptive_abs_frame = int(frame)
             if ctx != self._adaptive_context_key:
                 self._adaptive_invalidate_locked(reason="context_changed")
@@ -507,7 +509,8 @@ class FDIDMSimAdaptiveMixin:
                 result = self._optimize_alpha_beta_snapshot(snapshot)
             except Exception as exc:
                 with self._adaptive_lock:
-                    if expected_seq == int(self._adaptive_snapshot_seq):
+                    if (expected_seq == int(self._adaptive_snapshot_seq)
+                            and self._adaptive_cfg("enabled", False)):
                         self._adaptive_last_error = f"{type(exc).__name__}: {exc}"
                         self._adaptive_state = "error"
                 continue
@@ -515,6 +518,8 @@ class FDIDMSimAdaptiveMixin:
             pending_apply = None
             with self._adaptive_lock:
                 if expected_seq != int(self._adaptive_snapshot_seq):
+                    continue
+                if not self._adaptive_cfg("enabled", False):
                     continue
                 fine = max(float(self._adaptive_cfg("fine_step", 0.05)), 1e-9)
                 key = (int(round(float(result["recommended_alpha"]) / fine)),
@@ -586,20 +591,21 @@ class FDIDMSimAdaptiveMixin:
                         self._adaptive_state = "error"
                     continue
                 with self._adaptive_lock:
-                    self._adaptive_last_applied_frame = int(frame)
-                    self._adaptive_state = "applied"
-                    self._adaptive_history.append({
-                        "kind": "switch",
-                        "seq": int(self._adaptive_eval_seq),
-                        "frame": int(frame),
-                        "from_alpha": float(from_alpha),
-                        "from_beta": float(from_beta),
-                        "to_alpha": float(a),
-                        "to_beta": float(b),
-                        "gain_db": float(gain),
-                        "reason": "stable_ready",
-                        "ts": float(time.time()),
-                    })
+                    if self._adaptive_cfg("enabled", False):
+                        self._adaptive_last_applied_frame = int(frame)
+                        self._adaptive_state = "applied"
+                        self._adaptive_history.append({
+                            "kind": "switch",
+                            "seq": int(self._adaptive_eval_seq),
+                            "frame": int(frame),
+                            "from_alpha": float(from_alpha),
+                            "from_beta": float(from_beta),
+                            "to_alpha": float(a),
+                            "to_beta": float(b),
+                            "gain_db": float(gain),
+                            "reason": "stable_ready",
+                            "ts": float(time.time()),
+                        })
 
     # ------------------------------------------------------------ public API
     def start_adaptive_tuning(self, **cfg) -> bool:

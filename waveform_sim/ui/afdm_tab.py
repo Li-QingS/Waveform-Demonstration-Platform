@@ -153,7 +153,7 @@ class AfdmTab(BaseWaveformTab):
         self._on_stop_clicked()
 
         try:
-            from simulation.simple_afdm_rx import AFDMTransceiver
+            from waveform_sim.simulation.simple_afdm_rx import AFDMTransceiver
 
             self.tb = AFDMTransceiver(
                 c1=self.c1_spin.value(),
@@ -532,7 +532,7 @@ class AfdmTab(BaseWaveformTab):
         )
 
     def _create_ber_snr_sweep_transceiver(self, snr_db: float):
-        from simulation.simple_afdm_rx import AFDMTransceiver
+        from waveform_sim.simulation.simple_afdm_rx import AFDMTransceiver
         return AFDMTransceiver(
             c1=self.c1_spin.value(),
             c2=self.c2_spin.value(),

@@ -139,7 +139,7 @@ class OfdmTab(BaseWaveformTab):
         self._on_stop_clicked()
 
         try:
-            from simulation.simple_ofdm_rx import OfdmTransceiver
+            from waveform_sim.simulation.simple_ofdm_rx import OfdmTransceiver
             self.tb = OfdmTransceiver(
                 fft_len=64,
                 cp_len=16,
@@ -556,7 +556,7 @@ class OfdmTab(BaseWaveformTab):
         )
 
     def _create_ber_snr_sweep_transceiver(self, snr_db: float):
-        from simulation.simple_ofdm_rx import OfdmTransceiver
+        from waveform_sim.simulation.simple_ofdm_rx import OfdmTransceiver
         return OfdmTransceiver(
             fft_len=64,
             cp_len=16,
