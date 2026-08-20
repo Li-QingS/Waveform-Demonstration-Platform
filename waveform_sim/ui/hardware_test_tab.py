@@ -77,6 +77,9 @@ AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
 
 
+
+from .ui_utils import compute_spectrum, format_metric, has_signal, safe_float
+
 class HardwareTestTab(QWidget):
     """OFDM、OTFS、AFDM 共用的 USRP 真机测试页面。"""
 
@@ -815,15 +818,6 @@ class HardwareTestTab(QWidget):
         except Exception:
             pass
 
-    @staticmethod
-    def _has_signal(samples: np.ndarray) -> bool:
-        if samples.size == 0:
-            return False
-        finite = np.isfinite(np.real(samples)) & np.isfinite(np.imag(samples))
-        if not np.any(finite):
-            return False
-        return bool(np.max(np.abs(samples[finite])) > 1e-10)
-
     def _update_tx_plot(self, samp_rate: float):
         if self.backend is None or not self.test_running:
             self.tx_curve.setData([], [])
@@ -833,7 +827,7 @@ class HardwareTestTab(QWidget):
         samples = np.asarray(
             self.backend.get_tx_spectrum_source(4096), dtype=np.complex64
         ).reshape(-1)
-        if not self._has_signal(samples):
+        if not has_signal(samples):
             self.tx_curve.setData([], [])
             self.tx_plot.setTitle("发送端基带显示（暂未取得样点）")
             return
@@ -847,7 +841,7 @@ class HardwareTestTab(QWidget):
             ymax = max(0.25, float(np.nanmax(y)) * 1.15)
             self.tx_plot.setYRange(0, ymax, padding=0)
         else:
-            freq, psd = self._compute_spectrum(samples, samp_rate, 1024)
+            freq, psd = compute_spectrum(samples, samp_rate, 1024)
             self.tx_curve.setData(freq, psd)
             self.tx_plot.setTitle(f"TX 基带频谱（{samples.size} 样点）")
             self.tx_plot.setXRange(-samp_rate / 2, samp_rate / 2, padding=0)
@@ -862,12 +856,12 @@ class HardwareTestTab(QWidget):
         samples = np.asarray(
             self.backend.get_rx_spectrum_source(4096), dtype=np.complex64
         ).reshape(-1)
-        if not self._has_signal(samples):
+        if not has_signal(samples):
             self.rx_curve.setData([], [])
             self.rx_spectrum_plot.setTitle("USRP 接收基带频谱（暂未取得有效样点）")
             return
 
-        freq, psd = self._compute_spectrum(samples, samp_rate, 1024)
+        freq, psd = compute_spectrum(samples, samp_rate, 1024)
         self.rx_curve.setData(freq, psd)
         self.rx_spectrum_plot.setTitle(
             f"USRP 接收基带频谱（{samples.size} 样点）"
@@ -890,7 +884,7 @@ class HardwareTestTab(QWidget):
         n = min(x.size, ber.size)
         if n <= 0:
             self.ber_curve.setData([], [])
-            current = self._safe_float(status.get("ber"), np.nan)
+            current = safe_float(status.get("ber"), np.nan)
             title = "BER 曲线"
             if np.isfinite(current):
                 title += f"（当前 {current:.3e}）"
@@ -943,32 +937,6 @@ class HardwareTestTab(QWidget):
         self.constellation_plot.setXRange(-limit, limit, padding=0)
         self.constellation_plot.setYRange(-limit, limit, padding=0)
 
-    def _compute_spectrum(
-        self, samples: np.ndarray, samp_rate: float, segment_len: int = 1024
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        samples = np.asarray(samples, dtype=np.complex128).reshape(-1)
-        if samples.size == 0:
-            return np.zeros(0), np.zeros(0)
-
-        segment_len = min(max(8, int(segment_len)), samples.size)
-        n_segments = max(1, samples.size // segment_len)
-        trimmed = samples[-n_segments * segment_len :]
-        blocks = trimmed.reshape(n_segments, segment_len)
-        window = np.hanning(segment_len).astype(np.float64)
-        power = np.zeros(segment_len, dtype=np.float64)
-        for block in blocks:
-            spectrum = np.fft.fftshift(np.fft.fft(block * window))
-            power += np.abs(spectrum) ** 2
-        power /= float(n_segments)
-        psd_db = 10.0 * np.log10(power + 1e-12)
-        freq = np.linspace(
-            -float(samp_rate) / 2.0,
-            float(samp_rate) / 2.0,
-            segment_len,
-            endpoint=False,
-        )
-        return freq, psd_db
-
     def _apply_stable_plot_ranges(self, samp_rate: float):
         samp_rate = float(samp_rate)
         if (
@@ -1001,29 +969,11 @@ class HardwareTestTab(QWidget):
     # =========================================================
     # Status / log
     # =========================================================
-    @staticmethod
-    def _safe_float(value: Any, default: float = 0.0) -> float:
-        try:
-            result = float(value)
-        except (TypeError, ValueError):
-            return float(default)
-        return result
-
     def _extract_samp_rate(self, status: Dict[str, Any]) -> float:
-        return self._safe_float(
+        return safe_float(
             status.get("samp_rate", status.get("sample_rate")),
             self.samp_rate_spin.value(),
         )
-
-    @staticmethod
-    def _format_metric(value: Any, fmt: str = ".3f", fallback: str = "nan") -> str:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return fallback
-        if not np.isfinite(number):
-            return fallback
-        return format(number, fmt)
 
     def _update_decode_status(
         self, stats: Dict[str, Any], status: Dict[str, Any]
@@ -1044,9 +994,9 @@ class HardwareTestTab(QWidget):
             stats.get("expected_bytes", status.get("expected_bytes", 0)) or 0
         )
         reason = str(status.get("reason", status.get("status", "")) or "")
-        sync = self._format_metric(status.get("sync_metric"), ".3f")
-        cfo = self._format_metric(status.get("cfo_est_hz"), ".1f")
-        ber = self._format_metric(status.get("ber"), ".3e")
+        sync = format_metric(status.get("sync_metric"), ".3f")
+        cfo = format_metric(status.get("cfo_est_hz"), ".1f")
+        ber = format_metric(status.get("ber"), ".3e")
         combine = int(status.get("combine_frames", 0) or 0)
         repeat = int(status.get("payload_repeat", 0) or 0)
 
@@ -1054,16 +1004,16 @@ class HardwareTestTab(QWidget):
         if waveform in ("OFDM", "AFDM"):
             extras.extend(
                 [
-                    f"TrainNMSE={self._format_metric(status.get('train_nmse'), '.3f')}",
-                    f"PilotNMSE={self._format_metric(status.get('pilot_nmse'), '.3f')}",
-                    f"α={self._format_metric(status.get('alpha_abs'), '.3f')}",
+                    f"TrainNMSE={format_metric(status.get('train_nmse'), '.3f')}",
+                    f"PilotNMSE={format_metric(status.get('pilot_nmse'), '.3f')}",
+                    f"α={format_metric(status.get('alpha_abs'), '.3f')}",
                 ]
             )
         elif waveform == "OTFS":
             extras.extend(
                 [
-                    f"PilotNMSE={self._format_metric(status.get('pilot_nmse'), '.3f')}",
-                    f"KernelE={self._format_metric(status.get('kernel_energy'), '.3e')}",
+                    f"PilotNMSE={format_metric(status.get('pilot_nmse'), '.3f')}",
+                    f"KernelE={format_metric(status.get('kernel_energy'), '.3e')}",
                     f"rank={int(status.get('kernel_rank', 0) or 0)}",
                 ]
             )
@@ -1073,8 +1023,8 @@ class HardwareTestTab(QWidget):
         elif waveform == "AFDM":
             extras.extend(
                 [
-                    f"c1={self._format_metric(status.get('c1'), '.4f')}",
-                    f"c2={self._format_metric(status.get('c2'), '.4f')}",
+                    f"c1={format_metric(status.get('c1'), '.4f')}",
+                    f"c2={format_metric(status.get('c2'), '.4f')}",
                 ]
             )
 
@@ -1097,9 +1047,9 @@ class HardwareTestTab(QWidget):
         self._log(
             f"runtime[{self.backend_waveform}]: "
             f"reason={status.get('reason', '')}, "
-            f"sync={self._format_metric(status.get('sync_metric'), '.3f')}, "
-            f"CFO={self._format_metric(status.get('cfo_est_hz'), '.1f')} Hz, "
-            f"BER={self._format_metric(status.get('ber'), '.3e')}, "
+            f"sync={format_metric(status.get('sync_metric'), '.3f')}, "
+            f"CFO={format_metric(status.get('cfo_est_hz'), '.1f')} Hz, "
+            f"BER={format_metric(status.get('ber'), '.3e')}, "
             f"decode_ok={bool(stats.get('decode_ok', False))}, "
             f"match={int(stats.get('match_bytes', 0) or 0)}/"
             f"{int(stats.get('expected_bytes', 0) or 0)}"
@@ -1125,7 +1075,7 @@ class HardwareTestTab(QWidget):
     def _extract_number(
         self, status: Dict[str, Any], key: str, default: float
     ) -> float:
-        return self._safe_float(status.get(key), default)
+        return safe_float(status.get(key), default)
 
     @staticmethod
     def _read_text_file(file_path: str) -> str:
