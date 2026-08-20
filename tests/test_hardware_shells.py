@@ -13,6 +13,7 @@ CASES = [
     ("waveform_sim.hardware.afdm_hardtest", "AFDMHardwareTest", "_LegacyAFDMHardwareTest"),
     ("waveform_sim.hardware.ofdm_hardtest", "OfdmHardwareTx", "_LegacyOfdmHardwareTx"),
     ("waveform_sim.hardware.otfs_hardtest", "OTFSHardwareTest", "_LegacyOTFSHardwareTest"),
+    ("waveform_sim.hardware.fdidm_hardtest", "FDIDMHardwareTest", "_LegacyFDIDMHardwareTest"),
 ]
 
 

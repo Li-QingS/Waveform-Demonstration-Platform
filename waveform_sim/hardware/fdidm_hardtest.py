@@ -313,7 +313,7 @@ class _NTNTDLChannel:
             return y.astype(np.complex64)
 
 
-class FDIDMHardwareTest:
+class _LegacyFDIDMHardwareTest:
     APP_MAGIC = b"MTPK"
     PILOT_SEED = 0xFD1D_0017  # deterministic pilot generator
     DEFAULT_PILOT_SYMBOL = (1.0 + 1.0j) / np.sqrt(2.0)
@@ -5715,6 +5715,22 @@ class FDIDMHardwareTest:
 
     def get_last_error(self) -> str:
         return self._last_error
+
+
+# ---------------------------------------------------------------------------
+# 阶段6：统一硬件后端兼容壳
+# ---------------------------------------------------------------------------
+class FDIDMHardwareTest:
+    """兼容壳：委托 _LegacyFDIDMHardwareTest，公开接口不变。"""
+
+    def __init__(self, *args, backend=None, **kwargs):
+        self._backend = backend if backend is not None else _LegacyFDIDMHardwareTest(*args, **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
 
 
 if __name__ == "__main__":
