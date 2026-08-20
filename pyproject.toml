@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "waveform-demonstration-platform"
+version = "0.1.0"
+description = "FDIDM/OFDM/OTFS/AFDM 波形原型验证演示平台"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24,<3.0",
+  "PyQt5>=5.15,<6.0",
+  "pyqtgraph>=0.13,<0.14",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

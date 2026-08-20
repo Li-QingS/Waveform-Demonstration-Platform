@@ -1,0 +1,11 @@
+name: waveform-demo-platform
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pyqt
+  - pyqtgraph
+  - pytest
+  - pip
+

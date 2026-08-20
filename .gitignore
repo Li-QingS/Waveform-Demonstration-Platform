@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 
+# 工程化运行产物
+runs/
+*.pyc
+.pytest_cache/
+
 # IDE
 .idea/
 .vscode/
