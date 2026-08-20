@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
-class AFDMHardwareTest:
+class _LegacyAFDMHardwareTest:
     APP_MAGIC = b"MTPK"
 
     def __init__(
@@ -1303,6 +1303,22 @@ class AFDMHardwareTest:
         self.configure(mod_order=mod_order)
         if was_running:
             self.start()
+
+
+# ---------------------------------------------------------------------------
+# 阶段6：统一硬件后端兼容壳
+# ---------------------------------------------------------------------------
+class AFDMHardwareTest:
+    """兼容壳：委托 _LegacyAFDMHardwareTest，公开接口不变。"""
+
+    def __init__(self, *args, backend=None, **kwargs):
+        self._backend = backend if backend is not None else _LegacyAFDMHardwareTest(*args, **kwargs)
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("_backend")
+        if backend is not None and hasattr(backend, name):
+            return getattr(backend, name)
+        raise AttributeError(name)
 
 
 if __name__ == "__main__":
