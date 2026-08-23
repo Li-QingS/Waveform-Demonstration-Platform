@@ -30,15 +30,23 @@
 
 ## 验收状态
 
-- 行为基线：`python -m pytest -q` → 66 passed
+- 行为基线：`python -m pytest -q` → 79 passed
 - 编译：`python -m compileall -q waveform_sim scripts` 通过
 - 自检：`python scripts/run_self_test.py` 输出 `self test OK`
 - GUI：离屏 `MainWindow` 7 个页签可构造
 - 待实验室：6c 真机回归（USRP 硬件链路 + 自适应调优 + 性能面）
+
+## FDIDM 仿真侧自适应（重构后新增能力）
+
+在重构收尾后，为 FDIDM 软件仿真补齐了与硬件端同机制的预测式自适应：
+
+- 后端：`waveform_sim/simulation/fdidm_adaptive.py`（`FDIDMSimAdaptiveMixin` + 粗搜/细搜内核，收敛在仿真后端，兼容壳经 `__getattr__` 透传）
+- UI：`waveform_sim/ui/fdidm_adaptive_widgets.py`（α/β 轨迹、预测 SER 对比、切换标记、状态文本、控制区）
+- 流程文档：`markdown/32_fdidm_sim_adaptive_spec.md` ~ `35_fdidm_sim_adaptive_checklist.md`
+- 测试：`tests/test_fdidm_sim_adaptive.py`（搜索内核、决策策略、并发安全、端到端场景）
 
 ## 当前工程结构
 
 见 `README.md` 目录结构；核心变化是把约 5700 行的 `fdidm_hardtest.py` 拆分为
 `stream / channel / fec / gr_flow / fdidm_adaptive` 等模块，四个 transceiver 与
 四个 hardtest 均改为薄兼容壳，算法行为保持不变。
-
