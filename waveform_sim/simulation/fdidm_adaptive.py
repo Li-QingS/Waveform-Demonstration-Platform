@@ -503,6 +503,7 @@ class FDIDMSimAdaptiveMixin:
                     continue
                 snapshot = dict(snapshot)
                 expected_seq = int(snapshot.get("snapshot_seq", -1))
+                ctx_at_search = self._adaptive_context_key
                 self._adaptive_state = "optimizing"
                 self._adaptive_last_error = ""
             try:
@@ -517,8 +518,20 @@ class FDIDMSimAdaptiveMixin:
 
             pending_apply = None
             with self._adaptive_lock:
-                if expected_seq != int(self._adaptive_snapshot_seq):
+                current = self._adaptive_snapshot
+                if current is None or not self._adaptive_cfg("enabled", False):
                     continue
+                if expected_seq != int(current.get("snapshot_seq", -1)):
+                    # A newer snapshot was queued while we searched.  Reuse this
+                    # result only when the objective context and current alpha/beta
+                    # are unchanged; otherwise the result is stale and a fresh
+                    # search must run against the newest snapshot.
+                    if (ctx_at_search != self._adaptive_context_key
+                            or float(current.get("alpha", -1.0)) != float(snapshot.get("alpha", -1.0))
+                            or float(current.get("beta", -1.0)) != float(snapshot.get("beta", -1.0))):
+                        continue
+                    snapshot = current
+                    expected_seq = int(current.get("snapshot_seq", -1))
                 if not self._adaptive_cfg("enabled", False):
                     continue
                 fine = max(float(self._adaptive_cfg("fine_step", 0.05)), 1e-9)

@@ -136,6 +136,32 @@ def test_closed_loop_auto_apply_disabled():
     tb.stop()
 
 
+def test_slow_search_does_not_starve_evals(monkeypatch):
+    """回归：搜索慢于帧间隔时，结果不得被当作过期全部丢弃（CI 慢 runner 抖动根因）。"""
+    from waveform_sim.simulation import fdidm_adaptive as fdidm_adaptive_mod
+    orig_optimize = fdidm_adaptive_mod.FDIDMSimAdaptiveMixin._optimize_alpha_beta_snapshot
+
+    def slow_optimize(self, snapshot):
+        time.sleep(0.025)
+        return orig_optimize(self, snapshot)
+
+    monkeypatch.setattr(fdidm_adaptive_mod.FDIDMSimAdaptiveMixin,
+                        "_optimize_alpha_beta_snapshot", slow_optimize)
+    tb = _make_backend(dynamic_channel=True, channel_dynamics="block",
+                       channel_coherence_frames=8)
+    tb.start_adaptive_tuning(interval_frames=1, stability_evals=2,
+                             min_improvement_db=0.0, auto_apply=True,
+                             cooldown_frames=5, max_order=512)
+    _run_frames(tb, 60)
+    history = tb.get_adaptive_history()
+    evals = [h for h in history if h["kind"] == "eval"]
+    switches = [h for h in history if h["kind"] == "switch"]
+    tb.stop_adaptive_tuning()
+    tb.stop()
+    assert len(evals) >= 2, "slow search must not starve evaluation records"
+    assert len(switches) >= 1, "slow search must still allow a stable apply"
+
+
 def test_closed_loop_context_invalidation():
     tb = _make_backend(dynamic_channel=True, channel_dynamics="block",
                        channel_coherence_frames=8)
