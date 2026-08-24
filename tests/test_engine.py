@@ -64,6 +64,10 @@ def test_fdidm_shell_matches_legacy_metrics_keys():
     try:
         ok = _wait_until(lambda: shell.get_last_metrics().get("total_bits", 0) > 0)
         assert ok
+        # 两个后端都完成至少一帧后再比较键集合：未出帧前 _last_metrics 是占位空
+        # 字典（键少），慢速 runner 上只等 shell 会抓到 legacy 尚未出帧的竞态。
+        ok = _wait_until(lambda: legacy.get_last_metrics().get("total_bits", 0) > 0)
+        assert ok
         ms = shell.get_last_metrics()
         ml = legacy.get_last_metrics()
         assert set(ms.keys()) == set(ml.keys())
