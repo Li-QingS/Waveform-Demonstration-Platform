@@ -209,11 +209,11 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     ):
         super().__init__(daemon=True)
         channel_dynamics = str(channel_dynamics or ("block" if dynamic_channel else "fixed")).lower()
-        if channel_dynamics not in ("fixed", "block", "fast"):
+        if channel_dynamics not in ("fixed", "block", "fast", "cont"):
             channel_dynamics = "block" if dynamic_channel else "fixed"
         if channel_dynamics == "fixed" and dynamic_channel:
             channel_dynamics = "block"
-        dynamic_channel = bool(channel_dynamics in ("block", "fast"))
+        dynamic_channel = bool(channel_dynamics in ("block", "fast", "cont"))
         self.config = FDIDMConfig(
             alpha=float(alpha),
             beta=float(beta),
@@ -278,6 +278,18 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         self._last_metrics = self._empty_metrics()
         self._dynamic_base_seed = int(self.config.channel_seed)
         self._last_dynamic_block = None
+        # 单调递增的仿真帧号：只随 _simulate_one_frame 增长，不随参数更新/BER 统计重置。
+        # 信道块索引与自适应评估都以它为时间基准，避免"应用 α/β 后信道倒退"。
+        self._sim_frame = 0
+        # 连续多普勒模式（channel_dynamics="cont"）的持久化路径表与逐帧相位状态。
+        self._cont_paths = None
+        self._cont_phase = None
+        self._cont_paths_key = None
+        # 块衰落模式（channel_dynamics="block"）的持久化路径表与逐块相位随机游走状态。
+        self._block_paths = None
+        self._block_phase = None
+        self._block_paths_key = None
+        self._block_phase_block = -1
 
     # ----------------------------- properties -----------------------------
     @property
@@ -351,11 +363,11 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         data["dynamic_channel"] = bool(data.get("dynamic_channel", old.dynamic_channel))
         data["channel_coherence_frames"] = int(max(1, int(data.get("channel_coherence_frames", old.channel_coherence_frames))))
         mode = str(data.get("channel_dynamics", old.channel_dynamics) or "fixed").lower()
-        if mode not in ("fixed", "block", "fast"):
+        if mode not in ("fixed", "block", "fast", "cont"):
             mode = "block" if data["dynamic_channel"] else "fixed"
         if mode == "fixed" and data["dynamic_channel"]:
             mode = "block"
-        data["dynamic_channel"] = bool(mode in ("block", "fast"))
+        data["dynamic_channel"] = bool(mode in ("block", "fast", "cont"))
         data["channel_dynamics"] = mode
         data["fast_channel_coherence_symbols"] = int(max(1, int(data.get("fast_channel_coherence_symbols", old.fast_channel_coherence_symbols))))
         data["circular_channel"] = bool(data.get("circular_channel", old.circular_channel))
@@ -392,6 +404,17 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         self.config = new
         if new.channel_seed != old.channel_seed:
             self._dynamic_base_seed = int(new.channel_seed)
+            self._last_dynamic_block = None
+        # 时变模式/相干参数变化时强制重新进入当前块。旧代码在 reset_ber_stats 里无条件
+        # 重置 _last_dynamic_block，导致每次应用 α/β 都把信道重播种回第一个块。
+        channel_ctx_changed = (
+            new.random_channel != old.random_channel
+            or new.dynamic_channel != old.dynamic_channel
+            or new.channel_dynamics != old.channel_dynamics
+            or new.channel_coherence_frames != old.channel_coherence_frames
+            or new.fast_channel_coherence_symbols != old.fast_channel_coherence_symbols
+        )
+        if channel_ctx_changed:
             self._last_dynamic_block = None
         if shape_changed:
             self._gamma_cache.clear()
@@ -464,8 +487,9 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             self._apply_config_update(**kwargs)
 
     def reset_ber_stats(self):
+        # 只重置 BER/SER 统计，不重置信道推进状态（_last_dynamic_block/_sim_frame），
+        # 否则每次应用 α/β 都会让块索引回退、信道倒退到第一个实现。
         self._metrics.reset()
-        self._last_dynamic_block = None
 
     @staticmethod
     def _valid_channel_seed(seed: int) -> int:
@@ -479,7 +503,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     def _channel_dynamics_mode_locked(self) -> str:
         cfg = self.config
         mode = str(getattr(cfg, "channel_dynamics", "block" if getattr(cfg, "dynamic_channel", False) else "fixed") or "fixed").lower()
-        if mode not in ("fixed", "block", "fast"):
+        if mode not in ("fixed", "block", "fast", "cont"):
             mode = "block" if getattr(cfg, "dynamic_channel", False) else "fixed"
         if not getattr(cfg, "dynamic_channel", False):
             mode = "fixed"
@@ -490,23 +514,39 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
 
         fixed mode returns immediately and therefore preserves the original
         static-channel chain.  In block mode one H is reused for a configurable
-        number of frames.  In fast mode a fresh H is built for every frame, and
-        _build_paper_tf_channel_matrix() also varies path gains across the N
-        OFDM symbols inside that frame.
+        number of frames and adjacent blocks evolve by a small deterministic
+        phase walk (correlated, SER changes smoothly).  In fast mode a fresh H
+        is built for every frame, and _build_paper_tf_channel_matrix() also
+        varies path gains across the N OFDM symbols inside that frame.
         """
         cfg = self.config
         mode = self._channel_dynamics_mode_locked()
         if mode == "fixed":
             return
+        # 基于单调帧号的当前帧索引（0-based），不再受 BER 统计重置影响。
+        frame_idx = max(0, int(getattr(self, "_sim_frame", 0)) - 1)
+        if mode == "cont":
+            # 连续多普勒：路径表固定，每帧按物理多普勒推进相位，信道连续演化。
+            self._advance_cont_channel_locked()
+            self._cache_key = None
+            self._H_tf = None
+            self._H_cross = None
+            self._G_time = None
+            self._detector_cache = None
+            self._last_dynamic_block = ("cont", int(frame_idx))
+            return
         if mode == "fast":
-            block = int(self._metrics.total_frames)
+            block = int(frame_idx)
             seed_offset = 1_000_003
         else:
             coherence = int(max(1, getattr(cfg, "channel_coherence_frames", 1)))
-            block = int(self._metrics.total_frames // coherence)
+            block = int(frame_idx // coherence)
             seed_offset = 0
         if self._last_dynamic_block == (mode, block):
             return
+        if mode == "block":
+            # 平滑块演化：只游走相位，不重新随机整条路径表。
+            self._advance_block_phase_locked(block)
         new_seed = self._valid_channel_seed(self._dynamic_channel_seed_for_block(block) + seed_offset)
         data = cfg.__dict__.copy()
         data["channel_seed"] = int(new_seed)
@@ -716,17 +756,32 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             np.exp(-1j * 2.0 * np.pi * f * b) - np.exp(-1j * 2.0 * np.pi * f * a)
         ) / (-1j * 2.0 * np.pi * f * T)
 
-    def _generate_path_parameters(self):
+    def _sample_path_parameters(self, seed=None, random_phases=None, random_angles=None):
+        """Draw one TDL/CDL path table: delays, complex gains, per-path Doppler.
+
+        seed=None 使用当前 config.channel_seed，保持 block/fast 模式既有的逐实现
+        可复现行为；连续多普勒模式显式传入独立种子以复用同一条路径表。
+        """
+        cfg = self.config
+        if seed is None:
+            seed = int(cfg.channel_seed)
+        if random_phases is None:
+            random_phases = bool(cfg.random_channel)
+        if random_angles is None:
+            random_angles = bool(cfg.random_channel)
         delays_s, gains_db = self._channel_profile()
         gains_mag = 10.0 ** (gains_db / 20.0)
-        rng = np.random.default_rng(int(self.config.channel_seed) if self.config.random_channel else 12345)
-        phases = np.exp(1j * 2.0 * np.pi * rng.random(len(gains_mag))) if self.config.random_channel else np.ones(len(gains_mag), dtype=np.complex128)
+        rng = np.random.default_rng(int(seed))
+        if random_phases:
+            phases = np.exp(1j * 2.0 * np.pi * rng.random(len(gains_mag)))
+        else:
+            phases = np.ones(len(gains_mag), dtype=np.complex128)
         gains = gains_mag * phases
         gains /= np.sqrt(np.sum(np.abs(gains) ** 2) + 1e-15)
         fd_max = self._velocity_doppler_hz()
         if len(gains) <= 1:
             fd_list = np.asarray([fd_max], dtype=np.float64)
-        elif self.config.random_channel:
+        elif random_angles:
             # Randomized angles give realization-to-realization variability while
             # preserving the same max Doppler for all alpha/beta points.
             angles = rng.uniform(0.0, 2.0 * np.pi, len(gains))
@@ -734,6 +789,120 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         else:
             fd_list = fd_max * np.linspace(-1.0, 1.0, len(gains))
         return delays_s, gains, fd_list
+
+    def _cont_scenario_key_locked(self) -> tuple:
+        """场景键：这些参数变化时重建连续多普勒模式的持久化路径表。"""
+        cfg = self.config
+        return (
+            str(cfg.channel_model),
+            float(cfg.velocity_kmh),
+            float(getattr(cfg, "doppler_radial_factor", 0.10)),
+            float(cfg.fc_hz),
+            float(cfg.subcarrier_spacing_hz),
+            int(self._dynamic_base_seed),
+        )
+
+    def _ensure_cont_paths_locked(self):
+        """惰性建立连续多普勒模式的固定路径表（同一场景只随机一次）。"""
+        key = self._cont_scenario_key_locked()
+        if self._cont_paths is not None and self._cont_paths_key == key:
+            return
+        # 独立于块模式的种子序列，保证同一场景可复现。
+        seed = self._valid_channel_seed(int(self._dynamic_base_seed) + 777)
+        delays_s, gains, dopplers_hz = self._sample_path_parameters(
+            seed=int(seed), random_phases=True, random_angles=True
+        )
+        self._cont_paths = (delays_s, gains, dopplers_hz)
+        self._cont_phase = np.ones(len(gains), dtype=np.complex128)
+        self._cont_paths_key = key
+
+    def _advance_cont_channel_locked(self):
+        """每帧推进各径相位：exp(j2π fD T_frame)，T_frame = N/Δf。
+
+        对应真实 LEO 多普勒相位的连续旋转（3GPP TR 38.811：20GHz 最大多普勒
+        ±480kHz、多普勒变化率可达 -5.44kHz/s），而不是块模式那种每 8 帧独立跳变。
+        """
+        self._ensure_cont_paths_locked()
+        cfg = self.config
+        T_frame = float(self.N) / max(float(cfg.subcarrier_spacing_hz), 1e-15)
+        dopplers_hz = np.asarray(self._cont_paths[2], dtype=np.float64)
+        step = np.exp(1j * 2.0 * np.pi * dopplers_hz * T_frame)
+        self._cont_phase = np.asarray(self._cont_phase, dtype=np.complex128) * step
+
+    def _ensure_block_paths_locked(self):
+        """惰性建立块衰落模式的固定路径表（同一场景只随机一次）。"""
+        key = self._cont_scenario_key_locked()
+        if self._block_paths is not None and self._block_paths_key == key:
+            return
+        seed = self._valid_channel_seed(int(self._dynamic_base_seed) + 555)
+        delays_s, gains, dopplers_hz = self._sample_path_parameters(
+            seed=int(seed), random_phases=True, random_angles=True
+        )
+        self._block_paths = (delays_s, gains, dopplers_hz)
+        # 初始相位取随机值（而非全 1），避免第一块到第二块的过渡出现异常大跳变。
+        rng0 = np.random.default_rng(self._valid_channel_seed(int(seed) + 1))
+        self._block_angles = 2.0 * np.pi * rng0.random(len(gains))
+        self._block_phase = np.exp(1j * self._block_angles).astype(np.complex128)
+        self._block_phase_block = -1
+        self._block_paths_key = key
+
+    def _advance_block_phase_locked(self, block):
+        """块衰落：每个块对路径相位做一次小幅、确定性的随机游走。
+
+        旧实现用独立种子 per-block 重新随机路径，相邻块信道完全不相关，导致
+        SER 逐块大幅跳变。这里固定路径表（时延/幅度/多普勒），相位用均值回归的
+        AR(1) 过程平滑演化（rho<1，相位在固定带内漂移而非无限随机游走），
+        相邻块信道保持相关，SER 随时间平稳变化；游走步长由 (base_seed, block)
+        决定，可复现。
+        """
+        self._ensure_block_paths_locked()
+        n = len(self._block_paths[1])
+        block = int(max(0, block))
+        if self._block_phase is None or self._block_phase.size != n:
+            rng0 = np.random.default_rng(self._valid_channel_seed(int(self._dynamic_base_seed) + 555 + 1))
+            self._block_angles = 2.0 * np.pi * rng0.random(n)
+            self._block_phase = np.exp(1j * self._block_angles).astype(np.complex128)
+            self._block_phase_block = -1
+        if block < self._block_phase_block:
+            # 参数变化导致块索引回退时，重建到当前块，保证确定性。
+            rng0 = np.random.default_rng(self._valid_channel_seed(int(self._dynamic_base_seed) + 555 + 1))
+            self._block_angles = 2.0 * np.pi * rng0.random(n)
+            self._block_phase = np.exp(1j * self._block_angles).astype(np.complex128)
+            start = 0
+        else:
+            start = int(self._block_phase_block) + 1
+        step_sigma = 0.25
+        rho = 0.8
+        for b in range(start, block + 1):
+            rng = np.random.default_rng(
+                self._valid_channel_seed(int(self._dynamic_base_seed) + 104729 * b + 987654)
+            )
+            innovation = rng.normal(0.0, step_sigma, n)
+            self._block_angles = rho * np.asarray(self._block_angles, dtype=np.float64) + innovation
+            self._block_phase = np.exp(1j * self._block_angles).astype(np.complex128)
+        self._block_phase_block = int(block)
+
+    def _generate_path_parameters(self):
+        mode = self._channel_dynamics_mode_locked()
+        if mode == "cont":
+            # 连续多普勒：路径表固定，只随时间旋转相位（幅度/时延/多普勒不变）。
+            self._ensure_cont_paths_locked()
+            delays_s, gains, dopplers_hz = self._cont_paths
+            gains = np.asarray(gains, dtype=np.complex128) * np.asarray(self._cont_phase, dtype=np.complex128)
+            return delays_s, gains, dopplers_hz
+        if mode == "block":
+            # 块衰落：路径表固定，每个块只小幅随机游走相位，相邻块信道相关。
+            frame_idx = max(0, int(getattr(self, "_sim_frame", 1)) - 1)
+            coherence = int(max(1, int(getattr(self.config, "channel_coherence_frames", 1))))
+            self._advance_block_phase_locked(frame_idx // coherence)
+            delays_s, gains, dopplers_hz = self._block_paths
+            gains = np.asarray(gains, dtype=np.complex128) * np.asarray(self._block_phase, dtype=np.complex128)
+            return delays_s, gains, dopplers_hz
+        return self._sample_path_parameters(
+            seed=int(self.config.channel_seed),
+            random_phases=bool(self.config.random_channel),
+            random_angles=bool(self.config.random_channel),
+        )
 
     def _build_fast_time_gain_profile(self, num_paths: int, n_symbols: int) -> np.ndarray:
         """Per-path gain evolution across OFDM symbols for fast-fading mode.
@@ -1043,7 +1212,11 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
 
     # ----------------------------- simulation -----------------------------
     def _simulate_one_frame(self):
+        # 整帧在锁内完成：比特生成、映射、解码、硬判、统计都使用同一份 config 快照，
+        # 避免 GUI 线程在帧中途修改 mod_order/M/N/decoder 等参数导致
+        # bits 长度与星座/比特表不匹配（如 256 bit vs 128 bit 广播错误）。
         with self._lock:
+            self._sim_frame += 1
             self._maybe_update_dynamic_channel_locked()
             self._prepare_matrices_locked()
             H = self._H_cross.copy()
@@ -1053,28 +1226,28 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             noise_var = self._noise_variance()
             cfg = self.config
 
-        bits = self._rng.integers(0, 2, size=self.K * self.bits_per_symbol, dtype=np.uint8)
-        bit_groups = bits.reshape(-1, self.bits_per_symbol)
-        x = self._map_bits_to_symbols(bit_groups)
-        noise = self._complex_awgn(self.K, noise_var)
+            bits = self._rng.integers(0, 2, size=self.K * self.bits_per_symbol, dtype=np.uint8)
+            bit_groups = bits.reshape(-1, self.bits_per_symbol)
+            x = self._map_bits_to_symbols(bit_groups)
+            noise = self._complex_awgn(self.K, noise_var)
 
-        if cfg.link_mode == "full":
-            # Paper-domain full chain: x -> IFDIT -> H_TF -> FDIT -> y.
-            # Noise is added after FDIT so the theory and measured SER use the
-            # same AWGN convention.
-            y_clean = rx_fdit @ (H_tf @ (tx_fdit @ x))
-            y = y_clean + noise
-        else:
-            y_clean = H @ x
-            y = y_clean + noise
+            if cfg.link_mode == "full":
+                # Paper-domain full chain: x -> IFDIT -> H_TF -> FDIT -> y.
+                # Noise is added after FDIT so the theory and measured SER use the
+                # same AWGN convention.
+                y_clean = rx_fdit @ (H_tf @ (tx_fdit @ x))
+                y = y_clean + noise
+            else:
+                y_clean = H @ x
+                y = y_clean + noise
 
-        x_soft = self._decode(y, H, noise_var)
-        hard_idx = self._nearest_symbol_indices(x_soft)
-        hard_symbols = self._constellation[hard_idx]
-        hard_bits = self._bit_patterns[hard_idx].reshape(-1)
-        bit_errors = int(np.count_nonzero(bits != hard_bits[: bits.size]))
-        symbol_errors = int(np.count_nonzero(hard_idx != self._symbols_to_indices(x)))
-        self._metrics.update(bit_errors, bits.size, symbol_errors, self.K)
+            x_soft = self._decode(y, H, noise_var)
+            hard_idx = self._nearest_symbol_indices(x_soft)
+            hard_symbols = self._constellation[hard_idx]
+            hard_bits = self._bit_patterns[hard_idx].reshape(-1)
+            bit_errors = int(np.count_nonzero(bits != hard_bits[: bits.size]))
+            symbol_errors = int(np.count_nonzero(hard_idx != self._symbols_to_indices(x)))
+            self._metrics.update(bit_errors, bits.size, symbol_errors, self.K)
 
         # Debug equalized noise only for ZF/MMSE linear detector.  For nonlinear
         # detectors this remains a useful linear reference.
@@ -1267,7 +1440,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             "window_symbol_total": int(np.sum(self._metrics.recent_symbol_total)) if self._metrics.recent_symbol_total else 0,
             "cumulative_symbol_errors": int(self._metrics.total_symbol_errors),
             "cumulative_symbol_total": int(self._metrics.total_symbols),
-            "frames": int(self._metrics.total_frames),
+            "frames": int(getattr(self, "_sim_frame", self._metrics.total_frames)),
             "evm_percent": float(evm),
             "evm_db": float(20 * np.log10(max(evm / 100.0, 1e-12))),
             "impulse_peak_energy_ratio": float(self._impulse_peak_energy_ratio),
@@ -1290,6 +1463,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             "beta": float(self.config.beta),
             "used_alpha": float(self.config.alpha),
             "used_beta": float(self.config.beta),
+            "frames": int(getattr(self, "_sim_frame", 0)),
         }
 
 
@@ -1299,8 +1473,8 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         This method is intentionally deterministic when seed is provided.  It is
         used by the UI to draw measured SER-SNR curves for OFDM, OTFS, the
         manual point and the searched best point.  In fixed mode it uses the
-        original same-H realization; in block/fast modes it averages over the
-        deterministic channel evolution selected in the parameter panel.  If
+        original same-H realization; in block/fast/cont modes it averages over
+        the deterministic channel evolution selected in the parameter panel.  If
         zero errors occur, ``ser_display`` and ``ber_display``
         use the 95% rule-of-three upper bound instead of plotting an artificial
         zero on the log axis.
@@ -1343,7 +1517,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
                 "total_symbols": total_symbols,
                 "bit_errors": bit_errors,
                 "total_bits": total_bits,
-                "frames": int(self._metrics.total_frames),
+                "frames": int(getattr(self, "_sim_frame", self._metrics.total_frames)),
                 "dynamic_channel": bool(self.config.dynamic_channel),
                 "channel_dynamics": str(getattr(self.config, "channel_dynamics", "fixed")),
                 "channel_coherence_frames": int(getattr(self.config, "channel_coherence_frames", 1)),

@@ -63,6 +63,7 @@ class FDIDMSimAdaptiveMixin:
         self._adaptive_stable_key: Optional[Tuple[int, int]] = None
         self._adaptive_stable_count = 0
         self._adaptive_eval_seq = 0
+        self._adaptive_last_processed_seq = 0
         self._adaptive_abs_frame = 0
         self._adaptive_state = "disabled"
         self._adaptive_last_error = ""
@@ -368,6 +369,7 @@ class FDIDMSimAdaptiveMixin:
         improvement_db = 10.0 * math.log10(max(current_ser, 1e-15) / max(best_ser, 1e-15))
         ofdm = by_key.get((0.0, 0.0), {"ser": float("nan")})
         otfs = by_key.get((1.0, 1.0), {"ser": float("nan")})
+        afdm = by_key.get((0.5, 1.0), {"ser": float("nan")})
         return {
             "recommended_alpha": float(best["alpha"]),
             "recommended_beta": float(best["beta"]),
@@ -375,6 +377,7 @@ class FDIDMSimAdaptiveMixin:
             "predicted_ser_best": best_ser,
             "predicted_ser_ofdm": float(ofdm.get("ser", float("nan"))),
             "predicted_ser_otfs": float(otfs.get("ser", float("nan"))),
+            "predicted_ser_afdm": float(afdm.get("ser", float("nan"))),
             "predicted_improvement_db": float(improvement_db),
             "predicted_snr_db": float(predicted_snr_db),
             "candidate_count": int(len(all_results) + 1),
@@ -429,7 +432,10 @@ class FDIDMSimAdaptiveMixin:
             cfg = self.config
             M = int(cfg.m_subcarriers); N = int(cfg.n_symbols); K = M * N
             ctx = self._adaptive_context_key_locked()
-            frame = int(self._adaptive_abs_frame) + 1
+            # 以仿真线程的单调帧号（_sim_frame）为时间基准。旧实现用自适应模块自己的
+            # _adaptive_abs_frame，而它不随 BER 统计重置，导致与信道块索引（基于
+            # _sim_frame/total_frames）脱节；改为同源后冷却/间隔语义与信道推进一致。
+            frame = int(getattr(self, "_sim_frame", int(self._adaptive_abs_frame) + 1))
             mod_order = str(getattr(cfg, "mod_order", "16QAM"))
             equalizer = str(getattr(cfg, "decoder", "ZF"))
             alpha = float(getattr(cfg, "alpha", 0.0)); beta = float(getattr(cfg, "beta", 0.0))
@@ -502,6 +508,10 @@ class FDIDMSimAdaptiveMixin:
                 if snapshot is None or not self._adaptive_cfg("enabled", False):
                     continue
                 snapshot = dict(snapshot)
+                # 防御重复处理：快照序号不推进时（同一快照被并发队列再次唤醒），
+                # 直接跳过，避免同一帧被评估/应用两次。
+                if int(snapshot.get("snapshot_seq", 0)) <= int(self._adaptive_last_processed_seq):
+                    continue
                 expected_seq = int(snapshot.get("snapshot_seq", -1))
                 ctx_at_search = self._adaptive_context_key
                 self._adaptive_state = "optimizing"
@@ -532,6 +542,8 @@ class FDIDMSimAdaptiveMixin:
                         continue
                     snapshot = current
                     expected_seq = int(current.get("snapshot_seq", -1))
+                    if expected_seq <= int(self._adaptive_last_processed_seq):
+                        continue
                 if not self._adaptive_cfg("enabled", False):
                     continue
                 fine = max(float(self._adaptive_cfg("fine_step", 0.05)), 1e-9)
@@ -567,6 +579,7 @@ class FDIDMSimAdaptiveMixin:
                     action = "skip"
                 self._adaptive_recommendation = rec
                 self._adaptive_state = "ready" if ready else "tracking"
+                self._adaptive_last_processed_seq = int(snapshot.get("snapshot_seq", 0))
                 self._adaptive_history.append({
                     "kind": "eval",
                     "seq": int(self._adaptive_eval_seq),
@@ -578,6 +591,8 @@ class FDIDMSimAdaptiveMixin:
                     "ser_current": float(rec["predicted_ser_current"]),
                     "ser_best": float(rec["predicted_ser_best"]),
                     "ser_ofdm": float(rec["predicted_ser_ofdm"]),
+                    "ser_otfs": float(rec["predicted_ser_otfs"]),
+                    "ser_afdm": float(rec.get("predicted_ser_afdm", float("nan"))),
                     "gain_db": float(rec["predicted_improvement_db"]),
                     "action": action,
                     "stable_count": int(self._adaptive_stable_count),
@@ -607,6 +622,10 @@ class FDIDMSimAdaptiveMixin:
                     if self._adaptive_cfg("enabled", False):
                         self._adaptive_last_applied_frame = int(frame)
                         self._adaptive_state = "applied"
+                        # 应用后重置稳定计数：同一推荐必须在新一轮评估中重新确认，
+                        # 防止对过期快照的同一参数立即再次应用。
+                        self._adaptive_stable_key = None
+                        self._adaptive_stable_count = 0
                         self._adaptive_history.append({
                             "kind": "switch",
                             "seq": int(self._adaptive_eval_seq),
@@ -664,7 +683,7 @@ class FDIDMSimAdaptiveMixin:
             self._adaptive_snapshot_seq += 1
             snap = dict(last)
             snap["snapshot_seq"] = int(self._adaptive_snapshot_seq)
-            snap["frame_counter"] = int(self._adaptive_abs_frame)
+            snap["frame_counter"] = int(getattr(self, "_sim_frame", self._adaptive_abs_frame))
             snap["alpha"] = float(self.config.alpha)
             snap["beta"] = float(self.config.beta)
             snap["mod_order"] = str(self.config.mod_order)
@@ -698,6 +717,7 @@ class FDIDMSimAdaptiveMixin:
                 "predicted_ser_best": float(rec.get("predicted_ser_best", float("nan"))),
                 "predicted_ser_ofdm": float(rec.get("predicted_ser_ofdm", float("nan"))),
                 "predicted_ser_otfs": float(rec.get("predicted_ser_otfs", float("nan"))),
+                "predicted_ser_afdm": float(rec.get("predicted_ser_afdm", float("nan"))),
                 "predicted_improvement_db": float(rec.get("predicted_improvement_db", float("nan"))),
                 "predicted_snr_db": float(rec.get("predicted_snr_db", float("nan"))),
                 "stable_count": int(rec.get("stable_count", 0)),

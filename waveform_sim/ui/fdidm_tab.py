@@ -49,19 +49,26 @@ from .fdidm_utils import _CurveSpec, alpha_ser_floor, copy_kwargs_with, merged_c
 class FDIDMTab(BaseWaveformTab):
     """Mode-A FDIDM soft modulation page."""
 
-    ser_snr_point = pyqtSignal(int, str, float, float)
+    ser_snr_point = pyqtSignal(int, str, float, float, float, float)
     ser_snr_finished = pyqtSignal(int, str)
     search_finished = pyqtSignal(int, object)
     alpha_beta_point = pyqtSignal(int, str, float, float, float)
     alpha_beta_finished = pyqtSignal(int, str)
 
     # Right-bottom theory SER-vs-SNR points.
-    SER_SNR_POINTS = [10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40 ]
+    SER_SNR_POINTS = list(range(0, 31, 2))
     # Left-bottom alpha sweep: x-axis is alpha, each curve fixes one beta.
     ALPHA_SWEEP_BETAS = [round(0.2 * i, 1) for i in range(11)]
     # Right-bottom theory SER-vs-SNR uses raw positive theory values.
     # Non-positive/underflow values are not drawn on the log plot instead of
     # being clipped to an artificial display floor.
+    # 右下角"实时性能随时间变化"图的视图稳定策略：
+    # X 轴使用固定宽度滚动时间窗（右边界按整步长滑动），Y 轴保持固定范围，
+    # 避免新增噪声点导致坐标轴不断重算、画面抖动。
+    TIME_WINDOW_SEC = 120.0            # 时间窗宽度（秒）
+    TIME_WINDOW_STEP_SEC = 30.0        # 窗口右边界滑动步长（秒）
+    SER_Y_RANGE = (-6.0, 0.0)          # log10(SER) 显示范围：1e-6 ~ 1
+    SER_Y_EXPAND_CLAMP = (-12.0, 2.0)  # 数据越界时仅扩展、不收缩，且限制在此范围内
 
     def __init__(self):
         super().__init__("FDIDM")
@@ -69,11 +76,17 @@ class FDIDMTab(BaseWaveformTab):
         self.snr_spin.setValue(10.0)
         try:
             self.rename_info_rows({
-                "同步度量": "SER指标",
-                "CFO估计": "等效矩阵",
+                "Eb/N0": "实时SNR",
+                "BER": "瞬时多普勒",
+                "FER": "时延状态",
+                "同步度量": "多普勒扩展",
+                "CFO估计": "噪声 / 信道",
                 "FFT/CP": "帧结构",
                 "星座观察": "索引状态",
             })
+            metric_group = self.info_name_labels["运行状态"].parentWidget()
+            if hasattr(metric_group, "setTitle"):
+                metric_group.setTitle("实时链路状态")
         except Exception:
             pass
 
@@ -267,6 +280,10 @@ class FDIDMTab(BaseWaveformTab):
         self.channel_combo.addItems(["TDL-A", "TDL-C", "TDL-D", "CDL"])
         self.channel_combo.setCurrentText("TDL-C")
         ch_form.addRow("模型:", self.channel_combo)
+        # FDIDM 页面把通用 Eb/N0 控件移动到 LEO 信道模块中。
+        self.snr_label.setParent(None)
+        self.snr_spin.setParent(None)
+        ch_form.addRow("Eb/N0:", self.snr_spin)
 
         self.velocity_combo = QComboBox()
         self.velocity_combo.addItems(["0", "120", "500", "28080"])
@@ -274,8 +291,13 @@ class FDIDMTab(BaseWaveformTab):
         ch_form.addRow("速度(km/h):", self.velocity_combo)
 
         self.channel_dynamics_combo = QComboBox()
-        self.channel_dynamics_combo.addItems(["固定信道", "动态块衰落", "帧内快时变"])
-        self.channel_dynamics_combo.setCurrentText("固定信道")
+        self.channel_dynamics_combo.addItems(["固定信道", "动态块衰落", "帧内快时变", "连续多普勒"])
+        self.channel_dynamics_combo.setCurrentText("动态块衰落")
+        self.channel_dynamics_combo.setToolTip(
+            "动态块衰落按相干帧数更新CSI；帧内快时变每帧重生成信道；"
+            "连续多普勒按真实LEO多普勒逐帧旋转路径相位（20GHz下fDmax可达480kHz，"
+            "残余52kHz时相干时间仅约数微秒），固定信道则保持不变。"
+        )
         ch_form.addRow("时变模式:", self.channel_dynamics_combo)
 
         # 低频参数控件（挂入“高级参数”折叠组）
@@ -284,7 +306,8 @@ class FDIDMTab(BaseWaveformTab):
         self.radial_factor_spin.setDecimals(2)
         self.radial_factor_spin.setSingleStep(0.01)
         self.radial_factor_spin.setValue(0.10)
-        self.radial_factor_spin.setToolTip("用于计算最大多普勒：fDmax = v × 径向系数 × fc / c")
+        self.radial_factor_spin.setToolTip("径向投影系数，用于计算最大多普勒：fDmax = v × 径向投影 × fc / c")
+        ch_form.addRow("径向投影:", self.radial_factor_spin)
 
         self.random_channel_check = QCheckBox("随机路径相位/角度")
         self.random_channel_check.setChecked(True)
@@ -294,7 +317,7 @@ class FDIDMTab(BaseWaveformTab):
 
         self.coherence_frames_spin = QSpinBox()
         self.coherence_frames_spin.setRange(1, 10000)
-        self.coherence_frames_spin.setValue(20)
+        self.coherence_frames_spin.setValue(8)
         self.fast_symbol_spin = QSpinBox()
         self.fast_symbol_spin.setRange(1, 64)
         self.fast_symbol_spin.setValue(1)
@@ -335,34 +358,14 @@ class FDIDMTab(BaseWaveformTab):
             btn.setMinimumHeight(28)
             quick_layout.addWidget(btn)
 
-        # --- 高级参数（默认折叠） ---
-        adv_group = QGroupBox("高级参数")
-        adv_group.setCheckable(True)
-        adv_group.setChecked(False)
-        adv_container = QWidget()
-        adv_form = QFormLayout(adv_container)
-        adv_form.setContentsMargins(8, 8, 8, 8)
-        adv_form.setHorizontalSpacing(10)
-        adv_form.setVerticalSpacing(6)
-        adv_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        adv_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        adv_form.addRow("搜索步长:", self.search_step_spin)
-        adv_form.addRow("SNR定义:", self.snr_def_combo)
-        adv_form.addRow("径向系数:", self.radial_factor_spin)
-        adv_form.addRow("随机信道:", self.random_channel_check)
-        adv_form.addRow("种子:", self.seed_spin)
-        adv_form.addRow("相干帧/符号:", row2(self.coherence_frames_spin, self.fast_symbol_spin))
-        adv_layout = QVBoxLayout(adv_group)
-        adv_layout.setContentsMargins(8, 8, 8, 8)
-        adv_layout.addWidget(adv_container)
-        adv_group.toggled.connect(lambda on: adv_container.setVisible(on))
-        adv_container.setVisible(False)
+        # 高级参数模块已移除。搜索步长、随机种子和相干参数仍保留为内部配置，
+        # 由既有默认值驱动，避免破坏后端兼容性。
 
         # --- 自适应控制（左栏） ---
         self.adaptive_controls = AdaptiveControlBox()
 
         for group in (idx_group, frame_group, ch_group, self.adaptive_controls,
-                      quick_group, adv_group):
+                      quick_group):
             self.param_layout.addWidget(group)
     def _connect_fdidm_signals(self):
         self.btn_start.clicked.connect(self._on_start_clicked)
@@ -476,18 +479,31 @@ class FDIDMTab(BaseWaveformTab):
         self.ber_plot.setYRange(-6, 0, padding=0)
 
         self.ber_snr_plot.clear()
-        self.ber_snr_plot.setTitle("SER vs Eb/N0")
-        self.ber_snr_plot.setLabel("bottom", "Eb/N0", units="dB")
+        self.ber_snr_plot.setTitle("实时波形性能随时间变化")
+        self.ber_snr_plot.setLabel("bottom", "时间", units="s")
         self.ber_snr_plot.setLabel("left", "SER")
         self.ber_snr_plot.setLogMode(y=True)
-        self.ber_snr_plot.enableAutoRange(axis='y', enable=True)
-        self.ber_snr_plot.setXRange(min(self.SER_SNR_POINTS), max(self.SER_SNR_POINTS), padding=0)
+        # 固定视图范围：X 轴为滚动时间窗，Y 轴固定为 log10(SER)∈[-6,0]（1e-6~1），
+        # 关闭 auto-range，避免新增点导致坐标轴不断重算、画面抖动。
+        self.ber_snr_plot.setXRange(0.0, self.TIME_WINDOW_SEC, padding=0)
+        self.ber_snr_plot.setYRange(*self.SER_Y_RANGE, padding=0)
+        self.ber_snr_plot.enableAutoRange(axis="x", enable=False)
+        self.ber_snr_plot.enableAutoRange(axis="y", enable=False)
+        self.ber_snr_plot.addLegend(offset=(8, 8))
+        self._time_metric_curves = {}
+        self._time_switch_labels = []
+        self._time_switch_rendered = 0
+        self._time_plot_eval_count = -1
+        self._time_plot_x_view = None
+        self._time_plot_y_fit = None
 
     # ------------------------------------------------------------------
     # Backend construction and updates
     # ------------------------------------------------------------------
     def _selected_channel_dynamics(self):
         text = str(self.channel_dynamics_combo.currentText()) if hasattr(self, "channel_dynamics_combo") else "固定信道"
+        if "连续" in text or "多普勒" in text:
+            return "cont"
         if "快时变" in text:
             return "fast"
         if "动态" in text or "块" in text:
@@ -607,22 +623,52 @@ class FDIDMTab(BaseWaveformTab):
                 pass
 
     def _refresh_adaptive_panel(self):
-        """Poll backend adaptive status/history and repaint the panel."""
+        """Refresh live channel state and adaptive history.
+
+        The previous page returned early when adaptation was disabled, so it
+        could not display a changing channel.  This implementation always polls
+        channel/metric state and also synchronizes the visible alpha/beta values
+        after a real backend auto-apply event.
+        """
         tb = self.tb
         if tb is None:
             return
         try:
             status = tb.get_adaptive_status()
         except Exception:
-            return
-        if not bool(status.get("enabled", False)):
-            self.adaptive_plots.refresh(status, [])
-            return
+            status = {}
         try:
             history = tb.get_adaptive_history(limit=2000)
         except Exception:
             history = []
-        self.adaptive_plots.refresh(status, history)
+        try:
+            channel = tb.get_channel_summary()
+        except Exception:
+            channel = {}
+        try:
+            metrics = tb.get_last_metrics()
+        except Exception:
+            metrics = {}
+
+        current_a = status.get("current_alpha", metrics.get("alpha", np.nan))
+        current_b = status.get("current_beta", metrics.get("beta", np.nan))
+        try:
+            current_a = float(current_a)
+            current_b = float(current_b)
+            if np.isfinite(current_a) and np.isfinite(current_b):
+                if abs(self.alpha_spin.value() - current_a) > 1e-9:
+                    self.alpha_spin.blockSignals(True)
+                    self.alpha_spin.setValue(current_a)
+                if abs(self.beta_spin.value() - current_b) > 1e-9:
+                    self.beta_spin.blockSignals(True)
+                    self.beta_spin.setValue(current_b)
+        finally:
+            self.alpha_spin.blockSignals(False)
+            self.beta_spin.blockSignals(False)
+
+        link_state = self._build_realtime_link_state(status, channel, metrics)
+        self.adaptive_plots.refresh(status, history, link_state=link_state)
+        self._refresh_time_metric_plot(history)
 
     def _hot_update_from_ui(self, *args):
         self._best_alpha = None
@@ -676,7 +722,7 @@ class FDIDMTab(BaseWaveformTab):
                 fast_channel_coherence_symbols=int(self.fast_symbol_spin.value()),
             )
         self._update_channel_plot()
-        self.update_info_panel(status_text="已重新生成当前LEO星地信道。系统将自动搜索最优 α/β，并按左侧选择刷新左下角 α-SER 多β曲线，同时刷新右下角理论 SER-SNR 曲线。")
+        self.update_info_panel(status_text="已重新生成当前LEO星地信道。系统将自动搜索最优 α/β，并按左侧选择刷新左下角 α-SER 多β曲线，同时刷新自适应过程页的理论 SER-SNR 曲线。")
         self._schedule_auto_ser_snr("重新生成信道")
 
     def _set_indices_ui(self, a, b):
@@ -795,10 +841,14 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_beta_data.clear()
         self._ser_snr_curves.clear()
         self._ser_snr_data.clear()
-        self.ber_snr_plot.setTitle("Theory SER vs Eb/N0 (waiting for α*/β*)")
+        self.adaptive_plots.set_snr_title("SER-SNR 性能对比（等待动态参数搜索）")
 
         dyn_mode = str(base_kwargs.get("channel_dynamics", "fixed"))
-        dyn_note = "固定信道" if dyn_mode == "fixed" else ("动态块衰落" if dyn_mode == "block" else "帧内快时变")
+        dyn_note = (
+            "固定信道" if dyn_mode == "fixed"
+            else ("连续多普勒" if dyn_mode == "cont"
+                  else ("动态块衰落" if dyn_mode == "block" else "帧内快时变"))
+        )
         alpha_mode_label = self._alpha_curve_mode_label(alpha_curve_mode)
         alpha_curve_text = (
             f"左下角：Monte-Carlo 实测 {alpha_sweep_frames} 帧/αβ点，α步长0.1，β步长0.2共11条"
@@ -862,8 +912,8 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_active_token = int(token)
         self._snr_active_token = int(token)
 
-        self.ber_snr_plot.setTitle(
-            f"Theory SER vs Eb/N0 (α*={best_a:.1f}, β*={best_b:.1f}; drawing)"
+        self.adaptive_plots.set_snr_title(
+            "SER-SNR 性能对比（FDIDM 每个 SNR 点独立搜索 α/β）"
         )
 
         self._alpha_thread = threading.Thread(
@@ -926,36 +976,160 @@ class FDIDMTab(BaseWaveformTab):
             finish_reason = f"失败：{exc}"
         self._emit_signal_safe("alpha_beta_finished", token, finish_reason)
 
+    def _pick_sweep_channel_seed(self, base_kwargs: dict,
+                                 candidates: int = 8,
+                                 min_gain_db: float = 0.3) -> int:
+        """为 SER-SNR 对比图挑选一个能体现 FDIDM 增益的固定信道种子。
+
+        对比图要求每个 SNR 点信道条件完全相同（固定 H_tf、只有 SNR 变化）。
+        默认 seed 对应的信道可能恰好让 OFDM 最优，导致 FDIDM 与 OFDM 曲线完全
+        重合；这里用自适应快速目标（毫秒级）扫描少量候选种子，优先返回一个
+        分数索引相对 OFDM 有可见理论增益的实现，找不到时回退默认种子。
+        """
+        try:
+            from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
+            base_seed = int(base_kwargs.get("channel_seed", 42))
+            sweep_base = copy_kwargs_with(
+                base_kwargs, alpha=0.0, beta=0.0,
+                dynamic_channel=False, channel_dynamics="fixed",
+                random_channel=True,
+            )
+            tb = FDIDMTransceiver(**sweep_base)
+            b = tb._backend
+            for k in range(max(1, int(candidates))):
+                seed = int(base_seed + 104729 * k) % 2_147_483_647
+                seed = seed if seed > 0 else 1
+                b.regenerate_channel(seed=int(seed))
+                b._prepare_matrices_locked()
+                with b._lock:
+                    snap = {
+                        "M": int(b.config.m_subcarriers),
+                        "N": int(b.config.n_symbols),
+                        "htf": np.asarray(b._H_tf, dtype=np.complex128).copy(),
+                        "htf_kind": "full",
+                        "noise_var": float(b._noise_variance()),
+                        "equalizer": str(b.config.decoder),
+                        "mod_order": str(b.config.mod_order),
+                        "alpha": 0.0,
+                        "beta": 0.0,
+                        "coarse_step": 0.25,
+                        "fine_step": 0.05,
+                        "integer_margin_db": 0.0,
+                        "max_order": 512,
+                        "rcond": 1e-6,
+                        "frame_counter": 0,
+                        "snapshot_seq": int(k + 1),
+                    }
+                res = b._optimize_alpha_beta_snapshot(snap)
+                gain = float(res.get("predicted_improvement_db", 0.0))
+                if np.isfinite(gain) and gain >= float(min_gain_db):
+                    return int(seed)
+            return int(base_seed)
+        except Exception:
+            return int(base_kwargs.get("channel_seed", 42))
+
     def _theory_snr_worker(self, token: int, base_kwargs: dict, stop_event: threading.Event,
                            best_a: float, best_b: float):
-        """Worker 2: draw right-bottom theory/proxy SER-SNR curves."""
+        """Draw SNR-SER curves with one exact alpha/beta search per SNR.
+
+        The live simulation may use a changing channel, but one comparison sweep
+        must hold H_TF fixed so every waveform and every SNR point sees the same
+        physical channel (only SNR changes).
+        """
         finish_reason = "完成"
         try:
             from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
-            current_a = float(base_kwargs.get("alpha", 0.0))
-            current_b = float(base_kwargs.get("beta", 0.0))
-            raw_specs = [
-                ("2D-OFDM α=0,β=0", 0.0, 0.0),
-                ("OTFS α=1,β=1", 1.0, 1.0),
-                (f"当前 α={current_a:.1f},β={current_b:.1f}", current_a, current_b),
-                (f"理论最优 α={float(best_a):.1f},β={float(best_b):.1f}", float(best_a), float(best_b)),
+
+            sweep_kwargs = copy_kwargs_with(
+                base_kwargs,
+                dynamic_channel=False,
+                channel_dynamics="fixed",
+                random_channel=True,
+                # 对比图用固定信道，且每个 SNR 点信道条件完全相同；默认种子可能
+                # 恰好让 OFDM 最优导致 FDIDM 与 OFDM 重合，这里优先挑选一个能
+                # 体现分数索引理论增益的实现。
+                channel_seed=self._pick_sweep_channel_seed(base_kwargs),
+            )
+            references = [
+                ("OFDM", 0.0, 0.0),
+                ("OTFS", 1.0, 1.0),
+                # Current repository reference used for the AFDM baseline.
+                ("AFDM", 0.5, 1.0),
             ]
-            specs = merged_curve_specs(raw_specs)
-            for name, a, b in specs:
-                tb = FDIDMTransceiver(**copy_kwargs_with(base_kwargs, alpha=a, beta=b))
-                for snr in self.SER_SNR_POINTS:
-                    if stop_event.is_set() or token != self._auto_scan_token:
-                        finish_reason = "已停止"
-                        self._emit_signal_safe("ser_snr_finished", token, finish_reason)
-                        return
-                    item = tb.evaluate_theory_point(float(a), float(b), ebn0_db=float(snr))
+            previous_a = float(best_a)
+            previous_b = float(best_b)
+
+            for snr in self.SER_SNR_POINTS:
+                if stop_event.is_set() or token != self._auto_scan_token:
+                    finish_reason = "已停止"
+                    self._emit_signal_safe("ser_snr_finished", token, finish_reason)
+                    return
+
+                tb_model = FDIDMTransceiver(**copy_kwargs_with(
+                    sweep_kwargs, alpha=0.0, beta=0.0, snr_db=float(snr)
+                ))
+
+                for name, a, b in references:
+                    item = tb_model.evaluate_theory_point(float(a), float(b), ebn0_db=float(snr))
                     ser_raw = float(item.get("selected_theory_ser", item.get("zf_theory_ser", np.nan)))
-                    # No artificial display floor on the right-bottom theory plot.
-                    # Values that are non-positive due to numerical underflow are
-                    # passed as NaN and therefore not drawn on the log plot.
-                    ser = float(ser_raw) if np.isfinite(ser_raw) and ser_raw > 0 else float("nan")
-                    if not self._emit_signal_safe("ser_snr_point", token, name, float(snr), float(ser)):
+                    ser = ser_raw if np.isfinite(ser_raw) and ser_raw > 0 else float("nan")
+                    if not self._emit_signal_safe(
+                        "ser_snr_point", token, name, float(snr), float(ser),
+                        float(a), float(b),
+                    ):
                         return
+
+                result = tb_model.search_best_indices(
+                    step=float(base_kwargs.get("search_step", 0.1)),
+                    ebn0_db=float(snr),
+                    # Critical fix: without this argument, the backend optimizes
+                    # a multi-SNR window and can return the same pair at every x.
+                    objective_snr_points=[float(snr)],
+                    top_k=20,
+                    significance_threshold_percent=0.0,
+                    stop_event=stop_event,
+                )
+
+                candidates = []
+                for candidate in result.get("top_candidates", []) or []:
+                    try:
+                        c_ser = float(candidate.get(
+                            "ser_at_working_ebn0",
+                            candidate.get("zf_theory_ser", np.nan),
+                        ))
+                        c_a = float(candidate["alpha"])
+                        c_b = float(candidate["beta"])
+                    except Exception:
+                        continue
+                    if np.isfinite(c_ser) and c_ser >= 0:
+                        candidates.append((c_ser, c_a, c_b))
+
+                if candidates:
+                    exact_min = min(c[0] for c in candidates)
+                    tolerance = max(1e-15, abs(exact_min) * 1e-9)
+                    tied = [c for c in candidates if c[0] <= exact_min + tolerance]
+                    _, a_star, b_star = min(
+                        tied,
+                        key=lambda c: (
+                            (c[1] - previous_a) ** 2 + (c[2] - previous_b) ** 2,
+                            c[1],
+                            c[2],
+                        ),
+                    )
+                else:
+                    a_star = float(result.get("best_alpha", previous_a))
+                    b_star = float(result.get("best_beta", previous_b))
+
+                item = tb_model.evaluate_theory_point(a_star, b_star, ebn0_db=float(snr))
+                ser_raw = float(item.get("selected_theory_ser", item.get("zf_theory_ser", np.nan)))
+                ser = ser_raw if np.isfinite(ser_raw) and ser_raw > 0 else float("nan")
+                previous_a, previous_b = float(a_star), float(b_star)
+
+                if not self._emit_signal_safe(
+                    "ser_snr_point", token, "FDIDM", float(snr), float(ser),
+                    float(a_star), float(b_star),
+                ):
+                    return
         except Exception as exc:
             finish_reason = f"失败：{exc}"
         self._emit_signal_safe("ser_snr_finished", token, finish_reason)
@@ -983,17 +1157,10 @@ class FDIDMTab(BaseWaveformTab):
         self.ber_plot.setXRange(0.0, 2.0, padding=0)
 
     def _clear_ser_snr_plot(self):
-        self.ber_snr_plot.clear()
-        try:
-            self.ber_snr_plot.addLegend(offset=(8, 8))
-        except Exception:
-            pass
-        self.ber_snr_plot.setLogMode(y=True)
-        self.ber_snr_plot.setLabel("bottom", "Eb/N0", units="dB")
-        self.ber_snr_plot.setLabel("left", "Theory SER")
-        self.ber_snr_plot.setTitle("Theory SER vs Eb/N0")
-        self.ber_snr_plot.enableAutoRange(axis='y', enable=True)
-        self.ber_snr_plot.setXRange(min(self.SER_SNR_POINTS), max(self.SER_SNR_POINTS), padding=0)
+        """Clear only the adaptive-process SER-SNR chart."""
+        if hasattr(self, "adaptive_plots"):
+            self.adaptive_plots.clear_snr()
+
 
     def _on_qt_destroyed(self, *_args):
         """Stop background work when the Qt object is being destroyed."""
@@ -1067,9 +1234,6 @@ class FDIDMTab(BaseWaveformTab):
         self.btn_apply_best.setEnabled(True)
         self.update_info_panel(status_text=self._format_search_text(result))
         suffix = "显著" if result.get("significant", False) else "差异较弱"
-        self.ber_snr_plot.setTitle(
-            f"Theory SER vs Eb/N0 (α*={self._best_alpha:.1f}, β*={self._best_beta:.1f}, {suffix}; dual-thread drawing)"
-        )
         self._start_plot_workers_after_search(int(token), result)
 
     def _maybe_finish_auto_refresh(self, token: int, reason: str = "完成"):
@@ -1085,8 +1249,252 @@ class FDIDMTab(BaseWaveformTab):
         if self.status_text_label is not None:
             old = self.status_text_label.text()
             self.status_text_label.setText(
-                old + f"\n\n自动刷新{reason}：左下角α-SER与右下角理论SER-SNR采用独立线程绘制，曲线已按当前token更新。"
+                old + f"\n\n自动刷新{reason}：左下角α-SER与自适应过程页SER-SNR采用独立线程绘制，曲线已按当前token更新。"
             )
+
+    @staticmethod
+    def _weighted_path_statistics(channel):
+        """Calculate gain-weighted instantaneous delay/Doppler statistics."""
+        paths = list((channel or {}).get("paths", []) or [])
+        if not paths:
+            return {
+                "delay_mean_ns": float("nan"),
+                "delay_spread_ns": float("nan"),
+                "max_delay_ns": float("nan"),
+                "doppler_mean_hz": float("nan"),
+                "doppler_spread_hz": float("nan"),
+                "max_doppler_hz": float((channel or {}).get("max_doppler_hz", np.nan)),
+                "path_gain_power": float("nan"),
+            }
+
+        delays = np.asarray([float(p.get("delay_ns", 0.0)) for p in paths], dtype=float)
+        dopplers = np.asarray([float(p.get("doppler_hz", 0.0)) for p in paths], dtype=float)
+        gains = np.asarray([max(float(p.get("gain_abs", 0.0)), 0.0) for p in paths], dtype=float)
+        powers = gains * gains
+        power_sum = float(np.sum(powers))
+        if not np.isfinite(power_sum) or power_sum <= 1e-20:
+            weights = np.full(len(paths), 1.0 / max(len(paths), 1), dtype=float)
+            power_sum = float("nan")
+        else:
+            weights = powers / power_sum
+
+        delay_mean = float(np.sum(weights * delays))
+        doppler_mean = float(np.sum(weights * dopplers))
+        delay_rms = float(np.sqrt(max(np.sum(weights * (delays - delay_mean) ** 2), 0.0)))
+        doppler_rms = float(np.sqrt(max(np.sum(weights * (dopplers - doppler_mean) ** 2), 0.0)))
+        return {
+            "delay_mean_ns": delay_mean,
+            "delay_spread_ns": delay_rms,
+            "max_delay_ns": float(np.max(delays)),
+            "doppler_mean_hz": doppler_mean,
+            "doppler_spread_hz": doppler_rms,
+            "max_doppler_hz": float(np.max(np.abs(dopplers))),
+            "path_gain_power": power_sum,
+        }
+
+    def _build_realtime_link_state(self, adaptive_status, channel, metrics):
+        """Build current-frame state instead of repeating static configuration."""
+        channel = dict(channel or {})
+        metrics = dict(metrics or {})
+        adaptive_status = dict(adaptive_status or {})
+        path_stats = self._weighted_path_statistics(channel)
+
+        signal_power = float(metrics.get("avg_H_row_power", np.nan))
+        measured_noise = float(metrics.get("measured_noise_var", np.nan))
+        if (
+            np.isfinite(signal_power) and signal_power > 0
+            and np.isfinite(measured_noise) and measured_noise > 0
+        ):
+            effective_snr_db = 10.0 * np.log10(signal_power / measured_noise)
+        else:
+            effective_snr_db = float("nan")
+
+        return {
+            "configured_snr_db": float(metrics.get("ebn0_db", self.snr_spin.value())),
+            "effective_snr_db": float(effective_snr_db),
+            **path_stats,
+            "noise_power": float(metrics.get("noise_var", np.nan)),
+            "measured_noise_power": float(metrics.get("measured_noise_var", np.nan)),
+            "eq_noise_power": float(metrics.get("measured_eq_noise_var", np.nan)),
+            "expected_eq_noise_power": float(metrics.get("expected_eq_noise_var", np.nan)),
+            "evm_percent": float(metrics.get("evm_percent", np.nan)),
+            "condition_number": float(metrics.get("condition_number", np.nan)),
+            "channel_type": str(channel.get("channel_model", self.channel_combo.currentText())),
+            "channel_mode": str(self.channel_dynamics_combo.currentText()),
+            "channel_seed": int(channel.get(
+                "seed", metrics.get("channel_seed", self.seed_spin.value())
+            )),
+            "frame": int(metrics.get("frames", 0)),
+            "velocity_kmh": float(self.velocity_combo.currentText()),
+            "radial_projection": float(self.radial_factor_spin.value()),
+            "alpha": float(adaptive_status.get(
+                "current_alpha", metrics.get("alpha", self.alpha_spin.value())
+            )),
+            "beta": float(adaptive_status.get(
+                "current_beta", metrics.get("beta", self.beta_spin.value())
+            )),
+        }
+
+    def _refresh_time_metric_plot(self, history):
+        """Plot the actually active FDIDM pair, not the recommended lower bound.
+
+        视图稳定策略：
+          - X 轴为固定宽度滚动时间窗，右边界按整步长滑动，窗口未滑动时不重设，
+            避免新增点导致坐标轴不断重算；
+          - Y 轴保持固定范围，数据越界时只扩展、不收缩，消除"呼吸"式抖动；
+          - 仅在 eval/switch 条数变化时全量重绘，switch 标签只增量追加。
+        """
+        evals = [dict(h) for h in (history or []) if h.get("kind") == "eval"]
+        switches = [dict(h) for h in (history or []) if h.get("kind") == "switch"]
+        if not evals:
+            return
+
+        # 后端重建会清空历史：检测到条数回退时重置增量缓存。
+        if (len(evals) < self._time_plot_eval_count
+                or len(switches) < self._time_switch_rendered):
+            self._time_plot_eval_count = -1
+            self._time_switch_rendered = 0
+            self._time_plot_x_view = None
+            for item in self._time_switch_labels:
+                try:
+                    self.ber_snr_plot.removeItem(item)
+                except Exception:
+                    pass
+            self._time_switch_labels = []
+            for curve in self._time_metric_curves.values():
+                try:
+                    curve.setData([], [])
+                except Exception:
+                    pass
+
+        # 没有新数据时跳过重绘（自适应面板等其它区域仍正常刷新）。
+        if (len(evals) == self._time_plot_eval_count
+                and len(switches) == self._time_switch_rendered):
+            return
+
+        ts0 = min(float(h.get("ts", 0.0)) for h in evals)
+        x = np.asarray(
+            [max(0.0, float(h.get("ts", 0.0)) - ts0) for h in evals],
+            dtype=float,
+        )
+        series = {
+            "OFDM": [h.get("ser_ofdm", np.nan) for h in evals],
+            "OTFS": [h.get("ser_otfs", np.nan) for h in evals],
+            "AFDM": [h.get("ser_afdm", np.nan) for h in evals],
+            # ser_best is only a recommendation.  ser_current corresponds to the
+            # alpha/beta pair that was actually active in that CSI snapshot.
+            "FDIDM": [h.get("ser_current", np.nan) for h in evals],
+        }
+        styles = {
+            "OFDM": ((0, 114, 189), "o"),
+            "OTFS": ((217, 83, 25), "s"),
+            "AFDM": ((119, 172, 48), "t"),
+            "FDIDM": ((126, 47, 142), "d"),
+        }
+        self.ber_snr_plot.setTitle("实时性能随时间变化（FDIDM为当前已应用参数，3s滑动平均）")
+        smooth_n = 6
+        smoothed = {}
+        for name, values in series.items():
+            y = np.asarray([
+                float(v) if v is not None and np.isfinite(float(v)) and float(v) > 0
+                else np.nan
+                for v in values
+            ], dtype=float)
+            # 逐点抖动来自块边界/瞬时信道；显示上用尾部滑动平均呈现平稳趋势，
+            # 历史点不会因新点到来而漂移。
+            y = self._trailing_mean(y, smooth_n)
+            smoothed[name] = y
+            curve = self._time_metric_curves.get(name)
+            if curve is None:
+                color, symbol = styles[name]
+                pen = pg.mkPen(color, width=2.3 if name == "FDIDM" else 1.6)
+                curve = self.ber_snr_plot.plot(
+                    [], [], pen=pen, symbol=symbol, symbolSize=6,
+                    symbolPen=pen, symbolBrush="w", name=name,
+                )
+                self._time_metric_curves[name] = curve
+            curve.setData(x, y)
+
+        # X 轴：固定宽度滚动时间窗，右边界按整步长滑动。
+        window = float(self.TIME_WINDOW_SEC)
+        step = float(self.TIME_WINDOW_STEP_SEC)
+        t_max = float(x[-1]) if len(x) else 0.0
+        if t_max <= window:
+            view = (0.0, window)
+        else:
+            right = float(np.ceil(t_max / step) * step)
+            view = (right - window, right)
+        x_view_changed = (self._time_plot_x_view is None
+                          or abs(view[0] - self._time_plot_x_view[0]) > 1e-9
+                          or abs(view[1] - self._time_plot_x_view[1]) > 1e-9)
+        if x_view_changed:
+            self.ber_snr_plot.setXRange(*view, padding=0)
+            self._time_plot_x_view = view
+
+        # Y 轴：按当前时间窗内的可见数据自动拟合（带迟滞）。只在窗口滑动、首次渲染
+        # 或数据明显越界/视野远大于数据跨度时重设，避免逐点缩放抖动；同时把高 SER
+        # 场景下挤在顶部的几条线自动拉开，而不是固定在 1e-6~1 的宽范围里。
+        try:
+            mask = (x >= view[0]) & (x <= view[1])
+            valid = np.concatenate([np.asarray(y)[mask] for y in smoothed.values()])
+            valid = valid[np.isfinite(valid) & (valid > 0)]
+            if valid.size:
+                lo = float(np.log10(np.nanmin(valid)))
+                hi = float(np.log10(np.nanmax(valid)))
+                ymin, ymax = self.ber_snr_plot.viewRange()[1]
+                pad = 0.35
+                min_span = 0.6
+                fit_lo = lo - pad
+                fit_hi = hi + pad
+                if fit_hi - fit_lo < min_span:
+                    mid = 0.5 * (fit_lo + fit_hi)
+                    fit_lo = mid - 0.5 * min_span
+                    fit_hi = mid + 0.5 * min_span
+                fit_lo = max(fit_lo, self.SER_Y_EXPAND_CLAMP[0])
+                fit_hi = min(fit_hi, self.SER_Y_EXPAND_CLAMP[1])
+                data_span = hi - lo
+                view_span = max(ymax - ymin, 1e-9)
+                need_fit = (
+                    x_view_changed
+                    or self._time_plot_y_fit is None
+                    or lo < ymin - 0.5
+                    or hi > ymax + 0.5
+                    or data_span < 0.35 * view_span
+                )
+                if need_fit:
+                    self.ber_snr_plot.setYRange(fit_lo, fit_hi, padding=0)
+                    self._time_plot_y_fit = (fit_lo, fit_hi)
+        except Exception:
+            pass
+
+        # switch 标签只追加新条目，不复建历史标签，避免每 tick 闪烁。
+        for switch_index in range(self._time_switch_rendered, len(switches)):
+            sw = switches[switch_index]
+            t = max(0.0, float(sw.get("ts", ts0)) - ts0)
+            idx = int(np.argmin(np.abs(x - t))) if len(x) else 0
+            try:
+                y = float(smoothed["FDIDM"][idx])
+            except Exception:
+                y = float("nan")
+            if not np.isfinite(y) or y <= 0:
+                continue
+
+            # TextItem does not inherit PlotDataItem's log transform.
+            y_log = float(np.log10(max(y, 1e-300)))
+            anchor = (0.0, 1.15) if switch_index % 2 == 0 else (0.0, -0.15)
+            label = pg.TextItem(
+                text=f"({float(sw.get('to_alpha', 0.0)):g}, "
+                     f"{float(sw.get('to_beta', 0.0)):g})",
+                anchor=anchor,
+                color=(126, 47, 142),
+            )
+            label.setFont(QFont("Microsoft YaHei", 8))
+            label.setPos(t, y_log)
+            self.ber_snr_plot.addItem(label)
+            self._time_switch_labels.append(label)
+            self._time_switch_rendered = switch_index + 1
+
+        self._time_plot_eval_count = len(evals)
 
     def _format_search_text(self, r):
         """精简搜索结果文本，避免底部说明框过长影响可读性。"""
@@ -1106,7 +1514,7 @@ class FDIDMTab(BaseWaveformTab):
             f"信道：{ch.get('channel_model','--')}，seed={ch.get('seed','--')}，fDmax≈{ch.get('max_doppler_hz',0):.0f}Hz，νmax/Δf≈{float(norm_dop):.3f}，径向系数={ch.get('doppler_radial_factor',0):.2f}。",
             f"搜索目标：{r.get('objective','decoder-aware SER')}；SNR定义={r.get('snr_definition','Eb/N0')}；显著性={('显著' if r.get('significant', False) else '较弱')}。",
             f"几何均值SER：OFDM={ref_ser('OFDM(0,0)'):.2e}，OTFS={ref_ser('OTFS(1,1)'):.2e}，最优={ref_ser('理论最优'):.2e}。",
-            f"左下角：α-SER曲线，β=0:0.2:2共11条；SER<{floor:.2e}按floor连线显示；右下角：SER-SNR理论曲线使用原始正值，不再设置显示floor。",
+            f"左下角：α-SER曲线，β=0:0.2:2共11条；SER<{floor:.2e}按floor连线显示；自适应过程页：SER-SNR四波形对比；仿真图右下角：时间-SER四波形变化。",
             "说明：物理信道 H_tf 固定；α/β 只改变 H_eq=Rx_FDIT·H_tf·Tx_IFDIT 的等效表示。",
         ]
         note = str(r.get("significance_note", "")).strip()
@@ -1198,40 +1606,18 @@ class FDIDMTab(BaseWaveformTab):
         self.ber_plot.setTitle(f"{title} vs α for β=0:0.2:2 ({reason}, α step=0.1, display floor={floor:.2e})")
         self._maybe_finish_auto_refresh(int(token), str(reason))
 
-    def _on_ser_snr_point(self, token, name, snr, ser):
+    def _on_ser_snr_point(self, token, name, snr, ser, alpha, beta):
         if int(token) != int(self._auto_scan_token):
             return
-        if name not in self._ser_snr_curves:
-            pen, symbol = self._curve_style(name)
-            curve = self.ber_snr_plot.plot(
-                [], [],
-                pen=pen,
-                symbol=symbol,
-                symbolSize=7,
-                symbolPen=pen,
-                symbolBrush='w',
-                name=name,
-            )
-            self._ser_snr_curves[name] = curve
-            self._ser_snr_data[name] = ([], [])
-        x, y = self._ser_snr_data.setdefault(name, ([], []))
-        x.append(float(snr))
-        val = float(ser)
-        # Right-bottom plot no longer clips to a display floor.  Non-positive
-        # values cannot be displayed on a log axis, so they break the curve.
-        y.append(val if np.isfinite(val) and val > 0 else float("nan"))
-        order = np.argsort(np.asarray(x))
-        xx = np.asarray(x, dtype=float)[order]
-        yy = np.asarray(y, dtype=float)[order]
-        curve = self._ser_snr_curves.get(name)
-        if curve is not None:
-            curve.setData(xx, yy)
+        self.adaptive_plots.add_snr_point(
+            str(name), float(snr), float(ser), float(alpha), float(beta)
+        )
 
     def _on_ser_snr_finished(self, token, reason):
         if int(token) != int(self._auto_scan_token):
             return
         self._snr_active_token = None
-        self.ber_snr_plot.setTitle(f"Theory SER vs Eb/N0 ({reason}; no display floor)")
+        self.adaptive_plots.set_snr_title(f"SER-SNR 性能对比（{reason}）")
         self._maybe_finish_auto_refresh(int(token), str(reason))
 
     # ------------------------------------------------------------------
@@ -1246,6 +1632,7 @@ class FDIDMTab(BaseWaveformTab):
                 self.constellation_scatter.setData(x=np.real(const), y=np.imag(const))
             # The left-bottom plot is now the alpha sweep.  Do not overwrite it
             # with sliding SER during runtime refresh.
+            self._update_channel_plot()
             self._update_info_panel(running=True)
         except Exception:
             pass
@@ -1254,21 +1641,42 @@ class FDIDMTab(BaseWaveformTab):
         try:
             tb = self.tb if self.tb is not None else self._new_backend()
             summary = tb.get_channel_summary()
-            paths = summary.get("paths", [])
+            paths = list(summary.get("paths", []) or [])
             if not paths:
                 self.channel_scatter.setData([], [])
                 return
-            x = np.asarray([p["delay_ns"] for p in paths], dtype=float)
-            y = np.asarray([p["doppler_hz"] for p in paths], dtype=float)
-            # 为了让 delay-Doppler 路径图更像学术散点图，默认不再用圆圈大小编码路径增益。
-            # 路径增益仍在右下方“演示说明”文字区输出，避免大圆点遮挡坐标和误导视觉判断。
-            marker_size = 13.0
-            spots = [{"pos": (x[i], y[i]), "size": marker_size} for i in range(len(x))]
+
+            delays = np.asarray([float(p.get("delay_ns", 0.0)) for p in paths], dtype=float)
+            dopplers = np.asarray([float(p.get("doppler_hz", 0.0)) for p in paths], dtype=float)
+            gains = np.asarray([max(float(p.get("gain_abs", 0.0)), 0.0) for p in paths], dtype=float)
+            gain_max = float(np.max(gains)) if gains.size else 0.0
+            if gain_max > 1e-15:
+                sizes = 7.0 + 15.0 * np.sqrt(gains / gain_max)
+            else:
+                sizes = np.full(len(paths), 10.0, dtype=float)
+
+            spots = [
+                {
+                    "pos": (float(delays[i]), float(dopplers[i])),
+                    "size": float(sizes[i]),
+                    "data": {
+                        "path": int(paths[i].get("path", i)),
+                        "gain_abs": float(gains[i]),
+                    },
+                }
+                for i in range(len(paths))
+            ]
             self.channel_scatter.setData(spots)
+
+            try:
+                metrics = tb.get_last_metrics()
+            except Exception:
+                metrics = {}
+            mode = str(summary.get("channel_dynamics", self._selected_channel_dynamics()))
+            frame = int(metrics.get("frames", 0))
             self.spectrum_plot.setTitle(
-                f"LEO paths: {summary.get('channel_model')} seed={summary.get('seed')} "
-                f"v={summary.get('velocity_kms', summary.get('velocity_kmh', 0)/3600):.2f} km/s "
-                f"fD≈{summary.get('max_doppler_hz',0):.0f} Hz"
+                f"LEO Delay-Doppler：{summary.get('channel_model', '--')} / "
+                f"{mode}；seed={summary.get('seed', '--')}；frame={frame}"
             )
         except Exception:
             pass
@@ -1285,24 +1693,82 @@ class FDIDMTab(BaseWaveformTab):
             return f"{v:.{digits}e}"
         return f"{v:.{digits}f}"
 
+    @staticmethod
+    def _trailing_mean(y, n):
+        """尾部滑动平均：第 i 点只依赖 <=i 的数据，历史点不会随新点重算而漂移。"""
+        y = np.asarray(y, dtype=np.float64)
+        if n <= 1 or y.size <= 1:
+            return y
+        n = int(n)
+        cum = np.cumsum(np.where(np.isfinite(y), y, 0.0))
+        cnt = np.cumsum(np.isfinite(y))
+        out = np.full_like(y, np.nan)
+        for i in range(y.size):
+            j0 = max(0, i - n + 1)
+            s = cum[i] - (cum[j0 - 1] if j0 > 0 else 0.0)
+            c = cnt[i] - (cnt[j0 - 1] if j0 > 0 else 0)
+            if c > 0:
+                out[i] = s / float(c)
+        return out
+
     def _update_info_panel(self, running=False):
-        m = {}
+        metrics = {}
+        channel = {}
+        adaptive_status = {}
         if self.tb is not None:
             try:
-                m = self.tb.get_last_metrics()
+                metrics = self.tb.get_last_metrics()
             except Exception:
-                m = {}
-        alpha = float(self.alpha_spin.value())
-        beta = float(self.beta_spin.value())
-        status = "运行中" if running else "未启动"
+                metrics = {}
+            try:
+                channel = self.tb.get_channel_summary()
+            except Exception:
+                channel = {}
+            try:
+                adaptive_status = self.tb.get_adaptive_status()
+            except Exception:
+                adaptive_status = {}
+
+        state = self._build_realtime_link_state(adaptive_status, channel, metrics)
+        alpha = float(state.get("alpha", self.alpha_spin.value()))
+        beta = float(state.get("beta", self.beta_spin.value()))
+        running_text = "运行中" if running else "未启动"
+        if running and self._selected_channel_dynamics() == "fixed":
+            running_text += "（固定信道）"
+        elif running:
+            running_text += "（信道变化中）"
+
         self.update_info_panel(
             metrics={
-                "运行状态": status,
-                "Eb/N0": f"{self.snr_def_combo.currentText()}={self.snr_spin.value():.1f} dB",
-                "BER": f"cum={self._fmt(m.get('ber'))}, win={self._fmt(m.get('ber_window'))}",
-                "FER": self._fmt(m.get("fer")),
-                "同步度量": f"SERwin={self._fmt(m.get('ser'))}, SERth={self._fmt(m.get('selected_theory_ser', m.get('zf_theory_ser')))}",
-                "CFO估计": f"H_eq rowMax={self._fmt(m.get('row_norm_max'))}",
+                "运行状态": (
+                    f"{running_text}；frame={state.get('frame', 0)}；"
+                    f"seed={state.get('channel_seed', '--')}"
+                ),
+                "Eb/N0": (
+                    f"配置={self._fmt(state.get('configured_snr_db'))} dB；"
+                    f"有效={self._fmt(state.get('effective_snr_db'))} dB"
+                ),
+                # BER/FER rows are removed from the visible semantics; their
+                # generic slots are reused as separate channel-state rows.
+                "BER": (
+                    f"均值={self._fmt(state.get('doppler_mean_hz'))} Hz；"
+                    f"最大={self._fmt(state.get('max_doppler_hz'))} Hz"
+                ),
+                "FER": (
+                    f"均值={self._fmt(state.get('delay_mean_ns'))} ns；"
+                    f"RMS={self._fmt(state.get('delay_spread_ns'))} ns；"
+                    f"最大={self._fmt(state.get('max_delay_ns'))} ns"
+                ),
+                "同步度量": (
+                    f"RMS={self._fmt(state.get('doppler_spread_hz'))} Hz；"
+                    f"径向投影={self.radial_factor_spin.value():.2f}"
+                ),
+                "CFO估计": (
+                    f"目标={self._fmt(state.get('noise_power'))}；"
+                    f"实测={self._fmt(state.get('measured_noise_power'))}；"
+                    f"均衡后={self._fmt(state.get('eq_noise_power'))}；"
+                    f"{state.get('channel_type', '--')} / {state.get('channel_mode', '--')}"
+                ),
             },
             config={
                 "波形": "FDIDM Mode-A",
@@ -1310,13 +1776,17 @@ class FDIDMTab(BaseWaveformTab):
                 "调制": self.mod_combo.currentText(),
                 "采样率": f"{self.m_spin.value()*self.scs_spin.value()/1000:.2f} MHz",
                 "数据符号": f"{self.m_spin.value()*self.n_spin.value()}",
-                "星座观察": f"α={alpha:.1f}, β={beta:.1f}; v={float(self.velocity_combo.currentText())/3600:.2f} km/s；径向={self.radial_factor_spin.value():.2f}；信道={self.channel_dynamics_combo.currentText()}",
+                "星座观察": (
+                    f"当前α/β=({alpha:g}, {beta:g})；"
+                    f"v={float(self.velocity_combo.currentText())/3600:.2f} km/s"
+                ),
             },
         )
         if not running and self.status_text_label is not None and not self._last_search_result:
             self.status_text_label.setText(
-                "模式A：自动搜索 α*/β*，左下角显示 α-SER 多β曲线，右下角显示理论 SER-SNR 对比。\n"
-                "多普勒仅由速度、径向系数和载频计算；α-SER显示下界=3/(MC帧数×M×N)，右下角SER-SNR不再使用显示floor。"
+                "模式A：动态块衰落默认开启。实时链路状态按帧显示有效SNR、"
+                "增益加权多普勒、时延扩展、实测噪声和当前信道seed。\n"
+                "时间图中的FDIDM使用当前已应用α/β的SER；只有真实switch事件才标注参数。"
             )
 
     def closeEvent(self, event):

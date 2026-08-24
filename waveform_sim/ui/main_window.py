@@ -18,7 +18,7 @@ def _optional_tab(import_path: str, class_name: str):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FDIDM软波形自适应演示平台 v2.2-ui-refined")
+        self.setWindowTitle("FDIDM软波形自适应演示平台 v2.3")
         self.setGeometry(80, 60, 1400, 900)
         self.setMinimumSize(1100, 700)
         self._init_ui()
@@ -29,16 +29,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(4, 4, 4, 4)
-
         self.tabs = QTabWidget()
         self.tabs.setMovable(False)
         self.tabs.setTabsClosable(False)
         layout.addWidget(self.tabs)
 
         self.fdidm_tab = FDIDMTab()
-        self.tabs.addTab(self.fdidm_tab, "FDIDM软波形自适应")
+        self.tabs.addTab(self.fdidm_tab, "软波形仿真")
 
-        # Optional tabs are kept for compatibility with the user's larger project.
         optional = [
             ("ui.ofdm_tab", "OfdmTab", "OFDM波形仿真"),
             ("ui.otfs_tab", "OTFSTab", "OTFS波形仿真"),
@@ -55,7 +53,7 @@ class MainWindow(QMainWindow):
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("系统就绪：FDIDM模式A")
+        self.status_bar.showMessage("系统就绪：软波形仿真")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _init_menu(self):
