@@ -4,11 +4,25 @@
 
 ## 核心能力
 
-- 四种波形（FDIDM / OFDM / OTFS / AFDM）软件仿真、统一引擎 `LinkSimulator` 与 Monte-Carlo 性能对比扫描
+- 四种波形（FDIDM / OFDM / OTFS / AFDM）软件仿真：统一引擎 `LinkSimulator` + Monte-Carlo 性能对比扫描
 - USRP B210（N210 / X310）硬件链路测试与 RF 安全保护
-- FDIDM α/β 预测式自适应闭环：硬件侧（`fdidm_hardtest.py`）与仿真侧（`simulation/fdidm_adaptive.py`）均实现“CSI 快照 → 理论 SER 搜索 → 稳定判定 → 冷却 → 自动应用”
-- FDIDM 仿真页自适应过程可视化：α/β 轨迹、预测 SER 对比、切换标记、状态文本
+- FDIDM α/β 预测式自适应闭环：硬件侧（`hardware/fdidm_hardtest.py`）与仿真侧（`simulation/fdidm_adaptive.py`）均实现“CSI 快照 → 理论 SER 搜索 → 稳定判定 → 冷却 → 自动应用”
+- FDIDM 仿真页自适应过程可视化：α/β 轨迹、预测 SER 对比、切换标注、状态文本
+- 时变信道模型（仿真页可切换，详见下文）：固定信道 / 动态块衰落 / 帧内快时变 / 连续多普勒
+- 仿真图右下角“实时性能随时间变化”图：固定滚动时间窗、Y 轴按可见数据自动拟合、3 s 滑动平均、增量刷新
+- 自适应过程页 SER-SNR 对比图：固定信道、每个 SNR 点信道条件完全相同（只有 SNR 变化），并自动挑选能体现 FDIDM 理论增益的信道实现
 - 工程化：统一配置、统一引擎、实验 artifact + JSONL 事件日志、诊断脚本、行为基线测试与 CI
+
+## 时变信道模式
+
+FDIDM 仿真页“时变模式”下拉提供四种信道演化方式，参数基于真实 LEO 星地链路（3GPP TR 38.811）：
+
+- **固定信道**：整个运行期间保持同一 H_TF。
+- **动态块衰落**：路径表（时延/幅度/多普勒）固定，每个相干块对路径相位做一次均值回归（AR(1)）小幅游走；相邻块信道相关，SER 随时间平稳变化而不是独立跳变。
+- **帧内快时变**：每帧重新生成信道实现，并在帧内符号间做 AR(1) 增益演化。
+- **连续多普勒**：按各径真实多普勒逐帧旋转路径相位 exp(j2π·fD·T_frame)，信道连续演化、种子不变、可复现。
+
+参考量级：LEO 轨道速度约 7.8 km/s（28080 km/h）；20 GHz 载频下最大多普勒约 ±480 kHz、多普勒变化率可达 −5.44 kHz/s；默认径向系数 0.10 对应约 52 kHz 残余多普勒，此时相干时间仅数微秒——信道在帧级尺度上变化很快是物理事实，演示页用上述模式分别展示慢变/快变场景。
 
 ## 目录结构
 
@@ -29,7 +43,9 @@ waveform_sim/
     stream.py / channel.py / fec.py / gr_flow.py / fdidm_adaptive.py
   service/                      # 实验记录：experiment_service / artifact_writer / event_logger / run_state
   diagnostics/                  # health_check / report_exporter / snapshot
-  ui/                           # GUI 页签 + 公共组件（base_waveform_tab、plot_widgets、workers、ui_utils、fdidm_adaptive_widgets）
+  ui/                           # GUI 页签与公共组件
+    main_window.py / fdidm_tab.py / fdidm_plot_widgets.py
+    fdidm_adaptive_widgets.py / base_waveform_tab.py / compare_workers.py / ui_utils.py
 markdown/                       # 重构与自适应 spec/plan/task/checklist、REFACTOR_CHECKLIST、TODO
 scripts/                        # check_environment / check_usrp / run_self_test
 tests/                          # pytest 行为基线 / 回归测试
@@ -53,10 +69,13 @@ python scripts/run_self_test.py       # FDIDM 自检（出帧 + 实验 artifact�
 python -m pytest -q                   # 行为基线 / 回归测试
 ```
 
+## 测试
+
+当前行为基线 88 个用例，覆盖统一引擎、波形变换、服务层、硬件抽象与 FDIDM 仿真自适应（含信道块推进、连续多普勒、并发参数修改、时间图平滑、SER-SNR 固定信道对比等回归场景）。CI（`.github/workflows/ci.yml`）仅安装 NumPy + pytest，UI 用例自动跳过，后端用例全部运行。
+
 ## 文档
 
 `markdown/` 下包含工程化重构流程文档与 FDIDM 仿真侧自适应文档：
-
 - `06_platform_refactor_spec.md`：重构需求与验收标准
 - `07_platform_refactor_plan.md`：重构架构与分阶段实施计划
 - `08_platform_refactor_task_phase0_1.md` / `09_platform_refactor_checklist_phase0_1.md`：阶段 0~1 任务清单与验收清单
