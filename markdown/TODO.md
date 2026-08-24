@@ -8,7 +8,7 @@
 **背景**：目前只有 FDIDM 硬件链路有一套 α/β 预测式自适应（`waveform_sim/hardware/fdidm_hardtest.py`），软件仿真和其他波形都没有统一的自适应方案，导致波形间对比缺少“各自在最优参数下”的公平性。
 
 - [ ] TODO: 明确“自适应”的分层定义：波形指数级（α/β 等）与链路级（调制阶数、编码率、功率）自适应
-- [x] TODO: 软件仿真侧 FDIDM 预测式自适应——`waveform_sim/simulation/fdidm_adaptive.py` 实现“CSI 快照 → 理论 SER 搜索 → 稳定判定 → 冷却 → 自动应用”闭环，仿真页新增“自适应过程”面板（α/β 轨迹、预测 SER 对比、切换标记、状态文本），详见 `32~35_fdidm_sim_adaptive_*`
+- [x] TODO: 软件仿真侧 FDIDM 预测式自适应——`waveform_sim/simulation/fdidm_adaptive.py` 实现“CSI 快照 → 理论 SER 搜索 → 稳定判定 → 冷却 → 自动应用”闭环，仿真页新增“自适应过程”面板（α/β 轨迹、预测 SER 对比、切换标记、状态文本）
 - [ ] TODO: 为 OFDM / OTFS / AFDM 仿真后端补齐等效的基于 CSI 的自适应能力
 - [ ] TODO: 把 FDIDM 硬件现有的 α/β 预测优化抽象为通用接口，供其他波形复用
 - [ ] TODO: 硬件侧为 OFDM / OTFS / AFDM 补齐等效的自适应能力

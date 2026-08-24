@@ -46,7 +46,7 @@ waveform_sim/
   ui/                           # GUI 页签与公共组件
     main_window.py / fdidm_tab.py / fdidm_plot_widgets.py
     fdidm_adaptive_widgets.py / base_waveform_tab.py / compare_workers.py / ui_utils.py
-markdown/                       # 重构与自适应 spec/plan/task/checklist、REFACTOR_CHECKLIST、TODO
+markdown/                       # 状态/待办文档（REFACTOR_CHECKLIST、TODO）
 scripts/                        # check_environment / check_usrp / run_self_test
 tests/                          # pytest 行为基线 / 回归测试
 .github/workflows/ci.yml        # 纯 Python 核心 CI
@@ -75,9 +75,6 @@ python -m pytest -q                   # 行为基线 / 回归测试
 
 ## 文档
 
-`markdown/` 下包含工程化重构流程文档与 FDIDM 仿真侧自适应文档：
-- `06_platform_refactor_spec.md`：重构需求与验收标准
-- `07_platform_refactor_plan.md`：重构架构与分阶段实施计划
+`markdown/` 下保留持续维护的状态文档：
 - `REFACTOR_CHECKLIST.md`：重构对照清单（阶段完成状态）
 - `TODO.md`：平台待办清单（自适应、对比展示、架构优化）
-- `32_fdidm_sim_adaptive_spec.md` / `33_fdidm_sim_adaptive_plan.md` / `34_fdidm_sim_adaptive_task.md` / `35_fdidm_sim_adaptive_checklist.md`：FDIDM 仿真侧预测式自适应（spec/plan/task/checklist）

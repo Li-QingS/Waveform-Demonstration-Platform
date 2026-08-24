@@ -42,7 +42,6 @@
 
 - 后端：`waveform_sim/simulation/fdidm_adaptive.py`（`FDIDMSimAdaptiveMixin` + 粗搜/细搜内核，收敛在仿真后端，兼容壳经 `__getattr__` 透传）
 - UI：`waveform_sim/ui/fdidm_adaptive_widgets.py`（α/β 轨迹、预测 SER 对比、切换标记、状态文本、控制区）
-- 流程文档：`markdown/32_fdidm_sim_adaptive_spec.md` ~ `35_fdidm_sim_adaptive_checklist.md`
 - 测试：`tests/test_fdidm_sim_adaptive.py`（搜索内核、决策策略、并发安全、端到端场景）
 
 ## 当前工程结构
