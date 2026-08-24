@@ -78,8 +78,6 @@ python -m pytest -q                   # 行为基线 / 回归测试
 `markdown/` 下包含工程化重构流程文档与 FDIDM 仿真侧自适应文档：
 - `06_platform_refactor_spec.md`：重构需求与验收标准
 - `07_platform_refactor_plan.md`：重构架构与分阶段实施计划
-- `08_platform_refactor_task_phase0_1.md` / `09_platform_refactor_checklist_phase0_1.md`：阶段 0~1 任务清单与验收清单
-- `10_platform_refactor_task_phase2.md` ~ `31_platform_refactor_checklist_phase10.md`：阶段 2~10 任务清单与验收清单
 - `REFACTOR_CHECKLIST.md`：重构对照清单（阶段完成状态）
 - `TODO.md`：平台待办清单（自适应、对比展示、架构优化）
 - `32_fdidm_sim_adaptive_spec.md` / `33_fdidm_sim_adaptive_plan.md` / `34_fdidm_sim_adaptive_task.md` / `35_fdidm_sim_adaptive_checklist.md`：FDIDM 仿真侧预测式自适应（spec/plan/task/checklist）
