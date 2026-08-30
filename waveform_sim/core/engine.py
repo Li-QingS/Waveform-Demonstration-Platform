@@ -1,8 +1,9 @@
-"""统一链路引擎（阶段 3）。
+"""Unified link-simulator facade.
 
-LinkSimulator 提供统一的配置、生命周期、指标、绘图与自适应入口；
-FDIDM 后端当前为过渡包装（委托 waveform_sim.simulation.simple_fdidm_rx
-的 _LegacyFDIDMTransceiver），后续阶段将算法逐步内聚到 core。
+``LinkSimulator`` preserves the public API used by the existing UI while routing
+waveform-specific work to the project's OFDM/OTFS/AFDM/FDIDM backends.  The
+FDIDM backend additionally exposes the upgraded NTN channel and dual-timescale
+adaptive controller.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ _ALIASES = {
     "doppler_spread": "doppler_spread_hz",
     "doppler_freq": "doppler_spread_hz",
     "doppler_hz": "doppler_spread_hz",
+    "residual_doppler_hz": "residual_doppler_spread_hz",
     "sample_rate": "sample_rate_hz",
 }
 
@@ -67,7 +69,7 @@ class LinkSimulator:
     # ------------------------------------------------------------ backend
     def _create_backend(self):
         if self.config.waveform == "FDIDM":
-            # 阶段3过渡依赖：后续阶段将算法内聚进 core 后移除
+            # Keep the established FDIDM backend behind the unified facade.
             from waveform_sim.simulation.simple_fdidm_rx import _create_fdidm_backend
 
             return _create_fdidm_backend(**self._fdidm_legacy_kwargs())
@@ -97,8 +99,11 @@ class LinkSimulator:
             subcarrier_spacing_hz=float(c.subcarrier_spacing_hz),
             mod_order=str(c.mod_order),
             channel_model=str(c.channel_model),
+            ntn_profile=str(c.ntn_profile),
             velocity_kmh=float(c.velocity_kmh),
             doppler_radial_factor=float(c.doppler_radial_factor),
+            residual_doppler_spread_hz=float(c.residual_doppler_spread_hz),
+            doppler_compensation_ratio=float(c.doppler_compensation_ratio),
             decoder=str(c.detector),
             snr_db=float(c.snr_db),
             snr_definition=str(c.snr_definition),
@@ -116,6 +121,7 @@ class LinkSimulator:
             circular_channel=bool(c.circular_channel),
             tf_notch_depth_db=float(c.tf_notch_depth_db),
             tf_notch_count=int(c.tf_notch_count),
+            demo_frame_interval_s=float(c.demo_frame_interval_s),
         )
 
     def _ofdm_legacy_kwargs(self) -> Dict:
@@ -248,18 +254,21 @@ class LinkSimulator:
         callback: Optional[Callable] = None,
         **cfg,
     ) -> None:
+        """Start dual-timescale adaptation with one canonical configuration path.
+
+        Explicit keyword arguments still win, preserving the legacy UI/backend API.
+        """
         if config is not None:
             self.adaptive_config = config.normalized()
+            self.experiment_config.adaptive = self.adaptive_config
         backend = self._backend
         fn = getattr(backend, "start_adaptive_tuning", None)
         if fn is not None:
-            kwargs = dict(cfg)
+            kwargs = self.adaptive_config.to_backend_kwargs()
+            kwargs.update(dict(cfg))
             if callback is not None:
                 kwargs["callback"] = callback
-            if kwargs:
-                fn(**kwargs)
-            else:
-                fn()
+            fn(**kwargs)
             return
         if hasattr(backend, "search_best_indices"):
             def worker():

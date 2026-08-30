@@ -18,7 +18,7 @@ def _optional_tab(import_path: str, class_name: str):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FDIDM软波形自适应演示平台 v2.3")
+        self.setWindowTitle("FDIDM软波形自适应演示平台 v6.0")
         self.setGeometry(80, 60, 1400, 900)
         self.setMinimumSize(1100, 700)
         self._init_ui()

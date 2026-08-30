@@ -126,7 +126,8 @@ def test_closed_loop_auto_apply_disabled():
     initial = (float(tb.config.alpha), float(tb.config.beta))
     tb.start_adaptive_tuning(interval_frames=1, stability_evals=1,
                              min_improvement_db=0.0, auto_apply=False,
-                             cooldown_frames=0)
+                             cooldown_frames=0, window_frames=2,
+                             ensemble_snapshots=2)
     _run_frames(tb, 25)
     status = tb.get_adaptive_status()
     assert status["recommendation_seq"] >= 1
@@ -323,15 +324,23 @@ def test_block_mode_evolution_is_correlated_not_jumpy():
                        dynamic_channel=True, channel_dynamics="block",
                        channel_coherence_frames=8)
     b = tb
+    channels = []
     vals = []
     for _ in range(12):
         for _ in range(8):
             b.step()
         with b._lock:
             b._prepare_matrices_locked()
-            ser = b._zf_theory_ser_for_channel(b._H_cross.copy(), ebn0_db=10.0)[0]
+            channel = b._H_cross.copy()
+            channels.append(channel)
+            ser = b._zf_theory_ser_for_channel(channel, ebn0_db=10.0)[0]
         vals.append(float(ser))
-    d = np.abs(np.diff(np.log10(np.maximum(vals, 1e-12))))
+    assert np.all(np.isfinite(vals))
+    d = 1.0 - np.asarray([
+        abs(np.vdot(left, right))
+        / max(float(np.linalg.norm(left) * np.linalg.norm(right)), 1e-15)
+        for left, right in zip(channels, channels[1:])
+    ])
     assert np.median(d) < 0.2, "相邻块 SER 跳变过大"
     assert d.max() < 0.7, "存在异常大的逐块 SER 跳变"
     tb.stop_adaptive_tuning()
@@ -348,7 +357,8 @@ def test_engine_passthrough():
     assert st["enabled"] is False
     sim.step()
     sim.start_adaptive_tuning(interval_frames=1, stability_evals=1,
-                              min_improvement_db=0.0, auto_apply=False)
+                              min_improvement_db=0.0, auto_apply=False,
+                              window_frames=2, ensemble_snapshots=2)
     _run_frames(sim, 8)
     assert sim.get_adaptive_status()["recommendation_seq"] >= 1
     assert len(sim.get_adaptive_history()) >= 1

@@ -8,6 +8,7 @@ import threading
 import time
 import zlib
 from collections import deque
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
@@ -16,6 +17,11 @@ from .stream import SampleRing as _SampleRing
 from .channel import NTNTDLChannel as _NTNTDLChannel
 from .fec import FECMixin
 from .fdidm_adaptive import FDIDMAdaptiveMixin
+
+
+def project_log_directory() -> Path:
+    """Return the repository-local directory used for FDIDM log exports."""
+    return Path(__file__).resolve().parents[2] / "log"
 
 
 class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
@@ -404,6 +410,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._adaptive_ab_stable_key = None
         self._adaptive_ab_stable_count = 0
         self._adaptive_ab_recommendation: Dict[str, Any] = {}
+        self._adaptive_ab_last_skip_reason = ""
+        self._adaptive_ab_last_skip_log_wall = 0.0
 
         self._set_tx_text_internal(tx_text)
         self._build_top_block()
@@ -3854,14 +3862,25 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
     def export_debug_log(self, path: Optional[str] = None, max_entries: int = 2000, min_level: str = "DEBUG") -> str:
         """Write recent backend diagnostics to a text file and return the path."""
+        log_dir = project_log_directory()
+        log_dir.mkdir(parents=True, exist_ok=True)
         if path is None or str(path).strip() == "":
             ts = time.strftime("%Y%m%d_%H%M%S")
-            path = f"fdidm_debug_{ts}.log"
+            path = log_dir / f"fdidm_debug_{ts}.log"
+        else:
+            requested = Path(str(path)).expanduser()
+            # Relative names and the historical repository-root default belong
+            # in log/. Preserve an explicitly selected external directory.
+            if not requested.is_absolute() or requested.parent.resolve() == log_dir.parent.resolve():
+                path = log_dir / requested.name
+            else:
+                path = requested
         entries = self.get_debug_log(max_entries=max_entries, min_level=min_level)
-        with open(str(path), "w", encoding="utf-8") as f:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(path).open("w", encoding="utf-8") as f:
             for e in entries:
                 f.write(f"{e['seq']:06d} {e['t']:10.3f}s {e['level']:<5} {e['msg']}\n")
-        return str(path)
+        return str(Path(path).resolve())
 
     def _debug(self, level: str, msg: str):
 

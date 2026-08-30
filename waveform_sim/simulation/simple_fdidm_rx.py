@@ -30,6 +30,16 @@ import numpy as np
 
 from waveform_sim.core.engine import LinkSimulator
 from waveform_sim.simulation.fdidm_adaptive import FDIDMSimAdaptiveMixin
+from waveform_sim.simulation.leo_ntn_channel import (
+    absolute_doppler_shift_hz,
+    coherence_time_s,
+    get_profile,
+    normalize_profile_name,
+    normalized_doppler,
+    residual_common_cfo_hz,
+    sample_path_dopplers,
+    weighted_mean_and_rms,
+)
 
 C_LIGHT = 299_792_458.0
 DEFAULT_FC_HZ = 20e9
@@ -43,13 +53,20 @@ class FDIDMConfig:
     n_symbols: int = 8
     subcarrier_spacing_hz: float = 300e3
     mod_order: str = "16QAM"
-    channel_model: str = "TDL-C"
+    # 3GPP NR-NTN SISO conformance profile.  `channel_model` is retained as a
+    # compatibility alias because older UI/config files use that name.
+    channel_model: str = "NTN-TDLA100-200"
+    ntn_profile: str = "NTN-TDLA100-200"
     # Unit: km/h. LEO 7.8 km/s = 28080 km/h.
     velocity_kmh: float = 28080.0
-    # Use only the radial projection of orbital velocity.  A factor around
-    # 0.09~0.10 gives paper-like tens-of-kHz Doppler at Ka band instead of
-    # unrealistically using the full orbital speed as radial velocity.
+    # Projection of orbital velocity on the propagation direction.  It controls
+    # the predictable large common satellite Doppler shift, not fading spread.
     doppler_radial_factor: float = 0.10
+    # The common orbital shift is assumed to be predicted/pre-compensated.  The
+    # remaining multipath time selectivity is represented by the standardized
+    # residual maximum Doppler (200 Hz or 1200 Hz in the included profiles).
+    residual_doppler_spread_hz: float = 200.0
+    doppler_compensation_ratio: float = 0.999
     decoder: str = "ZF"
     ebn0_db: float = 8.0
     # "Eb/N0" keeps the old GUI semantics; "Es/N0" is closer to the SER
@@ -78,6 +95,9 @@ class FDIDMConfig:
     circular_channel: bool = True
     tf_notch_depth_db: float = 0.0
     tf_notch_count: int = 0
+    # Wall-clock pacing for the GUI demo only.  Physical channel time is derived
+    # from N/Delta-f and remains independent of this display pacing value.
+    demo_frame_interval_s: float = 0.02
 
 
 class _MetricTracker:
@@ -186,9 +206,12 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         n_symbols: int = 8,
         subcarrier_spacing_hz: float = 300e3,
         mod_order: str = "16QAM",
-        channel_model: str = "TDL-C",
+        channel_model: str = "NTN-TDLA100-200",
+        ntn_profile: Optional[str] = None,
         velocity_kmh: float = 28080.0,
         doppler_radial_factor: float = 0.10,
+        residual_doppler_spread_hz: float = 200.0,
+        doppler_compensation_ratio: float = 0.999,
         decoder: str = "ZF",
         snr_db: float = 8.0,
         snr_definition: str = "Eb/N0",
@@ -206,6 +229,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         circular_channel: bool = True,
         tf_notch_depth_db: float = 0.0,
         tf_notch_count: int = 0,
+        demo_frame_interval_s: float = 0.02,
     ):
         super().__init__(daemon=True)
         channel_dynamics = str(channel_dynamics or ("block" if dynamic_channel else "fixed")).lower()
@@ -214,6 +238,11 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         if channel_dynamics == "fixed" and dynamic_channel:
             channel_dynamics = "block"
         dynamic_channel = bool(channel_dynamics in ("block", "fast", "cont"))
+        profile_name = normalize_profile_name(ntn_profile or channel_model)
+        profile = get_profile(profile_name)
+        residual_spread = float(residual_doppler_spread_hz)
+        if not np.isfinite(residual_spread) or residual_spread <= 0.0:
+            residual_spread = float(profile.maximum_doppler_hz)
         self.config = FDIDMConfig(
             alpha=float(alpha),
             beta=float(beta),
@@ -221,9 +250,12 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             n_symbols=int(n_symbols),
             subcarrier_spacing_hz=float(subcarrier_spacing_hz),
             mod_order=str(mod_order).upper(),
-            channel_model=str(channel_model).upper().replace("_", "-"),
+            channel_model=profile_name,
+            ntn_profile=profile_name,
             velocity_kmh=float(velocity_kmh),
             doppler_radial_factor=float(np.clip(float(doppler_radial_factor), 0.0, 1.0)),
+            residual_doppler_spread_hz=float(max(0.0, residual_spread)),
+            doppler_compensation_ratio=float(np.clip(float(doppler_compensation_ratio), 0.0, 1.0)),
             decoder=str(decoder).upper(),
             ebn0_db=float(snr_db),
             snr_definition=str(snr_definition or "Eb/N0"),
@@ -241,6 +273,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             circular_channel=bool(circular_channel),
             tf_notch_depth_db=float(tf_notch_depth_db),
             tf_notch_count=int(tf_notch_count),
+            demo_frame_interval_s=float(max(0.0, demo_frame_interval_s)),
         )
         self._lock = threading.RLock()
         self._init_adaptive_state_locked()
@@ -276,6 +309,13 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         self._score = {}
         self._debug = {}
         self._last_metrics = self._empty_metrics()
+        # Physical-channel evolution indicators used by the live status panel.
+        # They are computed from H_TF, so an alpha/beta change is not mistaken for
+        # a physical channel change.
+        self._previous_h_tf_for_state = None
+        self._channel_matrix_change_norm = float("nan")
+        self._channel_matrix_correlation = float("nan")
+        self._channel_power_db = float("nan")
         self._dynamic_base_seed = int(self.config.channel_seed)
         self._last_dynamic_block = None
         # 单调递增的仿真帧号：只随 _simulate_one_frame 增长，不随参数更新/BER 统计重置。
@@ -326,7 +366,12 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     def run(self):
         while not self._stop_event.is_set():
             self._simulate_one_frame()
-            time.sleep(0.08)
+            # This is GUI pacing, not physical frame duration.  Curves are
+            # separately resampled, therefore a faster simulation no longer
+            # floods the time plot with points.
+            delay = float(max(0.0, getattr(self.config, "demo_frame_interval_s", 0.02)))
+            if delay > 0.0:
+                time.sleep(delay)
 
     def step(self):
         """单帧仿真（供统一引擎调用）。"""
@@ -335,8 +380,32 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     # ----------------------------- config API -----------------------------
     def _apply_config_update(self, **kwargs):
         old = self.config
+        updates = dict(kwargs)
+        # Normalize public/legacy aliases before constructing the frozen dataclass.
+        # Unknown fields are intentionally ignored so LinkSimulator callers can
+        # share one update dictionary across different waveform backends.
+        aliases = {
+            "snr_db": "ebn0_db",
+            "modulation": "mod_order",
+            "detector": "decoder",
+            "center_freq_hz": "fc_hz",
+            "seed": "channel_seed",
+            "residual_doppler_hz": "residual_doppler_spread_hz",
+            "doppler_spread_hz": "residual_doppler_spread_hz",
+            "max_doppler_hz": "residual_doppler_spread_hz",
+        }
+        for source, target in aliases.items():
+            if source in updates and target not in updates:
+                updates[target] = updates[source]
+        profile_was_explicit = "ntn_profile" in updates or "channel_model" in updates
+        if "ntn_profile" not in updates and "channel_model" in updates:
+            updates["ntn_profile"] = updates["channel_model"]
+        if "channel_model" not in updates and "ntn_profile" in updates:
+            updates["channel_model"] = updates["ntn_profile"]
+        allowed = set(FDIDMConfig.__dataclass_fields__)
+        updates = {key: value for key, value in updates.items() if key in allowed}
         data = old.__dict__.copy()
-        data.update(kwargs)
+        data.update(updates)
         data["alpha"] = float(np.clip(float(data.get("alpha", old.alpha)), 0.0, 2.0))
         data["beta"] = float(np.clip(float(data.get("beta", old.beta)), 0.0, 2.0))
         data["m_subcarriers"] = int(max(2, int(data.get("m_subcarriers", old.m_subcarriers))))
@@ -345,10 +414,28 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         data["mod_order"] = str(data.get("mod_order", old.mod_order)).upper()
         if data["mod_order"] not in self._MOD_ORDERS:
             data["mod_order"] = "16QAM"
-        data["channel_model"] = str(data.get("channel_model", old.channel_model)).upper().replace("_", "-")
+        profile_source = (
+            updates.get("ntn_profile")
+            if "ntn_profile" in updates
+            else updates.get("channel_model", getattr(old, "ntn_profile", old.channel_model))
+        )
+        profile_name = normalize_profile_name(profile_source)
+        data["channel_model"] = profile_name
+        data["ntn_profile"] = profile_name
+        if profile_was_explicit and "residual_doppler_spread_hz" not in updates:
+            data["residual_doppler_spread_hz"] = float(
+                get_profile(profile_name).maximum_doppler_hz
+            )
         data["velocity_kmh"] = float(data.get("velocity_kmh", old.velocity_kmh))
         data["doppler_radial_factor"] = float(np.clip(float(data.get("doppler_radial_factor", getattr(old, "doppler_radial_factor", 0.10))), 0.0, 1.0))
+        spread = float(data.get("residual_doppler_spread_hz", getattr(old, "residual_doppler_spread_hz", get_profile(profile_name).maximum_doppler_hz)))
+        if not np.isfinite(spread) or spread <= 0.0:
+            spread = float(get_profile(profile_name).maximum_doppler_hz)
+        data["residual_doppler_spread_hz"] = float(max(0.0, spread))
+        data["doppler_compensation_ratio"] = float(np.clip(float(data.get("doppler_compensation_ratio", getattr(old, "doppler_compensation_ratio", 0.999))), 0.0, 1.0))
         data.pop("max_doppler_hz", None)
+        data.pop("doppler_spread_hz", None)
+        data.pop("residual_doppler_hz", None)
         data["decoder"] = str(data.get("decoder", old.decoder)).upper()
         data["ebn0_db"] = float(data.get("ebn0_db", old.ebn0_db))
         snr_def = str(data.get("snr_definition", getattr(old, "snr_definition", "Eb/N0")) or "Eb/N0").strip().upper().replace(" ", "")
@@ -373,18 +460,26 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         data["circular_channel"] = bool(data.get("circular_channel", old.circular_channel))
         data["tf_notch_depth_db"] = float(data.get("tf_notch_depth_db", old.tf_notch_depth_db))
         data["tf_notch_count"] = int(max(0, int(data.get("tf_notch_count", old.tf_notch_count))))
+        data["demo_frame_interval_s"] = float(max(0.0, data.get("demo_frame_interval_s", getattr(old, "demo_frame_interval_s", 0.02))))
         if data["link_mode"] not in ("matrix", "full"):
             data["link_mode"] = "matrix"
 
         new = FDIDMConfig(**data)
         shape_changed = new.m_subcarriers != old.m_subcarriers or new.n_symbols != old.n_symbols
         mod_changed = new.mod_order != old.mod_order
+        index_changed = (
+            abs(new.alpha - old.alpha) > 1e-12
+            or abs(new.beta - old.beta) > 1e-12
+        )
         matrix_changed = (
             shape_changed
             or mod_changed
             or new.channel_model != old.channel_model
+            or new.ntn_profile != getattr(old, "ntn_profile", old.channel_model)
             or abs(new.velocity_kmh - old.velocity_kmh) > 1e-12
             or abs(getattr(new, "doppler_radial_factor", 0.10) - getattr(old, "doppler_radial_factor", 0.10)) > 1e-12
+            or abs(getattr(new, "residual_doppler_spread_hz", 200.0) - getattr(old, "residual_doppler_spread_hz", 200.0)) > 1e-12
+            or abs(getattr(new, "doppler_compensation_ratio", 0.999) - getattr(old, "doppler_compensation_ratio", 0.999)) > 1e-12
             or abs(new.subcarrier_spacing_hz - old.subcarrier_spacing_hz) > 1e-9
             or abs(new.fc_hz - old.fc_hz) > 1e-3
             or new.random_channel != old.random_channel
@@ -402,6 +497,12 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             or abs(new.search_step - old.search_step) > 1e-12
         )
         self.config = new
+        if index_changed and hasattr(self, "_adaptive_lock"):
+            # A queued slow optimizer may have used the previous applied pair as
+            # its baseline.  Advance the epoch and discard only stale decisions;
+            # physical CSI snapshots remain valid and are retained.
+            with self._adaptive_lock:
+                self._adaptive_note_index_change_locked()
         if new.channel_seed != old.channel_seed:
             self._dynamic_base_seed = int(new.channel_seed)
             self._last_dynamic_block = None
@@ -413,9 +514,15 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             or new.channel_dynamics != old.channel_dynamics
             or new.channel_coherence_frames != old.channel_coherence_frames
             or new.fast_channel_coherence_symbols != old.fast_channel_coherence_symbols
+            or new.ntn_profile != getattr(old, "ntn_profile", old.channel_model)
+            or abs(getattr(new, "residual_doppler_spread_hz", 200.0) - getattr(old, "residual_doppler_spread_hz", 200.0)) > 1e-12
+            or abs(getattr(new, "doppler_compensation_ratio", 0.999) - getattr(old, "doppler_compensation_ratio", 0.999)) > 1e-12
         )
         if channel_ctx_changed:
             self._last_dynamic_block = None
+            self._previous_h_tf_for_state = None
+            self._channel_matrix_change_norm = float("nan")
+            self._channel_matrix_correlation = float("nan")
         if shape_changed:
             self._gamma_cache.clear()
             self._impulse_grid = np.zeros((self.M, self.N), dtype=np.complex64)
@@ -666,25 +773,38 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         return A_tx, A_rx
 
     def _channel_profile(self):
-        name = self.config.channel_model.upper().replace("_", "-")
-        if name == "TDL-A":
-            delays_ns = np.array([0, 30, 70, 90, 110, 190, 410], dtype=np.float64)
-            gains_db = np.array([0, -1.5, -1.4, -3.6, -0.6, -9.1, -7.0], dtype=np.float64)
-        elif name == "TDL-D":
-            delays_ns = np.array([0, 35, 70, 110, 170, 290, 520], dtype=np.float64)
-            gains_db = np.array([-0.2, -13.5, -18.8, -21.0, -22.8, -17.9, -20.1], dtype=np.float64)
-        elif name == "CDL":
-            delays_ns = np.array([0, 50, 120, 200, 310, 460, 650, 900], dtype=np.float64)
-            gains_db = np.array([0, -2.0, -4.5, -6.0, -8.0, -11.0, -13.5, -16.0], dtype=np.float64)
-        else:
-            delays_ns = np.array([0, 20, 65, 120, 195, 280, 430, 650], dtype=np.float64)
-            gains_db = np.array([-4.4, -1.2, -3.5, -5.2, -2.5, 0.0, -7.2, -11.0], dtype=np.float64)
+        """Return the selected standardized NR-NTN delay/power profile."""
+        profile = get_profile(getattr(self.config, "ntn_profile", self.config.channel_model))
+        delays_ns = np.asarray(profile.delays_ns, dtype=np.float64)
+        gains_db = np.asarray(profile.powers_db, dtype=np.float64)
         return delays_ns * 1e-9, gains_db
 
+    def _absolute_doppler_shift_hz(self) -> float:
+        return absolute_doppler_shift_hz(
+            carrier_frequency_hz=float(self.config.fc_hz),
+            velocity_kmh=float(self.config.velocity_kmh),
+            radial_projection=float(getattr(self.config, "doppler_radial_factor", 0.10)),
+        )
+
     def _velocity_doppler_hz(self) -> float:
-        v_ms = abs(float(self.config.velocity_kmh)) / 3.6
-        radial_factor = float(np.clip(getattr(self.config, "doppler_radial_factor", 0.10), 0.0, 1.0))
-        return float(v_ms * radial_factor * float(self.config.fc_hz) / C_LIGHT)
+        """Backward-compatible name for the predictable common orbital shift."""
+        return self._absolute_doppler_shift_hz()
+
+    def _residual_common_doppler_hz(self) -> float:
+        return residual_common_cfo_hz(
+            self._absolute_doppler_shift_hz(),
+            float(getattr(self.config, "doppler_compensation_ratio", 0.999)),
+        )
+
+    def _residual_doppler_spread_hz(self) -> float:
+        configured = float(getattr(self.config, "residual_doppler_spread_hz", 0.0))
+        if np.isfinite(configured) and configured > 0.0:
+            return configured
+        profile = get_profile(getattr(self.config, "ntn_profile", self.config.channel_model))
+        return float(profile.maximum_doppler_hz)
+
+    def _channel_max_residual_doppler_hz(self) -> float:
+        return float(abs(self._residual_common_doppler_hz()) + self._residual_doppler_spread_hz())
 
     def _fractional_circular_delay(self, delay_samples: float) -> np.ndarray:
         K = self.K
@@ -716,13 +836,13 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         phases = np.exp(1j * 2.0 * np.pi * rng.random(len(gains_mag))) if self.config.random_channel else np.ones(len(gains_mag), dtype=np.complex128)
         gains = gains_mag * phases
         gains /= np.sqrt(np.sum(np.abs(gains) ** 2) + 1e-15)
-        fd_max = self._velocity_doppler_hz()
-        if len(gains) == 1:
-            fd_list = np.array([fd_max], dtype=np.float64)
-        elif self.config.random_channel:
-            fd_list = fd_max * np.sort(rng.uniform(-1.0, 1.0, len(gains)))
-        else:
-            fd_list = fd_max * np.linspace(-1.0, 1.0, len(gains))
+        fd_list = sample_path_dopplers(
+            len(gains),
+            maximum_spread_hz=self._residual_doppler_spread_hz(),
+            common_residual_hz=self._residual_common_doppler_hz(),
+            rng=rng,
+            deterministic=not bool(self.config.random_channel),
+        )
         t = np.arange(K, dtype=np.float64) / max(fs, 1e-12)
         G = np.zeros((K, K), dtype=np.complex128)
         path_table = []
@@ -778,16 +898,13 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             phases = np.ones(len(gains_mag), dtype=np.complex128)
         gains = gains_mag * phases
         gains /= np.sqrt(np.sum(np.abs(gains) ** 2) + 1e-15)
-        fd_max = self._velocity_doppler_hz()
-        if len(gains) <= 1:
-            fd_list = np.asarray([fd_max], dtype=np.float64)
-        elif random_angles:
-            # Randomized angles give realization-to-realization variability while
-            # preserving the same max Doppler for all alpha/beta points.
-            angles = rng.uniform(0.0, 2.0 * np.pi, len(gains))
-            fd_list = fd_max * np.cos(angles)
-        else:
-            fd_list = fd_max * np.linspace(-1.0, 1.0, len(gains))
+        fd_list = sample_path_dopplers(
+            len(gains),
+            maximum_spread_hz=self._residual_doppler_spread_hz(),
+            common_residual_hz=self._residual_common_doppler_hz(),
+            rng=rng,
+            deterministic=not bool(random_angles),
+        )
         return delays_s, gains, fd_list
 
     def _cont_scenario_key_locked(self) -> tuple:
@@ -795,9 +912,12 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         cfg = self.config
         return (
             str(cfg.channel_model),
+            str(getattr(cfg, "ntn_profile", cfg.channel_model)),
             float(cfg.velocity_kmh),
             float(getattr(cfg, "doppler_radial_factor", 0.10)),
             float(cfg.fc_hz),
+            float(getattr(cfg, "residual_doppler_spread_hz", 200.0)),
+            float(getattr(cfg, "doppler_compensation_ratio", 0.999)),
             float(cfg.subcarrier_spacing_hz),
             int(self._dynamic_base_seed),
         )
@@ -819,8 +939,8 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     def _advance_cont_channel_locked(self):
         """每帧推进各径相位：exp(j2π fD T_frame)，T_frame = N/Δf。
 
-        对应真实 LEO 多普勒相位的连续旋转（3GPP TR 38.811：20GHz 最大多普勒
-        ±480kHz、多普勒变化率可达 -5.44kHz/s），而不是块模式那种每 8 帧独立跳变。
+        这里只推进补偿后残余 CFO 与多径 Doppler spread 对应的相位；可预测的
+        大尺度轨道 Doppler 不直接作为随机快衰落注入信道。
         """
         self._ensure_cont_paths_locked()
         cfg = self.config
@@ -1006,7 +1126,10 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         cfg = self.config
         key = (
             cfg.alpha, cfg.beta, cfg.m_subcarriers, cfg.n_symbols, cfg.subcarrier_spacing_hz,
-            cfg.mod_order, cfg.channel_model, cfg.velocity_kmh, getattr(cfg, "doppler_radial_factor", 0.10),
+            cfg.mod_order, cfg.channel_model, getattr(cfg, "ntn_profile", cfg.channel_model),
+            cfg.velocity_kmh, getattr(cfg, "doppler_radial_factor", 0.10),
+            getattr(cfg, "residual_doppler_spread_hz", 200.0),
+            getattr(cfg, "doppler_compensation_ratio", 0.999),
             cfg.decoder, cfg.ebn0_db, getattr(cfg, "snr_definition", "Eb/N0"),
             cfg.optimize_indices, cfg.search_step, cfg.fc_hz, cfg.link_mode, cfg.random_channel,
             cfg.channel_seed, cfg.dynamic_channel, cfg.channel_coherence_frames,
@@ -1221,6 +1344,24 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             self._prepare_matrices_locked()
             H = self._H_cross.copy()
             H_tf = self._H_tf.copy()
+            prev_h = self._previous_h_tf_for_state
+            h_norm = float(np.linalg.norm(H_tf, "fro"))
+            self._channel_power_db = float(
+                10.0 * np.log10(max((h_norm * h_norm) / max(self.K, 1), 1e-15))
+            )
+            if prev_h is not None and np.shape(prev_h) == np.shape(H_tf):
+                prev_norm = float(np.linalg.norm(prev_h, "fro"))
+                denom = max(prev_norm * h_norm, 1e-15)
+                self._channel_matrix_correlation = float(
+                    np.clip(abs(np.vdot(prev_h, H_tf)) / denom, 0.0, 1.0)
+                )
+                self._channel_matrix_change_norm = float(
+                    np.linalg.norm(H_tf - prev_h, "fro") / max(prev_norm, 1e-15)
+                )
+            else:
+                self._channel_matrix_correlation = float("nan")
+                self._channel_matrix_change_norm = float("nan")
+            self._previous_h_tf_for_state = H_tf.copy()
             tx_fdit = self._tx_fdit.copy()
             rx_fdit = self._rx_fdit.copy()
             noise_var = self._noise_variance()
@@ -1410,6 +1551,9 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             "rx_unitarity_error": float(self._debug.get("rx_unitarity_error", float("nan"))),
             "chain_matrix_relative_error": float(self._debug.get("chain_matrix_relative_error", float("nan"))),
             "avg_H_row_power": float(self._debug.get("avg_H_row_power", float("nan"))),
+            "channel_power_db": float(self._channel_power_db),
+            "channel_matrix_change_norm": float(self._channel_matrix_change_norm),
+            "channel_matrix_correlation": float(self._channel_matrix_correlation),
             "alpha": float(self.config.alpha),
             "beta": float(self.config.beta),
             "used_alpha": float(self._used_alpha),
@@ -1418,8 +1562,15 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             "decoder_actual": self.config.decoder,
             "mod_order": self.config.mod_order,
             "channel_model": self.config.channel_model,
+            "ntn_profile": str(getattr(self.config, "ntn_profile", self.config.channel_model)),
             "velocity_kmh": float(self.config.velocity_kmh),
-            "doppler_hz": self._velocity_doppler_hz(),
+            # Keep doppler_hz as the residual channel limit for old UI readers.
+            "doppler_hz": self._channel_max_residual_doppler_hz(),
+            "absolute_doppler_shift_hz": self._absolute_doppler_shift_hz(),
+            "residual_common_cfo_hz": self._residual_common_doppler_hz(),
+            "residual_doppler_spread_hz": self._residual_doppler_spread_hz(),
+            "coherence_time_s": coherence_time_s(self._residual_doppler_spread_hz()),
+            "doppler_compensation_ratio": float(getattr(self.config, "doppler_compensation_ratio", 0.999)),
             "doppler_radial_factor": float(getattr(self.config, "doppler_radial_factor", 0.10)),
             "snr_definition": str(getattr(self.config, "snr_definition", "Eb/N0")),
             "random_channel": bool(self.config.random_channel),
@@ -1428,6 +1579,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             "channel_dynamics": str(getattr(self.config, "channel_dynamics", "fixed")),
             "channel_coherence_frames": int(getattr(self.config, "channel_coherence_frames", 1)),
             "fast_channel_coherence_symbols": int(getattr(self.config, "fast_channel_coherence_symbols", 1)),
+            "demo_frame_interval_s": float(getattr(self.config, "demo_frame_interval_s", 0.02)),
             "link_mode": self.config.link_mode,
             "circular_channel": bool(self.config.circular_channel),
             "tf_notch_depth_db": float(self.config.tf_notch_depth_db),
@@ -1459,6 +1611,9 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             "selected_theory_ser": float("nan"),
             "theory_objective_label": "--",
             "condition_number": float("nan"),
+            "channel_power_db": float("nan"),
+            "channel_matrix_change_norm": float("nan"),
+            "channel_matrix_correlation": float("nan"),
             "alpha": float(self.config.alpha),
             "beta": float(self.config.beta),
             "used_alpha": float(self.config.alpha),
@@ -1567,7 +1722,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
     def evaluate_theory_curve(self, alpha: float, beta: float, snr_db_values):
         """Evaluate a decoder-aware theory/proxy SER curve for one index pair.
 
-        This is used by the right-bottom SER-SNR plot.  It evaluates many
+        This is retained for legacy theory-curve callers.  It evaluates many
         Eb/N0 points without Monte-Carlo transmission.  For ZF and SIC-like
         proxy modes, the expensive pseudo-inverse is computed once and reused
         across all SNR points; for MMSE, the equalizer genuinely depends on
@@ -1609,7 +1764,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
 
         A single-SNR optimum is often unstable and may not match the SER-SNR
         curve.  By default we optimize over a small local SNR window around the
-        current operating Eb/N0, which is consistent with the right-bottom
+        current operating Eb/N0, which is consistent with the legacy
         SER-SNR comparison plot.
         """
         if objective_snr_points is not None:
@@ -1619,7 +1774,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
             # Do not optimize only at a very high operating SNR: many candidate
             # points can underflow to the same display/search floor, causing the
             # first grid point (0,0) to be selected by accident.  Include several
-            # mid-SNR probes used by the right-bottom SER-SNR plot so the ranking
+            # mid-SNR probes used by legacy SER-SNR callers so the ranking
             # is based on the curve shape, not on a saturated high-SNR tail.
             if objective_snr_offsets is not None:
                 pts = [center + float(o) for o in objective_snr_offsets]
@@ -1802,14 +1957,16 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         }
 
     def get_channel_summary(self):
-        """Return path-table and metadata for the current LEO SATCOM channel."""
+        """Return current NTN channel state with large/residual Doppler separated."""
         with self._lock:
             self._prepare_matrices_locked()
             debug = dict(self._debug)
             cfg = self.config
+            frame = int(getattr(self, "_sim_frame", 0))
         table = []
         for row in debug.get("path_table_ns_samples_fd_abs_gain", []) or []:
-            # row: pidx, tau_ns, tau_samples, doppler_hz, doppler_index, |gain|
+            # row: pidx, tau_ns, tau_samples, residual_doppler_hz,
+            #      normalized_doppler_index, |gain|
             try:
                 pidx, tau_ns, tau_samples, fd, fd_idx, gain_abs = row
                 table.append({
@@ -1822,25 +1979,56 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
                 })
             except Exception:
                 continue
-        max_delay_s = 0.0
-        if table:
-            max_delay_s = max(float(p.get("delay_ns", 0.0)) for p in table) * 1e-9
+
+        delays = [float(p["delay_ns"]) for p in table]
+        dopplers = [float(p["doppler_hz"]) for p in table]
+        powers = [float(p["gain_abs"]) ** 2 for p in table]
+        delay_mean_ns, delay_rms_ns = weighted_mean_and_rms(delays, powers)
+        doppler_mean_hz, doppler_rms_hz = weighted_mean_and_rms(dopplers, powers)
+        max_delay_ns = float(max(delays)) if delays else 0.0
+        max_residual_hz = float(max((abs(x) for x in dopplers), default=self._channel_max_residual_doppler_hz()))
+        bandwidth_hz = float(self.M * cfg.subcarrier_spacing_hz)
+        physical_frame_duration_s = float(self.N / max(cfg.subcarrier_spacing_hz, 1e-15))
+        absolute_shift = self._absolute_doppler_shift_hz()
+        residual_common = self._residual_common_doppler_hz()
+        residual_spread = self._residual_doppler_spread_hz()
+        profile = get_profile(getattr(cfg, "ntn_profile", cfg.channel_model))
+
         return {
-            "channel_model": cfg.channel_model,
+            "channel_model": profile.name,
+            "ntn_profile": profile.name,
             "velocity_kmh": float(cfg.velocity_kmh),
             "velocity_kms": float(cfg.velocity_kmh) / 3600.0,
             "fc_hz": float(cfg.fc_hz),
             "subcarrier_spacing_hz": float(cfg.subcarrier_spacing_hz),
             "sample_rate_hz": float(self.sample_rate),
-            "bandwidth_hz": float(self.M * cfg.subcarrier_spacing_hz),
-            "btau_max": float(self.M * cfg.subcarrier_spacing_hz * max_delay_s),
-            "max_doppler_hz": float(self._velocity_doppler_hz()),
-            "normalized_doppler": float(self._velocity_doppler_hz() / max(cfg.subcarrier_spacing_hz, 1e-15)),
+            "bandwidth_hz": bandwidth_hz,
+            "btau_max": float(bandwidth_hz * max_delay_ns * 1e-9),
+            "absolute_doppler_shift_hz": float(absolute_shift),
+            "doppler_compensation_ratio": float(getattr(cfg, "doppler_compensation_ratio", 0.999)),
+            "residual_common_cfo_hz": float(residual_common),
+            "residual_doppler_spread_hz": float(residual_spread),
+            "max_doppler_hz": max_residual_hz,
+            "doppler_mean_hz": float(doppler_mean_hz),
+            "doppler_spread_hz": float(doppler_rms_hz),
+            "normalized_doppler": normalized_doppler(max_residual_hz, cfg.subcarrier_spacing_hz),
+            "coherence_time_s": coherence_time_s(residual_spread),
             "doppler_radial_factor": float(getattr(cfg, "doppler_radial_factor", 0.10)),
-            "doppler_warning": bool(self._velocity_doppler_hz() >= cfg.subcarrier_spacing_hz),
+            "doppler_warning": bool(max_residual_hz >= cfg.subcarrier_spacing_hz),
+            "delay_mean_ns": float(delay_mean_ns),
+            "delay_spread_ns": float(delay_rms_ns),
+            "max_delay_ns": max_delay_ns,
+            "nominal_rms_delay_ns": float(profile.nominal_rms_delay_ns),
             "snr_definition": str(getattr(cfg, "snr_definition", "Eb/N0")),
             "M": int(self.M),
             "N": int(self.N),
+            "frame": frame,
+            "physical_frame_duration_s": physical_frame_duration_s,
+            "physical_time_s": float(frame * physical_frame_duration_s),
+            "demo_update_period_s": float(getattr(cfg, "demo_frame_interval_s", 0.02)),
+            "channel_power_db": float(self._channel_power_db),
+            "channel_matrix_change_norm": float(self._channel_matrix_change_norm),
+            "channel_matrix_correlation": float(self._channel_matrix_correlation),
             "seed": int(cfg.channel_seed),
             "base_seed": int(getattr(self, "_dynamic_base_seed", cfg.channel_seed)),
             "random_channel": bool(cfg.random_channel),
@@ -1914,15 +2102,15 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# 阶段3：统一引擎兼容壳
+# Unified-engine compatibility facade
 # ---------------------------------------------------------------------------
 def _create_fdidm_backend(**kwargs):
-    """供 waveform_sim.core.engine 构造 FDIDM 后端（过渡依赖）。"""
+    """Construct the established FDIDM backend for waveform_sim.core.engine."""
     return _LegacyFDIDMTransceiver(**kwargs)
 
 
 class FDIDMTransceiver(LinkSimulator):
-    """FDIDM 兼容壳：继承统一引擎，委托 _LegacyFDIDMTransceiver，公开接口不变。"""
+    """FDIDM compatibility facade backed by _LegacyFDIDMTransceiver."""
 
     def __init__(self, **kwargs):
         super().__init__(waveform="FDIDM", **kwargs)

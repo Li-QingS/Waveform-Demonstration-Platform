@@ -29,3 +29,34 @@ def test_adaptive_ser_from_symbol_nsr():
     ser = obj._adaptive_ser_from_symbol_nsr(np.array([100.0]), "QPSK")
     assert 0.0 <= float(ser) <= 1.0
 
+
+def test_context_invalidation_resets_run_frame_gates_and_snapshot():
+    """A new run must not wait for the previous run's frame number."""
+    import threading
+
+    obj = object.__new__(FDIDMAdaptiveMixin)
+    obj._adaptive_ab_lock = threading.RLock()
+    obj.adaptive_alpha_beta_enable = True
+    obj._frames_processed = 0
+    obj._adaptive_ab_snapshot_seq = 7
+    obj._adaptive_ab_snapshot = {"snapshot_seq": 7}
+    obj._adaptive_ab_last_snapshot = {"snapshot_seq": 7}
+    obj._adaptive_ab_recommendation = {"recommended_alpha": 1.0}
+    obj._adaptive_ab_last_queued_frame = 350
+    obj._adaptive_ab_last_applied_frame = 350
+    obj._adaptive_ab_last_htf_identity = ("diag_tf", 123)
+    obj._adaptive_ab_stable_key = (20, 20)
+    obj._adaptive_ab_stable_count = 4
+    obj._adaptive_ab_last_error = "old error"
+    messages = []
+    obj._debug = lambda level, message: messages.append((level, message))
+
+    obj._invalidate_alpha_beta_adaptation(reason="start_run_2", cooldown=False)
+
+    assert obj._adaptive_ab_last_queued_frame == -10**18
+    assert obj._adaptive_ab_last_applied_frame == -10**18
+    assert obj._adaptive_ab_snapshot is None
+    assert obj._adaptive_ab_last_snapshot is None
+    assert obj._adaptive_ab_recommendation == {}
+    assert obj._adaptive_ab_state == "waiting_channel"
+    assert any("start_run_2" in message for _, message in messages)

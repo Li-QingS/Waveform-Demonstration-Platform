@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -689,7 +690,9 @@ class FDIDMHardwareTestTab(QWidget):
             self._log(f"α/β 立即评估失败: {type(e).__name__}: {e}")
 
     def _on_export_log_clicked(self):
-        default_name = f"fdidm_debug_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        log_dir = Path(__file__).resolve().parents[2] / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        default_name = str(log_dir / f"fdidm_debug_{time.strftime('%Y%m%d_%H%M%S')}.log")
         path, _ = QFileDialog.getSaveFileName(self, "导出 FDIDM 日志", default_name, "Log Files (*.log);;Text Files (*.txt);;All Files (*)")
         if not path:
             return

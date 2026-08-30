@@ -37,6 +37,10 @@ class FDIDMAdaptiveMixin:
         with lock:
             self._adaptive_ab_snapshot_seq = int(getattr(self, "_adaptive_ab_snapshot_seq", 0)) + 1
             self._adaptive_ab_snapshot = None
+            # A snapshot from the previous channel/configuration is not valid
+            # for a later manual request.  Keep the invalidation boundary
+            # explicit so a restarted run cannot reuse stale CSI.
+            self._adaptive_ab_last_snapshot = None
             self._adaptive_ab_recommendation = {}
             self._adaptive_ab_stable_key = None
             self._adaptive_ab_stable_count = 0
@@ -46,7 +50,14 @@ class FDIDMAdaptiveMixin:
                 self._adaptive_ab_last_applied_frame = int(getattr(self, "_frames_processed", 0))
                 self._adaptive_ab_state = "cooldown"
             else:
+                # _frames_processed is reset on start() and on a new channel
+                # context.  Reset both frame gates with it; otherwise the new
+                # run waits until it exceeds the old run's frame number.
+                self._adaptive_ab_last_queued_frame = -10**18
+                self._adaptive_ab_last_applied_frame = -10**18
                 self._adaptive_ab_state = "waiting_channel" if self.adaptive_alpha_beta_enable else "disabled"
+            self._adaptive_ab_last_skip_reason = ""
+            self._adaptive_ab_last_skip_log_wall = 0.0
         try:
             self._debug("DEBUG", f"alpha/beta adaptation invalidated: {reason}")
         except Exception:
@@ -68,6 +79,19 @@ class FDIDMAdaptiveMixin:
                                       name=f"fdidm-ab-opt-{id(self):x}", daemon=True)
             self._adaptive_ab_thread = thread
             thread.start()
+
+    def _adaptive_ab_debug_skip(self, reason: str):
+        """Rate-limit diagnostic messages for per-frame adaptation gates."""
+        now = time.time()
+        previous = str(getattr(self, "_adaptive_ab_last_skip_reason", ""))
+        previous_wall = float(getattr(self, "_adaptive_ab_last_skip_log_wall", 0.0))
+        if reason != previous or now - previous_wall >= 5.0:
+            self._adaptive_ab_last_skip_reason = str(reason)
+            self._adaptive_ab_last_skip_log_wall = now
+            try:
+                self._debug("DEBUG", f"alpha/beta adaptation skipped: {reason}")
+            except Exception:
+                pass
 
     @staticmethod
     def _adaptive_qam_order(mod_order: str) -> int:
@@ -406,12 +430,17 @@ class FDIDMAdaptiveMixin:
             with self._adaptive_ab_lock:
                 self._adaptive_ab_state = "order_limited"
                 self._adaptive_ab_last_error = f"M*N={K} > adaptive max_order={self.adaptive_alpha_beta_max_order}"
+            self._adaptive_ab_debug_skip(f"order_limited(M*N={K}, max={self.adaptive_alpha_beta_max_order})")
             return
         if h_tf_est is None or not np.isfinite(float(sync_metric)):
+            self._adaptive_ab_debug_skip("invalid_channel_snapshot")
             return
         if float(sync_metric) < float(self.adaptive_alpha_beta_min_sync_metric):
+            self._adaptive_ab_debug_skip(
+                f"sync_below_threshold({float(sync_metric):.3f} < {float(self.adaptive_alpha_beta_min_sync_metric):.3f})")
             return
         if self.adaptive_alpha_beta_require_good_frame and not bool(good_quality):
+            self._adaptive_ab_debug_skip("frame_quality_gate")
             return
 
         frame_counter = int(getattr(self, "_frames_processed", 0))
@@ -420,12 +449,19 @@ class FDIDMAdaptiveMixin:
             force = bool(self._adaptive_ab_force_next)
             if (not force and str(htf_source) == "full_htf" and bool(getattr(self, "full_htf_once", False))
                     and htf_identity == self._adaptive_ab_last_htf_identity):
+                self._adaptive_ab_debug_skip("full_htf_once_reuse")
                 return
             if not force:
                 if frame_counter - int(self._adaptive_ab_last_applied_frame) < int(self.adaptive_alpha_beta_cooldown_frames):
                     self._adaptive_ab_state = "cooldown"
+                    self._adaptive_ab_debug_skip(
+                        f"cooldown(frame={frame_counter}, applied={self._adaptive_ab_last_applied_frame}, "
+                        f"need={self.adaptive_alpha_beta_cooldown_frames})")
                     return
                 if frame_counter - int(self._adaptive_ab_last_queued_frame) < int(self.adaptive_alpha_beta_interval_frames):
+                    self._adaptive_ab_debug_skip(
+                        f"interval(frame={frame_counter}, queued={self._adaptive_ab_last_queued_frame}, "
+                        f"need={self.adaptive_alpha_beta_interval_frames})")
                     return
             self._adaptive_ab_force_next = False
 
@@ -435,10 +471,12 @@ class FDIDMAdaptiveMixin:
             htf_kind = "diag"
         else:
             if raw.size != K * K:
+                self._adaptive_ab_debug_skip(f"invalid_full_shape(size={raw.size}, expected={K * K})")
                 return
             htf_payload = raw.reshape((K, K)).copy()
             htf_kind = "full"
         if not np.all(np.isfinite(htf_payload.real)) or not np.all(np.isfinite(htf_payload.imag)):
+            self._adaptive_ab_debug_skip("nonfinite_channel_snapshot")
             return
 
         with self._adaptive_ab_lock:

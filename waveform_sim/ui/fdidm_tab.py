@@ -1,9 +1,9 @@
-"""FDIDM Mode-A soft waveform demonstration tab.
+"""FDIDM soft-waveform demonstration tab.
 
 Goal:
-    One LEO SATCOM channel -> search best fractional alpha/beta by paper-style
-    ZF/MMSE-theory SER -> display the searched parameters as text -> validate with
-    OFDM/OTFS/current/best theory SER-vs-SNR curves.
+    One standardized LEO/NTN channel -> separate predictable orbital Doppler from
+    residual fading spread -> evaluate independent OFDM/OTFS/AFDM/FDIDM domains on
+    the same channel -> adapt FDIDM alpha/beta on a slower CSI-statistics time scale.
 
 This page intentionally removes alpha-beta heatmap and paper-figure modes.
 """
@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
@@ -28,7 +27,6 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QLabel,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -44,10 +42,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 
-from .fdidm_utils import _CurveSpec, alpha_ser_floor, copy_kwargs_with, merged_curve_specs
+from .fdidm_utils import alpha_ser_floor, copy_kwargs_with
 
 class FDIDMTab(BaseWaveformTab):
-    """Mode-A FDIDM soft modulation page."""
+    """FDIDM soft-waveform simulation and adaptation page."""
 
     ser_snr_point = pyqtSignal(int, str, float, float, float, float)
     ser_snr_finished = pyqtSignal(int, str)
@@ -55,18 +53,18 @@ class FDIDMTab(BaseWaveformTab):
     alpha_beta_point = pyqtSignal(int, str, float, float, float)
     alpha_beta_finished = pyqtSignal(int, str)
 
-    # Right-bottom theory SER-vs-SNR points.
+    # Adaptive-process SER-vs-SNR sweep points.
     SER_SNR_POINTS = list(range(0, 31, 2))
     # Left-bottom alpha sweep: x-axis is alpha, each curve fixes one beta.
     ALPHA_SWEEP_BETAS = [round(0.2 * i, 1) for i in range(11)]
-    # Right-bottom theory SER-vs-SNR uses raw positive theory values.
+    # The adaptive-process SER-vs-SNR plot uses raw positive benchmark values.
     # Non-positive/underflow values are not drawn on the log plot instead of
     # being clipped to an artificial display floor.
     # 右下角"实时性能随时间变化"图的视图稳定策略：
     # X 轴使用固定宽度滚动时间窗（右边界按整步长滑动），Y 轴保持固定范围，
     # 避免新增噪声点导致坐标轴不断重算、画面抖动。
-    TIME_WINDOW_SEC = 120.0            # 时间窗宽度（秒）
-    TIME_WINDOW_STEP_SEC = 30.0        # 窗口右边界滑动步长（秒）
+    TIME_WINDOW_SEC = 30.0             # 只显示最近30秒
+    TIME_WINDOW_STEP_SEC = 5.0          # 每5秒平移一次视窗
     SER_Y_RANGE = (-6.0, 0.0)          # log10(SER) 显示范围：1e-6 ~ 1
     SER_Y_EXPAND_CLAMP = (-12.0, 2.0)  # 数据越界时仅扩展、不收缩，且限制在此范围内
 
@@ -100,9 +98,9 @@ class FDIDMTab(BaseWaveformTab):
         # Background refresh is split into independent workers:
         #   1) search worker: find best alpha/beta from the current H_tf,
         #   2) alpha worker: draw the left-bottom alpha-SER sweep,
-        #   3) snr worker: draw the right-bottom theory SER-SNR curves.
-        # This prevents a slow Monte-Carlo alpha sweep from blocking the fast
-        # theory SER-SNR plot.
+        #   3) snr worker: draw the adaptive-process shared-channel SER-SNR curves.
+        # This prevents a slow Monte-Carlo alpha sweep from blocking the
+        # adaptive-process SER-SNR plot.
         self._search_thread = None
         self._alpha_thread = None
         self._snr_thread = None
@@ -166,8 +164,8 @@ class FDIDMTab(BaseWaveformTab):
         self.cfo_spin.setVisible(False)
         self.doppler_label.setVisible(False)
         self.doppler_spin.setVisible(False)
-        # 模式A中，右下角 SER-SNR 曲线不再由用户手动触发，
-        # 而是在任意关键参数更新后自动重新搜索并绘制。
+        # 自适应过程页的 SER-SNR 曲线由关键参数更新自动触发，
+        # 旧版手动刷新按钮保留为隐藏的基类兼容控件。
         self.btn_auto_ber_snr.setText("理论 SER-SNR 自动刷新已启用")
         self.btn_auto_ber_snr.hide()
         self.btn_stop_ber_snr.setText("停止理论 SER-SNR 刷新")
@@ -185,6 +183,9 @@ class FDIDMTab(BaseWaveformTab):
         self._auto_refresh_timer.setSingleShot(True)
         self._auto_refresh_timer.timeout.connect(self._start_auto_ser_snr_refresh)
 
+        # Align residual Doppler, physical coherence and slow-controller window
+        # before the first automatic SER-SNR refresh.
+        self._sync_profile_defaults(self.channel_combo.currentText())
         self._update_info_panel(running=False)
         QTimer.singleShot(400, lambda: self._schedule_auto_ser_snr("初始化"))
 
@@ -277,9 +278,17 @@ class FDIDMTab(BaseWaveformTab):
         # --- 信道 ---
         ch_group, ch_form = form_group("LEO信道")
         self.channel_combo = QComboBox()
-        self.channel_combo.addItems(["TDL-A", "TDL-C", "TDL-D", "CDL"])
-        self.channel_combo.setCurrentText("TDL-C")
-        ch_form.addRow("模型:", self.channel_combo)
+        self.channel_combo.addItems([
+            "NTN-TDLA100-200",
+            "NTN-TDLC5-200",
+            "NTN-TDLC5-1200",
+        ])
+        self.channel_combo.setCurrentText("NTN-TDLA100-200")
+        self.channel_combo.setToolTip(
+            "标准化NTN延迟功率谱与残余最大Doppler组合；"
+            "大尺度卫星公共频移在下方单独计算并补偿。"
+        )
+        ch_form.addRow("NTN模型:", self.channel_combo)
         # FDIDM 页面把通用 Eb/N0 控件移动到 LEO 信道模块中。
         self.snr_label.setParent(None)
         self.snr_spin.setParent(None)
@@ -292,22 +301,47 @@ class FDIDMTab(BaseWaveformTab):
 
         self.channel_dynamics_combo = QComboBox()
         self.channel_dynamics_combo.addItems(["固定信道", "动态块衰落", "帧内快时变", "连续多普勒"])
-        self.channel_dynamics_combo.setCurrentText("动态块衰落")
+        self.channel_dynamics_combo.setCurrentText("连续多普勒")
         self.channel_dynamics_combo.setToolTip(
-            "动态块衰落按相干帧数更新CSI；帧内快时变每帧重生成信道；"
-            "连续多普勒按真实LEO多普勒逐帧旋转路径相位（20GHz下fDmax可达480kHz，"
-            "残余52kHz时相干时间仅约数微秒），固定信道则保持不变。"
+            "动态块衰落按相干帧数更新CSI；帧内快时变在一帧内部改变路径增益；"
+            "连续多普勒只推进补偿后的残余CFO和多径Doppler扩展。"
+            "可预测的轨道公共频移不会直接当成随机快衰落。"
         )
         ch_form.addRow("时变模式:", self.channel_dynamics_combo)
 
-        # 低频参数控件（挂入“高级参数”折叠组）
+        # LEO 轨道公共频移与残余小尺度时变参数。
         self.radial_factor_spin = QDoubleSpinBox()
         self.radial_factor_spin.setRange(0.0, 1.0)
         self.radial_factor_spin.setDecimals(2)
         self.radial_factor_spin.setSingleStep(0.01)
         self.radial_factor_spin.setValue(0.10)
-        self.radial_factor_spin.setToolTip("径向投影系数，用于计算最大多普勒：fDmax = v × 径向投影 × fc / c")
+        self.radial_factor_spin.setToolTip(
+            "用于计算可预测的轨道公共Doppler：f_orbit=v×径向投影×fc/c；"
+            "它与小尺度Doppler扩展分开处理。"
+        )
         ch_form.addRow("径向投影:", self.radial_factor_spin)
+
+        self.residual_doppler_spin = QDoubleSpinBox()
+        self.residual_doppler_spin.setRange(0.0, 5000.0)
+        self.residual_doppler_spin.setDecimals(1)
+        self.residual_doppler_spin.setSingleStep(100.0)
+        self.residual_doppler_spin.setValue(200.0)
+        self.residual_doppler_spin.setSuffix(" Hz")
+        self.residual_doppler_spin.setToolTip(
+            "公共轨道频移补偿后，真正决定小尺度信道相干时间的最大Doppler扩展。"
+        )
+        ch_form.addRow("残余Doppler扩展:", self.residual_doppler_spin)
+
+        self.doppler_compensation_spin = QDoubleSpinBox()
+        self.doppler_compensation_spin.setRange(0.0, 100.0)
+        self.doppler_compensation_spin.setDecimals(3)
+        self.doppler_compensation_spin.setSingleStep(0.1)
+        self.doppler_compensation_spin.setValue(99.9)
+        self.doppler_compensation_spin.setSuffix(" %")
+        self.doppler_compensation_spin.setToolTip(
+            "对可预测公共轨道Doppler的预补偿比例；剩余部分作为残余公共CFO。"
+        )
+        ch_form.addRow("公共Doppler补偿:", self.doppler_compensation_spin)
 
         self.random_channel_check = QCheckBox("随机路径相位/角度")
         self.random_channel_check.setChecked(True)
@@ -317,7 +351,7 @@ class FDIDMTab(BaseWaveformTab):
 
         self.coherence_frames_spin = QSpinBox()
         self.coherence_frames_spin.setRange(1, 10000)
-        self.coherence_frames_spin.setValue(8)
+        self.coherence_frames_spin.setValue(64)
         self.fast_symbol_spin = QSpinBox()
         self.fast_symbol_spin.setRange(1, 64)
         self.fast_symbol_spin.setValue(1)
@@ -387,11 +421,13 @@ class FDIDMTab(BaseWaveformTab):
         self.btn_regen_channel.clicked.connect(self._regenerate_channel)
         self.btn_ofdm.clicked.connect(lambda: self._set_indices_ui(0.0, 0.0))
         self.btn_otfs.clicked.connect(lambda: self._set_indices_ui(1.0, 1.0))
+        self.channel_combo.currentTextChanged.connect(self._sync_profile_defaults)
 
         for widget in [
             self.alpha_spin, self.beta_spin, self.m_spin, self.n_spin,
             self.scs_spin, self.fc_spin, self.mod_combo, self.channel_combo,
             self.velocity_combo, self.radial_factor_spin,
+            self.residual_doppler_spin, self.doppler_compensation_spin,
             self.snr_def_combo, self.decoder_combo, self.random_channel_check,
             self.channel_dynamics_combo, self.coherence_frames_spin, self.fast_symbol_spin,
             self.alpha_curve_mode_combo, self.alpha_mc_frames_spin,
@@ -500,6 +536,46 @@ class FDIDMTab(BaseWaveformTab):
     # ------------------------------------------------------------------
     # Backend construction and updates
     # ------------------------------------------------------------------
+    def _sync_profile_defaults(self, name):
+        """Keep profile-dependent residual Doppler and block coherence defaults aligned.
+
+        Slow-controller windows are intentionally scaled down from the physical
+        coherence time (agile preset): the CSI window covers about half a
+        coherence time and a switch can be voted after two consecutive
+        recommendations, so parameter adaptation reacts within a few seconds
+        while retaining a minimal anti-oscillation guard.
+        """
+        profile = str(name or "").upper()
+        maximum_doppler = 1200.0 if "1200" in profile else 200.0
+        # Tc≈0.423/fD and Tframe=N/Δf.  Round to a usable integer block length.
+        frame_duration = float(self.n_spin.value()) / max(float(self.scs_spin.value()) * 1e3, 1e-15)
+        coherence_frames = max(1, int(round((0.423 / maximum_doppler) / frame_duration)))
+        slow_window = max(16, int(round(0.5 * coherence_frames)))
+        slow_interval = max(8, int(round(0.5 * slow_window)))
+        slow_ensemble = 3
+        slow_cooldown = max(16, slow_window)
+        controls = [
+            self.residual_doppler_spin,
+            self.coherence_frames_spin,
+            self.adaptive_controls.window_frames_spin,
+            self.adaptive_controls.eval_interval_spin,
+            self.adaptive_controls.ensemble_spin,
+            self.adaptive_controls.cooldown_spin,
+        ]
+        for widget in controls:
+            widget.blockSignals(True)
+        try:
+            self.residual_doppler_spin.setValue(maximum_doppler)
+            self.coherence_frames_spin.setValue(coherence_frames)
+            self.adaptive_controls.window_frames_spin.setValue(slow_window)
+            self.adaptive_controls.eval_interval_spin.setValue(slow_interval)
+            self.adaptive_controls.ensemble_spin.setValue(slow_ensemble)
+            self.adaptive_controls.cooldown_spin.setValue(slow_cooldown)
+        finally:
+            for widget in controls:
+                widget.blockSignals(False)
+        self._hot_update_from_ui()
+
     def _selected_channel_dynamics(self):
         text = str(self.channel_dynamics_combo.currentText()) if hasattr(self, "channel_dynamics_combo") else "固定信道"
         if "连续" in text or "多普勒" in text:
@@ -537,8 +613,11 @@ class FDIDMTab(BaseWaveformTab):
             subcarrier_spacing_hz=float(self.scs_spin.value()) * 1e3,
             mod_order=str(self.mod_combo.currentText()),
             channel_model=str(self.channel_combo.currentText()),
+            ntn_profile=str(self.channel_combo.currentText()),
             velocity_kmh=float(self.velocity_combo.currentText()),
             doppler_radial_factor=float(self.radial_factor_spin.value()),
+            residual_doppler_spread_hz=float(self.residual_doppler_spin.value()),
+            doppler_compensation_ratio=float(self.doppler_compensation_spin.value()) / 100.0,
             decoder=str(self.decoder_combo.currentText()),
             snr_db=float(self.snr_spin.value() if snr_db is None else snr_db),
             snr_definition=str(self.snr_def_combo.currentText()),
@@ -554,6 +633,7 @@ class FDIDMTab(BaseWaveformTab):
             fast_channel_coherence_symbols=int(self.fast_symbol_spin.value()),
             tf_notch_depth_db=0.0,
             tf_notch_count=0,
+            demo_frame_interval_s=0.02,
         )
 
     def _new_backend(self, alpha=None, beta=None, snr_db=None):
@@ -684,8 +764,11 @@ class FDIDMTab(BaseWaveformTab):
                     subcarrier_spacing_hz=float(self.scs_spin.value()) * 1e3,
                     mod_order=str(self.mod_combo.currentText()),
                     channel_model=str(self.channel_combo.currentText()),
+                    ntn_profile=str(self.channel_combo.currentText()),
                     velocity_kmh=float(self.velocity_combo.currentText()),
                     doppler_radial_factor=float(self.radial_factor_spin.value()),
+                    residual_doppler_spread_hz=float(self.residual_doppler_spin.value()),
+                    doppler_compensation_ratio=float(self.doppler_compensation_spin.value()) / 100.0,
                     decoder=str(self.decoder_combo.currentText()),
                     ebn0_db=float(self.snr_spin.value()),
                     snr_definition=str(self.snr_def_combo.currentText()),
@@ -859,7 +942,7 @@ class FDIDMTab(BaseWaveformTab):
             status_text=(
                 f"自动刷新启动：{self._auto_scan_reason}。\n"
                 f"信道统计模式：{dyn_note}；正在理论搜索 α*/β*。\n"
-                f"搜索结束后将启动双线程：{alpha_curve_text}；右下角：理论 SER-SNR 绘制。\n"
+                f"搜索结束后将启动双线程：{alpha_curve_text}；自适应页：共享信道四波形 SER-SNR 绘制。\n"
                 f"左下角显示下界=3/({alpha_sweep_frames}×{int(base_kwargs.get('m_subcarriers', 8))}×{int(base_kwargs.get('n_symbols', 8))})={ser_floor:.3e}；低于该值按下界连线显示。"
             )
         )
@@ -872,17 +955,66 @@ class FDIDMTab(BaseWaveformTab):
         self._search_thread.start()
 
     def _search_worker(self, token: int, base_kwargs: dict, stop_event: threading.Event, reason: str):
-        """Worker 0: find best alpha/beta, then notify UI to start plot workers."""
+        """Find the current-SNR optimum with the same practical benchmark used by plots.
+
+        The old page mixed two objectives: a dense perfect-CSI theory search for the
+        button and a sparse shared-channel receiver for the comparison plots.  That
+        could recommend parameters that were not actually optimal on the displayed
+        curves.  This worker now freezes one physical channel snapshot and uses the
+        independent-waveform benchmark throughout.
+        """
         try:
             from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
-            tb0 = FDIDMTransceiver(**base_kwargs)
-            result = tb0.search_best_indices(
-                step=float(base_kwargs.get("search_step", 0.1)),
-                ebn0_db=float(base_kwargs.get("snr_db", 10.0)),
+            from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+            fixed_kwargs = copy_kwargs_with(
+                base_kwargs,
+                dynamic_channel=False,
+                channel_dynamics="fixed",
+                channel_seed=int(base_kwargs.get("channel_seed", 42)),
+            )
+            tb0 = FDIDMTransceiver(**fixed_kwargs)
+            benchmark = SharedWaveformBenchmark.from_backend(tb0)
+            current_a = float(base_kwargs.get("alpha", 0.0))
+            current_b = float(base_kwargs.get("beta", 0.0))
+            working_snr = float(base_kwargs.get("snr_db", 10.0))
+            coarse_step = max(0.25, float(base_kwargs.get("search_step", 0.1)))
+            fine_step = min(0.10, max(0.05, coarse_step / 5.0))
+            optimized = SharedWaveformBenchmark.optimize_fdidm_over_ensemble(
+                [benchmark],
+                snr_db=working_snr,
+                current_alpha=current_a,
+                current_beta=current_b,
+                coarse_step=coarse_step,
+                fine_step=fine_step,
+                decision_ser_floor=1e-8,
                 stop_event=stop_event,
             )
-            result["channel_summary"] = tb0.get_channel_summary()
-            result["auto_reason"] = reason
+            refs = benchmark.evaluate_all(working_snr, current_a, current_b)
+            best_a = float(optimized["recommended_alpha"])
+            best_b = float(optimized["recommended_beta"])
+            best_metric = benchmark.evaluate("FDIDM", working_snr, best_a, best_b)
+            gain_db = float(optimized["predicted_improvement_db"])
+            result = {
+                **optimized,
+                "best_alpha": best_a,
+                "best_beta": best_b,
+                "best_score": float(best_metric["ser"]),
+                "current_score": float(optimized["predicted_ser_current"]),
+                "step": float(coarse_step),
+                "fine_step": float(fine_step),
+                "elapsed_s": float(optimized["search_seconds"]),
+                "objective": "共享物理信道 + 干扰感知稀疏LMMSE的SER",
+                "snr_definition": str(base_kwargs.get("snr_definition", "Eb/N0")),
+                "significant": bool(gain_db >= 0.5),
+                "significance_note": (
+                    f"预测增益{gain_db:.2f} dB；实时控制器仍需满足CSI窗口、"
+                    "连续稳定判决和冷却时间才会真正切换。"
+                ),
+                "references": refs,
+                "channel_summary": tb0.get_channel_summary(),
+                "auto_reason": reason,
+            }
             if stop_event.is_set() or token != self._auto_scan_token:
                 return
             self._emit_signal_safe("search_finished", token, result)
@@ -913,7 +1045,7 @@ class FDIDMTab(BaseWaveformTab):
         self._snr_active_token = int(token)
 
         self.adaptive_plots.set_snr_title(
-            "SER-SNR 性能对比（FDIDM 每个 SNR 点独立搜索 α/β）"
+            "共享信道稀疏LMMSE SER-SNR（FDIDM每个SNR独立优化α/β）"
         )
 
         self._alpha_thread = threading.Thread(
@@ -927,7 +1059,7 @@ class FDIDMTab(BaseWaveformTab):
             daemon=True,
         )
         # Start both workers back-to-back.  They use separate backend instances,
-        # so the fast right-bottom theory plot no longer waits for the slow
+        # so the adaptive-process SNR plot no longer waits for the slow
         # left-bottom Monte-Carlo alpha sweep.
         self._alpha_thread.start()
         self._snr_thread.start()
@@ -938,7 +1070,15 @@ class FDIDMTab(BaseWaveformTab):
         finish_reason = "完成"
         try:
             from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
+            from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
             current_b = float(base_kwargs.get("beta", 0.0))
+            fixed_tb = FDIDMTransceiver(**copy_kwargs_with(
+                base_kwargs,
+                dynamic_channel=False,
+                channel_dynamics="fixed",
+                channel_seed=int(base_kwargs.get("channel_seed", 42)),
+            ))
+            practical_benchmark = SharedWaveformBenchmark.from_backend(fixed_tb)
             # Requirement: alpha increases by 0.1 for every plotted point.
             alpha_values = np.round(np.arange(0.0, 2.0 + 0.05, 0.1), 10)
             beta_values = [round(float(b), 10) for b in self.ALPHA_SWEEP_BETAS]
@@ -956,13 +1096,17 @@ class FDIDMTab(BaseWaveformTab):
                         finish_reason = "已停止"
                         self._emit_signal_safe("alpha_beta_finished", token, finish_reason)
                         return
-                    tb_alpha = FDIDMTransceiver(**copy_kwargs_with(
-                        base_kwargs, alpha=float(a), beta=float(b), snr_db=work_snr
-                    ))
                     if mode == "theory":
-                        item = tb_alpha.evaluate_theory_point(float(a), float(b), ebn0_db=work_snr)
-                        ser_raw = float(item.get("selected_theory_ser", item.get("zf_theory_ser", np.nan)))
+                        # Use the same fixed channel and practical receiver model as
+                        # the SNR comparison and slow adaptive controller.
+                        item = practical_benchmark.evaluate(
+                            "FDIDM", work_snr, alpha=float(a), beta=float(b)
+                        )
+                        ser_raw = float(item.get("ser", np.nan))
                     else:
+                        tb_alpha = FDIDMTransceiver(**copy_kwargs_with(
+                            base_kwargs, alpha=float(a), beta=float(b), snr_db=work_snr
+                        ))
                         item = tb_alpha.estimate_ser(
                             num_frames=int(alpha_sweep_frames),
                             seed=alpha_seed_base,  # common random numbers across all α/β points
@@ -976,88 +1120,36 @@ class FDIDMTab(BaseWaveformTab):
             finish_reason = f"失败：{exc}"
         self._emit_signal_safe("alpha_beta_finished", token, finish_reason)
 
-    def _pick_sweep_channel_seed(self, base_kwargs: dict,
-                                 candidates: int = 8,
-                                 min_gain_db: float = 0.3) -> int:
-        """为 SER-SNR 对比图挑选一个能体现 FDIDM 增益的固定信道种子。
-
-        对比图要求每个 SNR 点信道条件完全相同（固定 H_tf、只有 SNR 变化）。
-        默认 seed 对应的信道可能恰好让 OFDM 最优，导致 FDIDM 与 OFDM 曲线完全
-        重合；这里用自适应快速目标（毫秒级）扫描少量候选种子，优先返回一个
-        分数索引相对 OFDM 有可见理论增益的实现，找不到时回退默认种子。
-        """
-        try:
-            from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
-            base_seed = int(base_kwargs.get("channel_seed", 42))
-            sweep_base = copy_kwargs_with(
-                base_kwargs, alpha=0.0, beta=0.0,
-                dynamic_channel=False, channel_dynamics="fixed",
-                random_channel=True,
-            )
-            tb = FDIDMTransceiver(**sweep_base)
-            b = tb._backend
-            for k in range(max(1, int(candidates))):
-                seed = int(base_seed + 104729 * k) % 2_147_483_647
-                seed = seed if seed > 0 else 1
-                b.regenerate_channel(seed=int(seed))
-                b._prepare_matrices_locked()
-                with b._lock:
-                    snap = {
-                        "M": int(b.config.m_subcarriers),
-                        "N": int(b.config.n_symbols),
-                        "htf": np.asarray(b._H_tf, dtype=np.complex128).copy(),
-                        "htf_kind": "full",
-                        "noise_var": float(b._noise_variance()),
-                        "equalizer": str(b.config.decoder),
-                        "mod_order": str(b.config.mod_order),
-                        "alpha": 0.0,
-                        "beta": 0.0,
-                        "coarse_step": 0.25,
-                        "fine_step": 0.05,
-                        "integer_margin_db": 0.0,
-                        "max_order": 512,
-                        "rcond": 1e-6,
-                        "frame_counter": 0,
-                        "snapshot_seq": int(k + 1),
-                    }
-                res = b._optimize_alpha_beta_snapshot(snap)
-                gain = float(res.get("predicted_improvement_db", 0.0))
-                if np.isfinite(gain) and gain >= float(min_gain_db):
-                    return int(seed)
-            return int(base_seed)
-        except Exception:
-            return int(base_kwargs.get("channel_seed", 42))
-
     def _theory_snr_worker(self, token: int, base_kwargs: dict, stop_event: threading.Event,
                            best_a: float, best_b: float):
-        """Draw SNR-SER curves with one exact alpha/beta search per SNR.
+        """Four waveform domains on one fixed physical channel realization.
 
-        The live simulation may use a changing channel, but one comparison sweep
-        must hold H_TF fixed so every waveform and every SNR point sees the same
-        physical channel (only SNR changes).
+        OFDM, OTFS and AFDM are no longer aliases for three FDIDM alpha/beta
+        points.  A shared-channel evaluator builds their own transform-domain
+        equivalent channels and uses waveform-appropriate complexity-limited
+        receivers.  FDIDM is re-optimized independently at every SNR point.
         """
         finish_reason = "完成"
         try:
             from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
+            from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
 
             sweep_kwargs = copy_kwargs_with(
                 base_kwargs,
+                alpha=0.0,
+                beta=0.0,
                 dynamic_channel=False,
                 channel_dynamics="fixed",
-                random_channel=True,
-                # 对比图用固定信道，且每个 SNR 点信道条件完全相同；默认种子可能
-                # 恰好让 OFDM 最优导致 FDIDM 与 OFDM 重合，这里优先挑选一个能
-                # 体现分数索引理论增益的实现。
-                channel_seed=self._pick_sweep_channel_seed(base_kwargs),
+                # Keep the user-selected seed.  Do not cherry-pick a realization
+                # merely to make one waveform look better.
+                channel_seed=int(base_kwargs.get("channel_seed", 42)),
             )
-            references = [
-                ("OFDM", 0.0, 0.0),
-                ("OTFS", 1.0, 1.0),
-                # Current repository reference used for the AFDM baseline.
-                ("AFDM", 0.5, 1.0),
-            ]
-            previous_a = float(best_a)
-            previous_b = float(best_b)
+            tb_model = FDIDMTransceiver(**sweep_kwargs)
+            benchmark = SharedWaveformBenchmark.from_backend(tb_model)
+            previous_a = float(best_a) if np.isfinite(float(best_a)) else 0.0
+            previous_b = float(best_b) if np.isfinite(float(best_b)) else 0.0
+            coarse_step = max(0.25, float(base_kwargs.get("search_step", 0.1)))
+            fine_step = min(0.10, max(0.05, coarse_step / 5.0))
 
             for snr in self.SER_SNR_POINTS:
                 if stop_event.is_set() or token != self._auto_scan_token:
@@ -1065,69 +1157,38 @@ class FDIDMTab(BaseWaveformTab):
                     self._emit_signal_safe("ser_snr_finished", token, finish_reason)
                     return
 
-                tb_model = FDIDMTransceiver(**copy_kwargs_with(
-                    sweep_kwargs, alpha=0.0, beta=0.0, snr_db=float(snr)
-                ))
-
-                for name, a, b in references:
-                    item = tb_model.evaluate_theory_point(float(a), float(b), ebn0_db=float(snr))
-                    ser_raw = float(item.get("selected_theory_ser", item.get("zf_theory_ser", np.nan)))
-                    ser = ser_raw if np.isfinite(ser_raw) and ser_raw > 0 else float("nan")
+                for name in ("OFDM", "OTFS", "AFDM"):
+                    item = benchmark.evaluate(name, float(snr))
+                    ser = float(item.get("ser", np.nan))
+                    if not np.isfinite(ser) or ser <= 0:
+                        ser = float("nan")
                     if not self._emit_signal_safe(
-                        "ser_snr_point", token, name, float(snr), float(ser),
-                        float(a), float(b),
+                        "ser_snr_point", token, name, float(snr), ser,
+                        float("nan"), float("nan"),
                     ):
                         return
 
-                result = tb_model.search_best_indices(
-                    step=float(base_kwargs.get("search_step", 0.1)),
-                    ebn0_db=float(snr),
-                    # Critical fix: without this argument, the backend optimizes
-                    # a multi-SNR window and can return the same pair at every x.
-                    objective_snr_points=[float(snr)],
-                    top_k=20,
-                    significance_threshold_percent=0.0,
+                result = SharedWaveformBenchmark.optimize_fdidm_over_ensemble(
+                    [benchmark],
+                    snr_db=float(snr),
+                    current_alpha=previous_a,
+                    current_beta=previous_b,
+                    coarse_step=coarse_step,
+                    fine_step=fine_step,
+                    # SER-SNR research plot keeps the raw theoretical ordering;
+                    # the live controller uses a higher practical decision floor.
+                    decision_ser_floor=1e-15,
                     stop_event=stop_event,
                 )
-
-                candidates = []
-                for candidate in result.get("top_candidates", []) or []:
-                    try:
-                        c_ser = float(candidate.get(
-                            "ser_at_working_ebn0",
-                            candidate.get("zf_theory_ser", np.nan),
-                        ))
-                        c_a = float(candidate["alpha"])
-                        c_b = float(candidate["beta"])
-                    except Exception:
-                        continue
-                    if np.isfinite(c_ser) and c_ser >= 0:
-                        candidates.append((c_ser, c_a, c_b))
-
-                if candidates:
-                    exact_min = min(c[0] for c in candidates)
-                    tolerance = max(1e-15, abs(exact_min) * 1e-9)
-                    tied = [c for c in candidates if c[0] <= exact_min + tolerance]
-                    _, a_star, b_star = min(
-                        tied,
-                        key=lambda c: (
-                            (c[1] - previous_a) ** 2 + (c[2] - previous_b) ** 2,
-                            c[1],
-                            c[2],
-                        ),
-                    )
-                else:
-                    a_star = float(result.get("best_alpha", previous_a))
-                    b_star = float(result.get("best_beta", previous_b))
-
-                item = tb_model.evaluate_theory_point(a_star, b_star, ebn0_db=float(snr))
-                ser_raw = float(item.get("selected_theory_ser", item.get("zf_theory_ser", np.nan)))
-                ser = ser_raw if np.isfinite(ser_raw) and ser_raw > 0 else float("nan")
-                previous_a, previous_b = float(a_star), float(b_star)
-
+                a_star = float(result["recommended_alpha"])
+                b_star = float(result["recommended_beta"])
+                ser = float(result["predicted_ser_best"])
+                previous_a, previous_b = a_star, b_star
+                if not np.isfinite(ser) or ser <= 0:
+                    ser = float("nan")
                 if not self._emit_signal_safe(
-                    "ser_snr_point", token, "FDIDM", float(snr), float(ser),
-                    float(a_star), float(b_star),
+                    "ser_snr_point", token, "FDIDM", float(snr), ser,
+                    a_star, b_star,
                 ):
                     return
         except Exception as exc:
@@ -1218,7 +1279,7 @@ class FDIDMTab(BaseWaveformTab):
         self._snr_active_token = None
         self.btn_stop_ber_snr.setEnabled(False)
         self.btn_auto_ber_snr.setEnabled(True)
-        self.update_info_panel(status_text="已停止当前自动刷新。后续参数更新会再次自动触发搜索、左下角α-SER与右下角理论SER-SNR绘制。")
+        self.update_info_panel(status_text="已停止当前自动刷新。后续参数更新会再次自动触发搜索、左下角α-SER与自适应过程页SER-SNR绘制。")
 
     def _on_search_finished(self, token, result):
         if int(token) != int(self._auto_scan_token):
@@ -1319,12 +1380,43 @@ class FDIDMTab(BaseWaveformTab):
             "expected_eq_noise_power": float(metrics.get("expected_eq_noise_var", np.nan)),
             "evm_percent": float(metrics.get("evm_percent", np.nan)),
             "condition_number": float(metrics.get("condition_number", np.nan)),
-            "channel_type": str(channel.get("channel_model", self.channel_combo.currentText())),
+            "channel_type": str(channel.get("ntn_profile", channel.get("channel_model", self.channel_combo.currentText()))),
             "channel_mode": str(self.channel_dynamics_combo.currentText()),
+            "absolute_doppler_shift_hz": float(channel.get(
+                "absolute_doppler_shift_hz", metrics.get("absolute_doppler_shift_hz", np.nan)
+            )),
+            "residual_common_cfo_hz": float(channel.get(
+                "residual_common_cfo_hz", metrics.get("residual_common_cfo_hz", np.nan)
+            )),
+            "residual_doppler_spread_hz": float(channel.get(
+                "residual_doppler_spread_hz", metrics.get("residual_doppler_spread_hz", np.nan)
+            )),
+            "doppler_compensation_ratio": float(channel.get(
+                "doppler_compensation_ratio", metrics.get("doppler_compensation_ratio", np.nan)
+            )),
+            "coherence_time_s": float(channel.get(
+                "coherence_time_s", metrics.get("coherence_time_s", np.nan)
+            )),
             "channel_seed": int(channel.get(
                 "seed", metrics.get("channel_seed", self.seed_spin.value())
             )),
             "frame": int(metrics.get("frames", 0)),
+            "physical_time_s": float(channel.get("physical_time_s", np.nan)),
+            "physical_frame_duration_s": float(channel.get("physical_frame_duration_s", np.nan)),
+            "sample_rate_hz": float(channel.get("sample_rate_hz", np.nan)),
+            "bandwidth_hz": float(channel.get(
+                "bandwidth_hz", self.m_spin.value() * self.scs_spin.value() * 1e3
+            )),
+            "normalized_doppler": float(channel.get("normalized_doppler", np.nan)),
+            "channel_power_db": float(metrics.get(
+                "channel_power_db", channel.get("channel_power_db", np.nan)
+            )),
+            "channel_matrix_change_norm": float(metrics.get(
+                "channel_matrix_change_norm", channel.get("channel_matrix_change_norm", np.nan)
+            )),
+            "channel_matrix_correlation": float(metrics.get(
+                "channel_matrix_correlation", channel.get("channel_matrix_correlation", np.nan)
+            )),
             "velocity_kmh": float(self.velocity_combo.currentText()),
             "radial_projection": float(self.radial_factor_spin.value()),
             "alpha": float(adaptive_status.get(
@@ -1336,25 +1428,23 @@ class FDIDMTab(BaseWaveformTab):
         }
 
     def _refresh_time_metric_plot(self, history):
-        """Plot the actually active FDIDM pair, not the recommended lower bound.
+        """Display decimated, log-domain-EMA waveform metrics over the last 30 s.
 
-        视图稳定策略：
-          - X 轴为固定宽度滚动时间窗，右边界按整步长滑动，窗口未滑动时不重设，
-            避免新增点导致坐标轴不断重算；
-          - Y 轴保持固定范围，数据越界时只扩展、不收缩，消除"呼吸"式抖动；
-          - 仅在 eval/switch 条数变化时全量重绘，switch 标签只增量追加。
+        The backend continues processing every frame.  It emits at most one
+        display metric every configured display interval, so GUI point rate and
+        physical channel update rate are independent.
         """
-        evals = [dict(h) for h in (history or []) if h.get("kind") == "eval"]
+        metric_events = [dict(h) for h in (history or []) if h.get("kind") == "metric"]
         switches = [dict(h) for h in (history or []) if h.get("kind") == "switch"]
-        if not evals:
+        if not metric_events:
             return
 
-        # 后端重建会清空历史：检测到条数回退时重置增量缓存。
-        if (len(evals) < self._time_plot_eval_count
+        if (len(metric_events) < self._time_plot_eval_count
                 or len(switches) < self._time_switch_rendered):
             self._time_plot_eval_count = -1
             self._time_switch_rendered = 0
             self._time_plot_x_view = None
+            self._time_plot_y_fit = None
             for item in self._time_switch_labels:
                 try:
                     self.ber_snr_plot.removeItem(item)
@@ -1362,28 +1452,19 @@ class FDIDMTab(BaseWaveformTab):
                     pass
             self._time_switch_labels = []
             for curve in self._time_metric_curves.values():
-                try:
-                    curve.setData([], [])
-                except Exception:
-                    pass
+                curve.setData([], [])
 
-        # 没有新数据时跳过重绘（自适应面板等其它区域仍正常刷新）。
-        if (len(evals) == self._time_plot_eval_count
+        if (len(metric_events) == self._time_plot_eval_count
                 and len(switches) == self._time_switch_rendered):
             return
 
-        ts0 = min(float(h.get("ts", 0.0)) for h in evals)
-        x = np.asarray(
-            [max(0.0, float(h.get("ts", 0.0)) - ts0) for h in evals],
-            dtype=float,
-        )
+        ts0 = min(float(h.get("ts", 0.0)) for h in metric_events)
+        x = np.asarray([max(0.0, float(h.get("ts", 0.0)) - ts0) for h in metric_events], dtype=float)
         series = {
-            "OFDM": [h.get("ser_ofdm", np.nan) for h in evals],
-            "OTFS": [h.get("ser_otfs", np.nan) for h in evals],
-            "AFDM": [h.get("ser_afdm", np.nan) for h in evals],
-            # ser_best is only a recommendation.  ser_current corresponds to the
-            # alpha/beta pair that was actually active in that CSI snapshot.
-            "FDIDM": [h.get("ser_current", np.nan) for h in evals],
+            "OFDM": [h.get("ser_ofdm", np.nan) for h in metric_events],
+            "OTFS": [h.get("ser_otfs", np.nan) for h in metric_events],
+            "AFDM": [h.get("ser_afdm", np.nan) for h in metric_events],
+            "FDIDM": [h.get("ser_fdidm", np.nan) for h in metric_events],
         }
         styles = {
             "OFDM": ((0, 114, 189), "o"),
@@ -1391,19 +1472,14 @@ class FDIDMTab(BaseWaveformTab):
             "AFDM": ((119, 172, 48), "t"),
             "FDIDM": ((126, 47, 142), "d"),
         }
-        self.ber_snr_plot.setTitle("实时性能随时间变化（FDIDM为当前已应用参数，3s滑动平均）")
-        smooth_n = 6
-        smoothed = {}
+        self.ber_snr_plot.setTitle("共享动态信道实时SER（显示降采样 + log-EMA）")
+        plotted = {}
         for name, values in series.items():
             y = np.asarray([
-                float(v) if v is not None and np.isfinite(float(v)) and float(v) > 0
-                else np.nan
+                float(v) if v is not None and np.isfinite(float(v)) and float(v) > 0 else np.nan
                 for v in values
             ], dtype=float)
-            # 逐点抖动来自块边界/瞬时信道；显示上用尾部滑动平均呈现平稳趋势，
-            # 历史点不会因新点到来而漂移。
-            y = self._trailing_mean(y, smooth_n)
-            smoothed[name] = y
+            plotted[name] = y
             curve = self._time_metric_curves.get(name)
             if curve is None:
                 color, symbol = styles[name]
@@ -1415,7 +1491,6 @@ class FDIDMTab(BaseWaveformTab):
                 self._time_metric_curves[name] = curve
             curve.setData(x, y)
 
-        # X 轴：固定宽度滚动时间窗，右边界按整步长滑动。
         window = float(self.TIME_WINDOW_SEC)
         step = float(self.TIME_WINDOW_STEP_SEC)
         t_max = float(x[-1]) if len(x) else 0.0
@@ -1424,102 +1499,106 @@ class FDIDMTab(BaseWaveformTab):
         else:
             right = float(np.ceil(t_max / step) * step)
             view = (right - window, right)
-        x_view_changed = (self._time_plot_x_view is None
-                          or abs(view[0] - self._time_plot_x_view[0]) > 1e-9
-                          or abs(view[1] - self._time_plot_x_view[1]) > 1e-9)
+        x_view_changed = (
+            self._time_plot_x_view is None
+            or abs(view[0] - self._time_plot_x_view[0]) > 1e-9
+            or abs(view[1] - self._time_plot_x_view[1]) > 1e-9
+        )
         if x_view_changed:
             self.ber_snr_plot.setXRange(*view, padding=0)
             self._time_plot_x_view = view
 
-        # Y 轴：按当前时间窗内的可见数据自动拟合（带迟滞）。只在窗口滑动、首次渲染
-        # 或数据明显越界/视野远大于数据跨度时重设，避免逐点缩放抖动；同时把高 SER
-        # 场景下挤在顶部的几条线自动拉开，而不是固定在 1e-6~1 的宽范围里。
         try:
             mask = (x >= view[0]) & (x <= view[1])
-            valid = np.concatenate([np.asarray(y)[mask] for y in smoothed.values()])
+            valid_parts = [np.asarray(y)[mask] for y in plotted.values()]
+            valid = np.concatenate(valid_parts) if valid_parts else np.zeros(0)
             valid = valid[np.isfinite(valid) & (valid > 0)]
             if valid.size:
-                lo = float(np.log10(np.nanmin(valid)))
-                hi = float(np.log10(np.nanmax(valid)))
-                ymin, ymax = self.ber_snr_plot.viewRange()[1]
-                pad = 0.35
-                min_span = 0.6
-                fit_lo = lo - pad
-                fit_hi = hi + pad
-                if fit_hi - fit_lo < min_span:
+                lo = float(np.log10(np.min(valid)))
+                hi = float(np.log10(np.max(valid)))
+                fit_lo = max(lo - 0.30, self.SER_Y_EXPAND_CLAMP[0])
+                fit_hi = min(hi + 0.30, self.SER_Y_EXPAND_CLAMP[1])
+                if fit_hi - fit_lo < 0.7:
                     mid = 0.5 * (fit_lo + fit_hi)
-                    fit_lo = mid - 0.5 * min_span
-                    fit_hi = mid + 0.5 * min_span
-                fit_lo = max(fit_lo, self.SER_Y_EXPAND_CLAMP[0])
-                fit_hi = min(fit_hi, self.SER_Y_EXPAND_CLAMP[1])
-                data_span = hi - lo
-                view_span = max(ymax - ymin, 1e-9)
-                need_fit = (
-                    x_view_changed
-                    or self._time_plot_y_fit is None
-                    or lo < ymin - 0.5
-                    or hi > ymax + 0.5
-                    or data_span < 0.35 * view_span
-                )
-                if need_fit:
+                    fit_lo, fit_hi = mid - 0.35, mid + 0.35
+                if x_view_changed or self._time_plot_y_fit is None:
                     self.ber_snr_plot.setYRange(fit_lo, fit_hi, padding=0)
                     self._time_plot_y_fit = (fit_lo, fit_hi)
+                else:
+                    old_lo, old_hi = self._time_plot_y_fit
+                    if lo < old_lo - 0.25 or hi > old_hi + 0.25:
+                        self.ber_snr_plot.setYRange(fit_lo, fit_hi, padding=0)
+                        self._time_plot_y_fit = (fit_lo, fit_hi)
         except Exception:
             pass
 
-        # switch 标签只追加新条目，不复建历史标签，避免每 tick 闪烁。
         for switch_index in range(self._time_switch_rendered, len(switches)):
             sw = switches[switch_index]
             t = max(0.0, float(sw.get("ts", ts0)) - ts0)
             idx = int(np.argmin(np.abs(x - t))) if len(x) else 0
-            try:
-                y = float(smoothed["FDIDM"][idx])
-            except Exception:
-                y = float("nan")
+            y = float(plotted["FDIDM"][idx]) if len(x) else float("nan")
             if not np.isfinite(y) or y <= 0:
                 continue
-
-            # TextItem does not inherit PlotDataItem's log transform.
-            y_log = float(np.log10(max(y, 1e-300)))
-            anchor = (0.0, 1.15) if switch_index % 2 == 0 else (0.0, -0.15)
             label = pg.TextItem(
-                text=f"({float(sw.get('to_alpha', 0.0)):g}, "
-                     f"{float(sw.get('to_beta', 0.0)):g})",
-                anchor=anchor,
+                text=f"({float(sw.get('to_alpha', 0.0)):g}, {float(sw.get('to_beta', 0.0)):g})",
+                anchor=(0.0, 1.15 if switch_index % 2 == 0 else -0.15),
                 color=(126, 47, 142),
             )
             label.setFont(QFont("Microsoft YaHei", 8))
-            label.setPos(t, y_log)
+            label.setPos(t, float(np.log10(max(y, 1e-300))))
             self.ber_snr_plot.addItem(label)
             self._time_switch_labels.append(label)
             self._time_switch_rendered = switch_index + 1
 
-        self._time_plot_eval_count = len(evals)
+        self._time_plot_eval_count = len(metric_events)
 
-    def _format_search_text(self, r):
-        """精简搜索结果文本，避免底部说明框过长影响可读性。"""
-        ch = r.get("channel_summary", {})
-        refs = r.get("references", {})
-        best_a = float(r.get("best_alpha", np.nan))
-        best_b = float(r.get("best_beta", np.nan))
-        floor = self._current_alpha_ser_floor()
-        norm_dop = ch.get("normalized_doppler", ch.get("max_doppler_hz", 0) / max(ch.get("subcarrier_spacing_hz", 1), 1))
+    def _format_search_text(self, result):
+        """Compact explanation for the fixed-snapshot practical search."""
+        channel = dict(result.get("channel_summary", {}) or {})
+        refs = dict(result.get("references", {}) or {})
+        best_a = float(result.get("best_alpha", np.nan))
+        best_b = float(result.get("best_beta", np.nan))
 
-        def ref_ser(name):
-            item = refs.get(name, {})
-            return item.get("score_ser_geomean", item.get("zf_theory_ser", np.nan))
+        def metric_ser(name):
+            try:
+                return float(refs.get(name, {}).get("ser", np.nan))
+            except Exception:
+                return float("nan")
 
         lines = [
-            f"搜索完成：α*={best_a:.1f}, β*={best_b:.1f}；步长={r.get('step', np.nan):.2f}；耗时={r.get('elapsed_s', np.nan):.2f}s。",
-            f"信道：{ch.get('channel_model','--')}，seed={ch.get('seed','--')}，fDmax≈{ch.get('max_doppler_hz',0):.0f}Hz，νmax/Δf≈{float(norm_dop):.3f}，径向系数={ch.get('doppler_radial_factor',0):.2f}。",
-            f"搜索目标：{r.get('objective','decoder-aware SER')}；SNR定义={r.get('snr_definition','Eb/N0')}；显著性={('显著' if r.get('significant', False) else '较弱')}。",
-            f"几何均值SER：OFDM={ref_ser('OFDM(0,0)'):.2e}，OTFS={ref_ser('OTFS(1,1)'):.2e}，最优={ref_ser('理论最优'):.2e}。",
-            f"左下角：α-SER曲线，β=0:0.2:2共11条；SER<{floor:.2e}按floor连线显示；自适应过程页：SER-SNR四波形对比；仿真图右下角：时间-SER四波形变化。",
-            "说明：物理信道 H_tf 固定；α/β 只改变 H_eq=Rx_FDIT·H_tf·Tx_IFDIT 的等效表示。",
+            (
+                f"当前SNR参数搜索完成：α*={best_a:g}, β*={best_b:g}；"
+                f"粗/细步长={float(result.get('step', np.nan)):.2f}/"
+                f"{float(result.get('fine_step', np.nan)):.2f}；"
+                f"候选={int(result.get('candidate_count', 0))}；"
+                f"耗时={float(result.get('elapsed_s', np.nan)):.2f}s。"
+            ),
+            (
+                f"固定信道快照：{channel.get('ntn_profile', channel.get('channel_model', '--'))}，"
+                f"seed={channel.get('seed', '--')}；带宽="
+                f"{float(channel.get('bandwidth_hz', np.nan))/1e6:.3f} MHz；"
+                f"轨道公共频移≈{float(channel.get('absolute_doppler_shift_hz', 0.0)):.0f} Hz；"
+                f"残余扩展={float(channel.get('residual_doppler_spread_hz', 0.0)):.0f} Hz。"
+            ),
+            (
+                f"同一物理信道、独立波形域SER：OFDM={metric_ser('OFDM'):.3e}，"
+                f"OTFS={metric_ser('OTFS'):.3e}，AFDM={metric_ser('AFDM'):.3e}，"
+                f"当前FDIDM={metric_ser('FDIDM'):.3e}；"
+                f"搜索后FDIDM={float(result.get('predicted_ser_best', np.nan)):.3e}。"
+            ),
+            (
+                f"预测增益={float(result.get('predicted_improvement_db', 0.0)):.2f} dB。"
+                "此结果只用于当前快照预览；实时自适应还必须通过CSI窗口、"
+                "连续稳定判决、增益门限与切换冷却。"
+            ),
+            (
+                "自适应过程页：每个SNR独立搜索α/β并在FDIDM点旁标注；"
+                "仿真图右下角：只显示当前已应用参数的时间SER，真实switch才标注。"
+            ),
         ]
-        note = str(r.get("significance_note", "")).strip()
+        note = str(result.get("significance_note", "")).strip()
         if note:
-            lines.append(f"提示：{note}")
+            lines.append("提示：" + note)
         return "\n".join(lines)
 
     def _curve_style(self, name):
@@ -1742,17 +1821,17 @@ class FDIDMTab(BaseWaveformTab):
             metrics={
                 "运行状态": (
                     f"{running_text}；frame={state.get('frame', 0)}；"
+                    f"物理时间={self._fmt(float(state.get('physical_time_s', np.nan))*1e3)} ms；"
                     f"seed={state.get('channel_seed', '--')}"
                 ),
                 "Eb/N0": (
                     f"配置={self._fmt(state.get('configured_snr_db'))} dB；"
                     f"有效={self._fmt(state.get('effective_snr_db'))} dB"
                 ),
-                # BER/FER rows are removed from the visible semantics; their
-                # generic slots are reused as separate channel-state rows.
+                # Generic base-panel slots are reused as separate channel-state rows.
                 "BER": (
-                    f"均值={self._fmt(state.get('doppler_mean_hz'))} Hz；"
-                    f"最大={self._fmt(state.get('max_doppler_hz'))} Hz"
+                    f"轨道公共={self._fmt(state.get('absolute_doppler_shift_hz'))} Hz；"
+                    f"补偿后CFO={self._fmt(state.get('residual_common_cfo_hz'))} Hz"
                 ),
                 "FER": (
                     f"均值={self._fmt(state.get('delay_mean_ns'))} ns；"
@@ -1760,18 +1839,22 @@ class FDIDMTab(BaseWaveformTab):
                     f"最大={self._fmt(state.get('max_delay_ns'))} ns"
                 ),
                 "同步度量": (
-                    f"RMS={self._fmt(state.get('doppler_spread_hz'))} Hz；"
-                    f"径向投影={self.radial_factor_spin.value():.2f}"
+                    f"配置最大={self._fmt(state.get('residual_doppler_spread_hz'))} Hz；"
+                    f"当前RMS={self._fmt(state.get('doppler_spread_hz'))} Hz；"
+                    f"Tc≈{self._fmt(float(state.get('coherence_time_s', np.nan))*1e3)} ms"
                 ),
                 "CFO估计": (
-                    f"目标={self._fmt(state.get('noise_power'))}；"
+                    f"目标噪声={self._fmt(state.get('noise_power'))}；"
                     f"实测={self._fmt(state.get('measured_noise_power'))}；"
-                    f"均衡后={self._fmt(state.get('eq_noise_power'))}；"
+                    f"均衡后={self._fmt(state.get('eq_noise_power'))}<br>"
+                    f"H功率={self._fmt(state.get('channel_power_db'))} dB；"
+                    f"相邻帧相关={self._fmt(state.get('channel_matrix_correlation'))}；"
+                    f"相对变化={self._fmt(state.get('channel_matrix_change_norm'))}<br>"
                     f"{state.get('channel_type', '--')} / {state.get('channel_mode', '--')}"
                 ),
             },
             config={
-                "波形": "FDIDM Mode-A",
+                "波形": "FDIDM",
                 "FFT/CP": f"M×N={self.m_spin.value()}×{self.n_spin.value()}；无显式CP",
                 "调制": self.mod_combo.currentText(),
                 "采样率": f"{self.m_spin.value()*self.scs_spin.value()/1000:.2f} MHz",
@@ -1784,7 +1867,7 @@ class FDIDMTab(BaseWaveformTab):
         )
         if not running and self.status_text_label is not None and not self._last_search_result:
             self.status_text_label.setText(
-                "模式A：动态块衰落默认开启。实时链路状态按帧显示有效SNR、"
+                "软波形仿真：连续多普勒默认开启。实时链路状态按帧显示有效SNR、"
                 "增益加权多普勒、时延扩展、实测噪声和当前信道seed。\n"
                 "时间图中的FDIDM使用当前已应用α/β的SER；只有真实switch事件才标注参数。"
             )
