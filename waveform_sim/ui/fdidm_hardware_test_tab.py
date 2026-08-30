@@ -1157,6 +1157,8 @@ class FDIDMHardwareTestTab(QWidget):
         rec_b = float(status.get("adaptive_recommended_beta", np.nan))
         gain = float(status.get("adaptive_predicted_improvement_db", np.nan))
         snr = float(status.get("adaptive_predicted_snr_db", np.nan))
+        step = float(status.get("adaptive_active_step", np.nan))
+        direction = str(status.get("adaptive_selected_direction", "none"))
         stable = int(status.get("adaptive_stable_count", 0))
         required = int(status.get("adaptive_stable_required", 0))
         source = str(status.get("adaptive_htf_source", ""))
@@ -1203,7 +1205,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"{status.get('cfo_source','')}, raw={float(status.get('cfo_preamble_hz',0.0)):.1f}, "
             f"alias={float(status.get('cfo_alias_hz',np.nan)):.1f}, scan={float(status.get('cfo_scan_score',np.nan)):.2f}, "
             f"BER(FEC)={float(status.get('fec_bit_ber', status.get('ber',np.nan))):.3g}, "
-            f"raw={float(status.get('raw_bit_ber',np.nan)):.3g}, EVM={evm_txt}, cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
+            f"raw={float(status.get('raw_bit_ber',np.nan)):.3g}, SER={float(status.get('measured_ser',np.nan)):.3g}, EVM={evm_txt}, cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, code={status.get('coding_scheme','')}, "
             f"TDLfit={float(status.get('tdl_param_fit_nmse',np.nan)):.2e}, const={status.get('constellation_source','none')}, "
             f"ABauto={status.get('adaptive_alpha_beta_state','off')}"

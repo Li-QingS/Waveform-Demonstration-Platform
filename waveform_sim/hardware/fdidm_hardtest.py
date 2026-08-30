@@ -182,11 +182,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._tx_base_cycle_len = 0
         self._tx_uhd_repeats = 1
         self._tx_tdl_prerendered = False
+        self._tx_peak_limited = False
+        self._tx_rms_target = 0.35
         self._tx_coded_frame_bits = np.zeros(0, dtype=np.int8)
         self._tx_coded_bits_len = 0
         self._tx_uncoded_bits_len = 0
         self._last_fec_bit_ber = float("nan")
         self._last_raw_bit_ber = float("nan")
+        self._last_measured_ser = float("nan")
 
         # Channel path. Every supported mode now traverses the real USRP RF path.
         # Baseband-only TDL loopback was removed because it does not exercise
@@ -220,6 +223,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.adaptive_alpha_beta_min_sync_metric = float(max(0.0, min(float(adaptive_alpha_beta_min_sync_metric), 1.0)))
         self.adaptive_alpha_beta_require_good_frame = bool(adaptive_alpha_beta_require_good_frame)
         self.adaptive_alpha_beta_rcond = float(max(1e-12, min(float(adaptive_alpha_beta_rcond), 1e-1)))
+        self._adaptive_active_step = float(self.adaptive_alpha_beta_coarse_step)
 
         self._estimator_auto_note = ""
         self._resolve_effective_channel_estimator()
@@ -289,6 +293,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._cached_Phi: Optional[np.ndarray] = None
         self._cached_H_cond_proxy = float("nan")
         self._full_htf_estimates = 0
+        self._diag_csi_smooth: Optional[np.ndarray] = None
+        self._diag_csi_smooth_weight = 0.2
+        self._cfo_smooth_hz = float("nan")
+        self._rx_tracking_locked = False
+        self._rx_tracking_failures = 0
+        self._latest_adaptive_diag_csi = np.zeros((self.M, self.N), dtype=np.complex128)
         self._last_process_t = 0.0
         self._tx_preview_start_t = time.time()
         self._tx_cycle_frame_count = int(self.tx_frame_count)
@@ -864,10 +874,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if self.inter_frame_guard_len > 0:
                 frames.append(guard.copy())
         tx_cycle = np.concatenate(frames) if frames else np.zeros(1, dtype=np.complex128)
-        # Peak-normalize one logical super-cycle; this preserves the
-        # training/data ratio set above.
-        peak = float(np.max(np.abs(tx_cycle)) + 1e-12)
-        tx_cycle = (0.9 / peak) * tx_cycle
+        # Normalize alpha/beta candidates to a common RMS power first. Apply a
+        # separate peak safety clamp only when the waveform crest factor exceeds
+        # the hardware limit, and expose that fact in diagnostics.
+        rms = float(np.sqrt(np.mean(np.abs(tx_cycle) ** 2))) if tx_cycle.size else 0.0
+        if rms > 1e-12:
+            tx_cycle = (float(self._tx_rms_target) / rms) * tx_cycle
+        peak = float(np.max(np.abs(tx_cycle)) + 1e-12) if tx_cycle.size else 0.0
+        self._tx_peak_limited = bool(peak > 0.9)
+        if self._tx_peak_limited:
+            tx_cycle = (0.9 / peak) * tx_cycle
         tx_wave, base_cycle_len, uhd_repeats = self._expand_waveform_for_uhd(tx_cycle.astype(np.complex64))
         tdl_prerendered = False
         if self._tdl_before_rf_enabled():
@@ -1474,12 +1490,24 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         safe_x = np.where(np.abs(x_tf) < 1e-10, 1e-10 + 0j, x_tf)
         h_cell = (y_tf / safe_x).astype(np.complex128)           # raw per-cell
 
+        # Smooth the complete time-frequency pilot estimate once per frame.  The
+        # equalizer below still consumes the time average, while the adaptive
+        # worker receives this time-resolved copy so beta is not erased.
+        weight = float(np.clip(getattr(self, "_diag_csi_smooth_weight", 0.2), 0.02, 1.0))
+        previous = getattr(self, "_diag_csi_smooth", None)
+        if previous is not None and np.shape(previous) == np.shape(h_cell) and np.all(np.isfinite(previous)):
+            h_cell_smooth = ((1.0 - weight) * np.asarray(previous, dtype=np.complex128) + weight * h_cell)
+        else:
+            h_cell_smooth = h_cell.copy()
+        self._diag_csi_smooth = h_cell_smooth.copy()
+        self._latest_adaptive_diag_csi = h_cell_smooth.copy()
+
         # (1) average across the N pilot OFDM symbols -> per-subcarrier response.
-        h_freq = np.mean(h_cell, axis=1)                         # (M,)
+        h_freq = np.mean(h_cell_smooth, axis=1)                   # (M,)
 
         # Per-cell noise variance directly from the pilot residual (this is the
         # quantity the diagonal MMSE load wants; far more reliable than the guard).
-        resid = h_cell - h_freq[:, None]
+        resid = h_cell_smooth - h_freq[:, None]
         noise_var_cell = float(np.mean(np.abs(resid) ** 2)) if resid.size > h_freq.size else float("nan")
 
         # (2) impulse-response denoising of the averaged response.
@@ -2080,6 +2108,18 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         _, ber, raw_ber, frame_bytes, payload, text, match, decode_ok, syms_best, evm = best
         self._last_fec_bit_ber = float(ber)
         self._last_raw_bit_ber = float(raw_ber)
+        try:
+            ref_syms = self._known_preamble_ref_syms()
+            ll = int(min(ref_syms.size, syms_best.size))
+            if ll > 0:
+                refs = ref_syms[:ll]
+                ideal = self._ideal_constellation_points()
+                decisions = ideal[np.argmin(np.abs(syms_best[:ll, None] - ideal[None, :]), axis=1)]
+                self._last_measured_ser = float(np.mean(decisions != refs))
+            else:
+                self._last_measured_ser = float("nan")
+        except Exception:
+            self._last_measured_ser = float("nan")
         return float(ber), frame_bytes, payload, text, int(match), bool(decode_ok), syms_best, float(evm)
 
     def _known_preamble_ref_syms(self) -> np.ndarray:
@@ -2479,6 +2519,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._rx_probe_total_est = 0
             self._rx_probe_last_fp = None
             self._last_processed_abs_start = -10 ** 18
+            self._diag_csi_smooth = None
+            self._cfo_smooth_hz = float("nan")
+            self._rx_tracking_locked = False
+            self._rx_tracking_failures = 0
+            self._latest_adaptive_diag_csi = np.zeros((self.M, self.N), dtype=np.complex128)
+            if hasattr(self, "_adaptive_active_step"):
+                self._adaptive_active_step = float(getattr(self, "adaptive_alpha_beta_coarse_step", 0.25))
         self._needs_top_block_rebuild = False
 
     def _current_cfo_mode_key(self) -> str:
@@ -2521,6 +2568,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._ber_estimate = float("nan")
             self._last_fec_bit_ber = float("nan")
             self._last_raw_bit_ber = float("nan")
+            self._last_measured_ser = float("nan")
             self.last_frame_ok = False
             self.last_bad_reason = reason
             self.last_sync_metric = 0.0
@@ -2558,6 +2606,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     f"startup settle armed: {self.startup_settle_sec*1000:.0f} ms + "
                     f"{self._rx_settle_windows_remaining} fresh RX vector(s)")
 
+    def _arm_live_transition(self):
+        """Discard only two receive windows after an in-place waveform swap."""
+        self._rx_settle_until_wall = time.time()
+        self._rx_settle_windows_remaining = 2
+        self._debug("INFO", "live transition armed: 2 fresh RX vector(s), no startup delay")
+
     def _in_startup_settle(self, rx_new_samples: int) -> bool:
         now = time.time()
         settling_time = now < float(getattr(self, "_rx_settle_until_wall", 0.0))
@@ -2591,7 +2645,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         return (f"len={wf.size}, base_cycle={int(getattr(self, '_tx_base_cycle_len', 0))}, "
                 f"repeats={int(getattr(self, '_tx_uhd_repeats', 1))}, "
                 f"coding={self._coding_summary()}, tdl_prerender={bool(getattr(self, '_tx_tdl_prerendered', False))}, "
-                f"energy={energy:.3f}, hash=0x{fold:08x}, "
+                f"energy={energy:.3f}, rms_target={float(getattr(self, '_tx_rms_target', 0.0)):.3f}, "
+                f"peak_limited={bool(getattr(self, '_tx_peak_limited', False))}, hash=0x{fold:08x}, "
                 f"data_mid_idx={mid_idx}, data_mid={mid:.4f}")
 
     def get_waveform_fingerprint(self) -> str:
@@ -3161,7 +3216,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             # while stopped, so the next start cannot replay stale samples.
             self._sync_waveform_to_top_block()
             if self._running:
-                self._arm_startup_settle()
+                self._arm_live_transition()
             self._debug("INFO", self._format_link_limit_summary())
 
         if rebuild_top_block and not self._running:
@@ -3398,6 +3453,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             with self._lock:
                 self.last_frame_ok = False
                 self.last_bad_reason = f"sync_peak_not_found({max_metric:.3f})"
+            self._rx_tracking_failures = int(getattr(self, "_rx_tracking_failures", 0)) + 1
+            if self._rx_tracking_failures >= 2:
+                self._rx_tracking_locked = False
+                self._cfo_smooth_hz = float("nan")
             cfo_note = "" if known_cfo is None else f", knownCFO={float(known_cfo):.1f}Hz"
             self._debug("DEBUG",
                         f"no sync peak above threshold: max_metric={max_metric:.3f}, "
@@ -3466,6 +3525,24 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     pilot_samples = frame[self._off_pilot:self._off_data]
                     data_samples = frame[self._off_data:self._off_end]
                     cfo_hz = cfo_hz + res_cfo
+
+            # Smooth valid CFO estimates across frames. The first estimate is
+            # used unchanged; later updates suppress random preamble phase jitter
+            # with one scalar multiply/add and no extra search.
+            if np.isfinite(cfo_hz):
+                cfo_frame_value = float(cfo_hz)
+                cfo_weight = 0.2
+                prev_cfo = float(getattr(self, "_cfo_smooth_hz", float("nan")))
+                if np.isfinite(prev_cfo) and abs(float(cfo_hz) - prev_cfo) < max(1000.0, 0.1 * self.sample_rate):
+                    cfo_hz = (1.0 - cfo_weight) * prev_cfo + cfo_weight * float(cfo_hz)
+                if abs(float(cfo_hz) - cfo_frame_value) > 1e-9:
+                    t_idx3 = np.arange(frame.size, dtype=np.float64)
+                    frame = frame * np.exp(-1j * 2.0 * np.pi * (float(cfo_hz) - cfo_frame_value) * t_idx3 / max(self.sample_rate, 1e-12))
+                    pilot_samples = frame[self._off_pilot:self._off_data]
+                    data_samples = frame[self._off_data:self._off_end]
+                self._cfo_smooth_hz = float(cfo_hz)
+                self._rx_tracking_locked = True
+                self._rx_tracking_failures = 0
 
             htf_cache_refreshing = False
             htf_old_snapshot = None
@@ -3575,7 +3652,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 pilot_samples=pilot_samples.astype(np.complex64),
                 data_samples=data_samples.astype(np.complex64),
                 evm_inst=float(evm_inst),
-                adaptive_htf=h_tf_est,
+                adaptive_htf=(getattr(self, "_latest_adaptive_diag_csi", h_tf_est)
+                              if not (self.use_full_htf or self.use_tdl_param_htf) else h_tf_est),
                 adaptive_htf_kind=("full" if (self.use_full_htf or self.use_tdl_param_htf) else "diag"),
                 adaptive_htf_source=("full_htf" if self.use_full_htf else ("tdl_param" if self.use_tdl_param_htf else "diag_tf")),
                 htf_cache_refreshing=bool(htf_cache_refreshing),
@@ -3690,6 +3768,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "ber": float(best.get("ber", float("nan"))),
                 "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
                 "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
+                "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
                 "sync_metric": float(best.get("sync_metric", float("nan"))),
                 "cond_h_cross": float(best.get("cond_h", float("nan"))),
                 "noise_var": float(best.get("noise_var", float("nan"))),
@@ -3718,7 +3797,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             f"v33 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
             f"alias={best.get('cfo_alias_hz', float('nan')):.1f}Hz, scanScore={best.get('cfo_scan_score', float('nan')):.3f}, "
             f"Hleak={best['htf_leakage']:.3f}, cond={best['cond_h']:.2e}, "
-            f"BER={best['ber']:.3e}, rawBER={float(getattr(self, '_last_raw_bit_ber', float('nan'))):.3e}, FECBER={float(getattr(self, '_last_fec_bit_ber', float('nan'))):.3e}, EVM={best['evm_inst']:.2f}%, "
+            f"BER={best['ber']:.3e}, rawBER={float(getattr(self, '_last_raw_bit_ber', float('nan'))):.3e}, SER={float(getattr(self, '_last_measured_ser', float('nan'))):.3e}, FECBER={float(getattr(self, '_last_fec_bit_ber', float('nan'))):.3e}, EVM={best['evm_inst']:.2f}%, "
             f"noise_var={best['noise_var']:.2e}, "
             f"TDLfit={float(getattr(self, '_last_tdl_param_fit_nmse', float('nan'))):.2e}/"
             f"{int(getattr(self, 'last_tdl_param_path_count', 0))}p, "
@@ -3827,13 +3906,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self.start()
 
     def set_alpha_beta(self, alpha: Optional[float] = None, beta: Optional[float] = None):
-        was_running = bool(self._running)
-        if was_running:
-            self.stop()
+        # Alpha/beta changes preserve graph geometry and are therefore safe to
+        # apply through the in-place vector-source swap. Structural parameters
+        # continue to use configure()'s explicit "stop first" guard.
         self.configure(alpha=self.alpha if alpha is None else alpha,
                        beta=self.beta if beta is None else beta)
-        if was_running:
-            self.start()
 
     def _create_python_logger(self) -> logging.Logger:
         """Create optional standard-logging handlers for backend diagnostics."""
@@ -4182,6 +4259,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "adaptive_predicted_ser_best": float(adaptive_ab.get("predicted_ser_best", float("nan"))),
                 "adaptive_predicted_improvement_db": float(adaptive_ab.get("predicted_improvement_db", float("nan"))),
                 "adaptive_predicted_snr_db": float(adaptive_ab.get("predicted_snr_db", float("nan"))),
+                "adaptive_active_step": float(adaptive_ab.get("active_step", getattr(self, "_adaptive_active_step", 0.25))),
+                "adaptive_next_active_step": float(adaptive_ab.get("next_active_step", getattr(self, "_adaptive_active_step", 0.25))),
+                "adaptive_selected_direction": str(adaptive_ab.get("selected_direction", "none")),
+                "adaptive_alpha_observable": bool(adaptive_ab.get("alpha_observable", False)),
+                "adaptive_beta_observable": bool(adaptive_ab.get("beta_observable", False)),
+                "adaptive_alpha_span": float(adaptive_ab.get("alpha_span", float("nan"))),
+                "adaptive_beta_span": float(adaptive_ab.get("beta_span", float("nan"))),
+                "tx_peak_limited": bool(getattr(self, "_tx_peak_limited", False)),
                 "adaptive_stable_count": int(adaptive_ab.get("stable_count", 0)),
                 "adaptive_stable_required": int(adaptive_ab.get("stable_required", 0)),
                 "adaptive_htf_source": str(adaptive_ab.get("htf_source", "")),

@@ -255,103 +255,86 @@ class FDIDMAdaptiveMixin:
         M = int(snapshot["M"]); N = int(snapshot["N"]); K = M * N
         if K > int(snapshot.get("max_order", 512)):
             raise ValueError(f"adaptive search skipped: M*N={K} exceeds max_order={snapshot.get('max_order')}")
+
         prepared, predicted_snr_db = self._adaptive_prepare_base(snapshot)
         diagonal_fast_path = str(prepared.get("kind")) == "diag_weights"
-        coarse_step = float(snapshot.get("coarse_step", 0.25))
-        fine_step = float(snapshot.get("fine_step", 0.05))
-        # Full H_TF searches are substantially heavier than diagonal-TF searches.
-        # A 0.5 coarse grid plus coordinate refinement keeps the optimizer from
-        # starving the hardware host while still finishing at the requested fine step.
-        effective_coarse = coarse_step if diagonal_fast_path else max(coarse_step, 0.50)
-        coarse_vals = self._adaptive_grid_values(effective_coarse)
-        coarse_candidates = [(float(a), float(bb)) for a in coarse_vals for bb in coarse_vals]
-        coarse_results = self._adaptive_evaluate_candidates(prepared, coarse_candidates, M, N, snapshot["mod_order"])
-        coarse_results.sort(key=lambda r: (r["ser"], r["alpha"], r["beta"]))
+        coarse_step = float(max(snapshot.get("coarse_step", 0.25), 0.01))
+        fine_step = float(max(snapshot.get("fine_step", 0.05), 0.01))
+        active_step = float(getattr(self, "_adaptive_active_step", coarse_step))
+        if not np.isfinite(active_step) or active_step <= 0.0:
+            active_step = coarse_step
+        active_step = min(active_step, coarse_step)
 
-        refine_candidates = set()
-        if diagonal_fast_path:
-            # Cheap exact two-dimensional refinement around three basins.
-            radius = max(effective_coarse, 2.0 * fine_step)
-            for seed in coarse_results[:3]:
-                a0 = float(seed["alpha"]); b0 = float(seed["beta"])
-                av = np.arange(max(0.0, a0 - radius), min(2.0, a0 + radius) + 0.5 * fine_step, fine_step)
-                bv = np.arange(max(0.0, b0 - radius), min(2.0, b0 + radius) + 0.5 * fine_step, fine_step)
-                for a in av:
-                    for bb in bv:
-                        refine_candidates.add((round(float(np.clip(a, 0.0, 2.0)), 9),
-                                               round(float(np.clip(bb, 0.0, 2.0)), 9)))
-        else:
-            # Full-matrix coordinate refinement around the two best coarse basins.
-            radius = max(0.5 * effective_coarse, 2.0 * fine_step)
-            for seed in coarse_results[:2]:
-                a0 = float(seed["alpha"]); b0 = float(seed["beta"])
-                av = np.arange(max(0.0, a0 - radius), min(2.0, a0 + radius) + 0.5 * fine_step, fine_step)
-                bv = np.arange(max(0.0, b0 - radius), min(2.0, b0 + radius) + 0.5 * fine_step, fine_step)
-                for a in av:
-                    refine_candidates.add((round(float(np.clip(a, 0.0, 2.0)), 9), round(b0, 9)))
-                for bb in bv:
-                    refine_candidates.add((round(a0, 9), round(float(np.clip(bb, 0.0, 2.0)), 9)))
-
-        current_alpha = float(snapshot.get("alpha", 0.0))
-        current_beta = float(snapshot.get("beta", 0.0))
-        current_canonical = (round(self._adaptive_canonical_index(current_alpha), 9),
-                             round(self._adaptive_canonical_index(current_beta), 9))
-        refine_candidates.update({current_canonical, (0.0, 0.0), (1.0, 1.0), (0.5, 1.0)})
-        fine_results = self._adaptive_evaluate_candidates(prepared, sorted(refine_candidates), M, N, snapshot["mod_order"])
-
-        by_key: Dict[Tuple[float, float], Dict[str, float]] = {}
-        for item in coarse_results + fine_results:
-            key = (round(item["alpha"], 9), round(item["beta"], 9))
-            old = by_key.get(key)
-            if old is None or item["ser"] < old["ser"]:
-                by_key[key] = item
-        all_results = list(by_key.values())
-        all_results.sort(key=lambda r: (r["ser"], r["alpha"], r["beta"]))
-        raw_best = all_results[0]
-
-        current_eval = self._adaptive_evaluate_candidates(
-            prepared, [(current_alpha, current_beta)], M, N, snapshot["mod_order"]
-        )[0]
+        current_alpha = float(np.clip(snapshot.get("alpha", 0.0), 0.0, 2.0))
+        current_beta = float(np.clip(snapshot.get("beta", 0.0), 0.0, 2.0))
+        current = (round(current_alpha, 9), round(current_beta, 9))
+        step = active_step
+        candidates = {current}
+        for da, db in ((-step, 0.0), (step, 0.0), (0.0, -step), (0.0, step)):
+            candidates.add((round(float(np.clip(current_alpha + da, 0.0, 2.0)), 9),
+                           round(float(np.clip(current_beta + db, 0.0, 2.0)), 9)))
+        results = self._adaptive_evaluate_candidates(
+            prepared, sorted(candidates), M, N, snapshot["mod_order"]
+        )
+        by_key = {(round(float(r["alpha"]), 9), round(float(r["beta"]), 9)): r for r in results}
+        current_eval = by_key[current]
         current_ser = float(current_eval["ser"])
+        # A span below this floor is measurement/numerical noise, not an
+        # observable axis.  The relative part scales with the current SER while
+        # the absolute part keeps near-zero SER from producing false switches.
+        flat_floor = max(1e-12, abs(current_ser) * 1e-3)
+        alpha_neighbours = [r for key, r in by_key.items() if key[1] == current[1] and key[0] != current[0]]
+        beta_neighbours = [r for key, r in by_key.items() if key[0] == current[0] and key[1] != current[1]]
+        alpha_span = (max([current_ser] + [float(r["ser"]) for r in alpha_neighbours]) -
+                      min([current_ser] + [float(r["ser"]) for r in alpha_neighbours])) if alpha_neighbours else 0.0
+        beta_span = (max([current_ser] + [float(r["ser"]) for r in beta_neighbours]) -
+                     min([current_ser] + [float(r["ser"]) for r in beta_neighbours])) if beta_neighbours else 0.0
+        alpha_observable = bool(alpha_span > flat_floor)
+        beta_observable = bool(beta_span > flat_floor)
 
-        # Prefer the current point on a numerical tie; this prevents needless
-        # switching on a flat/identity channel.
-        tie_limit = float(raw_best["ser"]) * (1.0 + 1e-10) + 1e-15
-        tied = [r for r in all_results if r["ser"] <= tie_limit]
-        best = min(tied, key=lambda r: ((r["alpha"] - current_canonical[0]) ** 2 +
-                                        (r["beta"] - current_canonical[1]) ** 2,
-                                        r["alpha"], r["beta"]))
-
-        # Paper-aligned complexity policy: if an integer-index waveform is within
-        # a small SER margin of the fractional optimum, use the integer point.
-        margin_db = float(snapshot.get("integer_margin_db", 0.0))
-        integer_limit = float(best["ser"]) * (10.0 ** (margin_db / 10.0)) + 1e-15
-        integer_results = [r for r in all_results
-                           if abs(r["alpha"] - round(r["alpha"])) < 1e-9
-                           and abs(r["beta"] - round(r["beta"])) < 1e-9
-                           and r["ser"] <= integer_limit
-                           and r["ser"] < current_ser * (1.0 - 1e-10)]
-        if integer_results:
-            best = min(integer_results, key=lambda r: (r["ser"],
-                                                       (r["alpha"] - current_canonical[0]) ** 2 +
-                                                       (r["beta"] - current_canonical[1]) ** 2))
-
+        eligible = [r for r in results if r is not current_eval]
+        eligible = [r for r in eligible if not (
+            (float(r["alpha"]) != current[0] and not alpha_observable) or
+            (float(r["beta"]) != current[1] and not beta_observable)
+        )]
+        best = min([current_eval] + eligible, key=lambda r: (float(r["ser"]),
+                                                               abs(float(r["alpha"]) - current[0]) +
+                                                               abs(float(r["beta"]) - current[1])))
         best_ser = float(best["ser"])
         improvement_db = 10.0 * math.log10(max(current_ser, 1e-15) / max(best_ser, 1e-15))
-        ofdm = by_key.get((0.0, 0.0), {"ser": float("nan")})
-        otfs = by_key.get((1.0, 1.0), {"ser": float("nan")})
+        min_gain_db = float(snapshot.get("min_improvement_db", 0.0))
+        meaningful = bool(best is not current_eval and improvement_db >= min_gain_db)
+
+        # At the coarse step, a failed move simply arms the fine step for the
+        # next snapshot.  A successful move remains one coarse step at a time.
+        next_step = step if meaningful or step <= fine_step + 1e-12 else fine_step
+        recommended = best if meaningful else current_eval
+        direction = "none"
+        if meaningful:
+            if float(recommended["alpha"]) != current[0]:
+                direction = "alpha"
+            elif float(recommended["beta"]) != current[1]:
+                direction = "beta"
+        self._adaptive_active_step = float(next_step)
         return {
-            "recommended_alpha": float(best["alpha"]),
-            "recommended_beta": float(best["beta"]),
+            "recommended_alpha": float(recommended["alpha"]),
+            "recommended_beta": float(recommended["beta"]),
             "predicted_ser_current": current_ser,
-            "predicted_ser_best": best_ser,
-            "predicted_ser_ofdm": float(ofdm.get("ser", float("nan"))),
-            "predicted_ser_otfs": float(otfs.get("ser", float("nan"))),
-            "predicted_improvement_db": float(improvement_db),
+            "predicted_ser_best": float(recommended["ser"]),
+            "predicted_ser_ofdm": float(by_key.get((0.0, 0.0), {}).get("ser", float("nan"))),
+            "predicted_ser_otfs": float(by_key.get((1.0, 1.0), {}).get("ser", float("nan"))),
+            "predicted_improvement_db": float(improvement_db if meaningful else 0.0),
             "predicted_snr_db": float(predicted_snr_db),
-            "candidate_count": int(len(all_results) + 1),
+            "candidate_count": int(len(results)),
             "search_seconds": float(time.time() - t0),
-            "search_mode": "diag_2d" if diagonal_fast_path else "full_coordinate",
+            "search_mode": "diag_five_point" if diagonal_fast_path else "full_five_point",
+            "active_step": float(step),
+            "next_active_step": float(next_step),
+            "selected_direction": direction,
+            "alpha_span": float(alpha_span),
+            "beta_span": float(beta_span),
+            "alpha_observable": alpha_observable,
+            "beta_observable": beta_observable,
             "htf_source": str(snapshot.get("htf_source", "unknown")),
             "htf_kind": str(snapshot.get("htf_kind", "unknown")),
             "equalizer": str(snapshot.get("equalizer", "")),
@@ -491,6 +474,7 @@ class FDIDMAdaptiveMixin:
                 "htf": htf_payload, "htf_kind": str(htf_kind), "htf_source": str(htf_source),
                 "coarse_step": float(self.adaptive_alpha_beta_coarse_step),
                 "fine_step": float(self.adaptive_alpha_beta_fine_step),
+                "min_improvement_db": float(self.adaptive_alpha_beta_min_improvement_db),
                 "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "rcond": float(self.adaptive_alpha_beta_rcond),
@@ -522,6 +506,7 @@ class FDIDMAdaptiveMixin:
             snap["mod_order"] = str(self.mod_order); snap["equalizer"] = str(self.equalizer)
             snap["coarse_step"] = float(self.adaptive_alpha_beta_coarse_step)
             snap["fine_step"] = float(self.adaptive_alpha_beta_fine_step)
+            snap["min_improvement_db"] = float(self.adaptive_alpha_beta_min_improvement_db)
             snap["integer_margin_db"] = float(self.adaptive_alpha_beta_integer_margin_db)
             snap["max_order"] = int(self.adaptive_alpha_beta_max_order)
             snap["rcond"] = float(self.adaptive_alpha_beta_rcond)
@@ -552,6 +537,13 @@ class FDIDMAdaptiveMixin:
                 "predicted_ser_otfs": float(rec.get("predicted_ser_otfs", float("nan"))),
                 "predicted_improvement_db": float(rec.get("predicted_improvement_db", float("nan"))),
                 "predicted_snr_db": float(rec.get("predicted_snr_db", float("nan"))),
+                "active_step": float(rec.get("active_step", getattr(self, "_adaptive_active_step", getattr(self, "adaptive_alpha_beta_coarse_step", 0.25)))),
+                "next_active_step": float(rec.get("next_active_step", getattr(self, "_adaptive_active_step", getattr(self, "adaptive_alpha_beta_coarse_step", 0.25)))),
+                "selected_direction": str(rec.get("selected_direction", "none")),
+                "alpha_span": float(rec.get("alpha_span", float("nan"))),
+                "beta_span": float(rec.get("beta_span", float("nan"))),
+                "alpha_observable": bool(rec.get("alpha_observable", False)),
+                "beta_observable": bool(rec.get("beta_observable", False)),
                 "stable_count": int(rec.get("stable_count", 0)),
                 "stable_required": int(rec.get("stable_required", self.adaptive_alpha_beta_stability_evals)),
                 "candidate_count": int(rec.get("candidate_count", 0)),
