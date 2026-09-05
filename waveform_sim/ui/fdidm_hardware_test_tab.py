@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,72 @@ AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
 
 
+@dataclass
+class ComparisonPhaseRecord:
+    """One completed baseline/adaptive phase of a single-USRP comparison."""
+    mode: str
+    round_index: int
+    alpha: float = float("nan")
+    beta: float = float("nan")
+    frames_processed: int = 0
+    frames_decode_ok: int = 0
+    crc_success_ratio: float = float("nan")
+    match_ratio: float = float("nan")
+    measured_ser: float = float("nan")
+    fec_bit_ber: float = float("nan")
+    evm_average_percent: float = float("nan")
+    valid_sample_count: int = 0
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def as_dict(self):
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+@dataclass
+class ComparisonSummary:
+    baseline: list = field(default_factory=list)
+    adaptive: list = field(default_factory=list)
+    conclusion_available: bool = False
+    improvement: dict = field(default_factory=dict)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+
+@dataclass
+class ComparisonSession:
+    active: bool = False
+    phase: str = "idle"
+    phase_index: int = 0
+    total_phases: int = 0
+    phase_started_at: float = 0.0
+    phase_duration_sec: float = 10.0
+    baseline_alpha: float = 0.5
+    baseline_beta: float = 1.0
+    repeat_count: int = 2
+    phase_start_frames: int = 0
+    phase_start_ok: int = 0
+    phase_samples: list = field(default_factory=list)
+    records: list = field(default_factory=list)
+    history: dict = field(default_factory=lambda: {"baseline": [], "adaptive": []})
+    summary: ComparisonSummary = field(default_factory=ComparisonSummary)
+
+    def reset(self):
+        self.active = False
+        self.phase = "idle"
+        self.phase_index = 0
+        self.total_phases = 0
+        self.phase_started_at = 0.0
+        self.phase_start_frames = 0
+        self.phase_start_ok = 0
+        self.phase_samples.clear()
+        self.records.clear()
+        self.history = {"baseline": [], "adaptive": []}
+        self.summary = ComparisonSummary()
+
+
 
 from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas, _PlotGridCell
 
@@ -52,6 +119,15 @@ class FDIDMHardwareTestTab(QWidget):
         self._pending_apply = False
         self._suppress_param_signals = False
         self._last_adaptive_recommendation_seq = 0
+        self.comparison_session = ComparisonSession()
+        self._comparison_tick_busy = False
+        self._comparison_evm_x = 0
+        self._adaptive_observation_state = None
+        self._adaptive_observation_started_at = 0.0
+        self._adaptive_observation_samples = []
+        self._adaptive_observation_records = []
+        self._adaptive_toggle_markers = []
+        self._adaptive_toggle_pending = False
         self._surface_metric_items = [
             ("EVM平均(%)", "evm_average_percent", "lower"),
             ("BER(FEC)", "fec_bit_ber", "lower"),
@@ -214,7 +290,9 @@ class FDIDMHardwareTestTab(QWidget):
         adapt.setHorizontalSpacing(5)
         adapt.setVerticalSpacing(5)
         self.adaptive_enable_check = QCheckBox("启用信道自适应")
-        self.adaptive_enable_check.setChecked(True)
+        # The demo starts in fixed mode so the operator can explicitly enable
+        # adaptation and observe the before/after change.
+        self.adaptive_enable_check.setChecked(False)
         self.adaptive_auto_apply_check = QCheckBox("自动应用稳定推荐")
         self.adaptive_auto_apply_check.setChecked(True)
         self.adaptive_coarse_spin = self._dspin(0.05, 1.0, 0.25, 2, "", 0.05)
@@ -244,6 +322,32 @@ class FDIDMHardwareTestTab(QWidget):
         layout.addWidget(adapt_group)
 
         modem_group = QGroupBox("收发/显示")
+        comparison_group = QGroupBox("单 USRP 优势对比")
+        comparison = QGridLayout(comparison_group)
+        comparison.setHorizontalSpacing(5)
+        comparison.setVerticalSpacing(5)
+        self.comparison_baseline_alpha_spin = self._dspin(-2.0, 2.0, self.alpha_spin.value(), 2, "", 0.05)
+        self.comparison_baseline_beta_spin = self._dspin(-2.0, 2.0, self.beta_spin.value(), 2, "", 0.05)
+        self.comparison_duration_spin = self._spin(2, 120, 10)
+        self.comparison_repeat_spin = self._spin(1, 10, 2)
+        self.btn_start_comparison = QPushButton("开始对比演示")
+        self.btn_stop_comparison = QPushButton("停止对比")
+        self.btn_stop_comparison.setEnabled(False)
+        self.comparison_status_label = QLabel("对比：未开始")
+        self.comparison_status_label.setWordWrap(True)
+        comparison.addWidget(QLabel("基线 α"), 0, 0); comparison.addWidget(self.comparison_baseline_alpha_spin, 0, 1)
+        comparison.addWidget(QLabel("基线 β"), 0, 2); comparison.addWidget(self.comparison_baseline_beta_spin, 0, 3)
+        comparison.addWidget(QLabel("阶段秒数"), 1, 0); comparison.addWidget(self.comparison_duration_spin, 1, 1)
+        comparison.addWidget(QLabel("交替轮数"), 1, 2); comparison.addWidget(self.comparison_repeat_spin, 1, 3)
+        comparison.addWidget(self.btn_start_comparison, 2, 0, 1, 2)
+        comparison.addWidget(self.btn_stop_comparison, 2, 2, 1, 2)
+        comparison.addWidget(self.comparison_status_label, 3, 0, 2, 4)
+        comparison_note = QLabel("同一台 USRP 按 baseline → adaptive 交替运行，用实测 CRC、SER、EVM 和文本恢复证明软波形自适应收益。")
+        comparison_note.setWordWrap(True)
+        comparison.addWidget(comparison_note, 5, 0, 1, 4)
+        layout.addWidget(comparison_group)
+        comparison_group.setVisible(False)
+
         modem = QGridLayout(modem_group)
         modem.setHorizontalSpacing(5)
         modem.setVerticalSpacing(5)
@@ -313,6 +417,20 @@ class FDIDMHardwareTestTab(QWidget):
         # 右侧四幅图必须在同一个 QGridLayout 中按 1:1 / 1:1 分配空间。
         # 不再用垂直 splitter 挤压 plot_panel，避免 OpenGL/pyqtgraph 上排图
         # 在小窗口下把下排图遮住或挤到不可见。
+        self.comparison_result_group = QGroupBox("自适应效果观测")
+        result_grid = QGridLayout(self.comparison_result_group)
+        self.comparison_phase_label = QLabel("自适应：未开始")
+        self.comparison_baseline_result_label = QLabel("开启前：—")
+        self.comparison_adaptive_result_label = QLabel("开启后：—")
+        self.comparison_improvement_label = QLabel("变化：—")
+        self.comparison_phase_label.setStyleSheet("font-weight: 600; color: #333333;")
+        self.comparison_improvement_label.setStyleSheet("font-weight: 600; color: #167c3a;")
+        for col, widget in enumerate((self.comparison_phase_label, self.comparison_baseline_result_label,
+                                      self.comparison_adaptive_result_label, self.comparison_improvement_label)):
+            result_grid.addWidget(widget, 0, col)
+        self.comparison_result_group.setMaximumHeight(62)
+        layout.addWidget(self.comparison_result_group, 0)
+
         plot_panel = QWidget()
         plot_panel.setMinimumSize(0, 0)
         plot_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -384,7 +502,11 @@ class FDIDMHardwareTestTab(QWidget):
         layout.addWidget(text_panel, 0)
 
         self.rx_curve = self.rx_spectrum_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2))
-        self.evm_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_PURPLE, width=2))
+        self.evm_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_PURPLE, width=2), name="current EVM")
+        self.evm_baseline_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2), name="before adaptive")
+        self.evm_adaptive_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_BLUE, width=2), name="after adaptive")
+        self.evm_baseline_curve.setVisible(False)
+        self.evm_adaptive_curve.setVisible(False)
         self.constellation_scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(237, 177, 32, 160))
         self.constellation_plot.addItem(self.constellation_scatter)
         return panel
@@ -562,6 +684,8 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_connect.clicked.connect(self._on_connect_clicked)
         self.btn_start_test.clicked.connect(self._on_start_test_clicked)
         self.btn_stop_test.clicked.connect(self._on_stop_test_clicked)
+        self.btn_start_comparison.clicked.connect(self._start_comparison_demo)
+        self.btn_stop_comparison.clicked.connect(self._stop_comparison_demo)
         self.btn_export_log.clicked.connect(self._on_export_log_clicked)
         self.btn_apply_params.clicked.connect(self._apply_params_to_backend)
         self.btn_ofdm.clicked.connect(lambda: self._set_indices(0.0, 0.0))
@@ -570,7 +694,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_reset_hcache.clicked.connect(self._on_reset_hcache_clicked)
         self.btn_clear_ab_surface.clicked.connect(self._on_clear_ab_surface_clicked)
         self.btn_adaptive_evaluate.clicked.connect(self._on_adaptive_evaluate_clicked)
-        self.adaptive_enable_check.stateChanged.connect(lambda _: self._on_adaptive_config_changed())
+        self.adaptive_enable_check.stateChanged.connect(self._on_adaptive_enable_changed)
         self.adaptive_auto_apply_check.stateChanged.connect(lambda _: self._handle_alpha_beta_adaptation(self.backend.get_status()) if self.backend is not None else None)
         for w in (self.adaptive_coarse_spin, self.adaptive_fine_spin, self.adaptive_interval_spin,
                   self.adaptive_stability_spin, self.adaptive_min_gain_spin, self.adaptive_cooldown_spin):
@@ -615,6 +739,9 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _on_start_test_clicked(self):
         try:
+            if not self.comparison_session.active:
+                self.comparison_session.reset()
+                self._update_adaptive_observation_display()
             if self.backend is None:
                 self._create_backend()
             else:
@@ -629,6 +756,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
+            self._reset_adaptive_observation(bool(self.adaptive_enable_check.isChecked()))
             self._log("v35 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
@@ -636,6 +764,8 @@ class FDIDMHardwareTestTab(QWidget):
             self._log(f"开始测试失败: {type(e).__name__}: {e}")
 
     def _on_stop_test_clicked(self):
+        if self.comparison_session.active:
+            self._stop_comparison_demo()
         self.test_running = False
         self.update_timer.stop()
         if self.backend is not None:
@@ -651,6 +781,7 @@ class FDIDMHardwareTestTab(QWidget):
         self._set_hw_controls_enabled(True)
         self._set_test_controls_enabled(True)
         self._clear_plots()
+        self._finalize_adaptive_observation_segment()
         self.decode_status_label.setText("解调状态：已停止")
         self._log("停止 FDIDM 测试。")
 
@@ -713,6 +844,316 @@ class FDIDMHardwareTestTab(QWidget):
                 self._log(f"界面日志已导出：{path}")
         except Exception as e:
             self._log(f"导出日志失败: {type(e).__name__}: {e}")
+
+    # ---------------- manual adaptive observation ----------------
+    def _reset_adaptive_observation(self, enabled=None):
+        self._adaptive_observation_state = bool(self.adaptive_enable_check.isChecked() if enabled is None else enabled)
+        self._adaptive_observation_started_at = time.monotonic()
+        self._adaptive_observation_samples = []
+        self._adaptive_observation_start_frames = 0
+        self._adaptive_observation_start_ok = 0
+        self._adaptive_observation_records = []
+        self._adaptive_toggle_pending = False
+        for marker in list(self._adaptive_toggle_markers):
+            try:
+                self.evm_plot.removeItem(marker)
+            except Exception:
+                pass
+        self._adaptive_toggle_markers = []
+        self._update_adaptive_observation_display()
+
+    @staticmethod
+    def _observation_metric_sample(status, stats):
+        return {
+            "match_ratio": float(status.get("match_ratio", stats.get("match_ratio", np.nan))),
+            "measured_ser": float(status.get("measured_ser", np.nan)),
+            "fec_bit_ber": float(status.get("fec_bit_ber", status.get("ber", np.nan))),
+            "evm_average_percent": float(status.get("evm_average_percent", status.get("evm_percent", np.nan))),
+            "crc_success_ratio": (
+                float(status.get("frames_decode_ok", 0)) / float(status.get("frames_processed", 0))
+                if int(status.get("frames_processed", 0) or 0) > 0 else np.nan
+            ),
+            "alpha": float(status.get("alpha", np.nan)),
+            "beta": float(status.get("beta", np.nan)),
+            "recommended_alpha": float(status.get("adaptive_recommended_alpha", np.nan)),
+            "recommended_beta": float(status.get("adaptive_recommended_beta", np.nan)),
+        }
+
+    def _sample_adaptive_observation(self, status, stats):
+        if self.backend is None or self._adaptive_observation_state is None:
+            return
+        current_frames = int(status.get("frames_processed", 0) or 0)
+        current_ok = int(status.get("frames_decode_ok", 0) or 0)
+        if not self._adaptive_observation_samples:
+            self._adaptive_observation_start_frames = current_frames
+            self._adaptive_observation_start_ok = current_ok
+        sample = self._observation_metric_sample(status, stats)
+        delta_frames = current_frames - int(getattr(self, "_adaptive_observation_start_frames", current_frames))
+        delta_ok = current_ok - int(getattr(self, "_adaptive_observation_start_ok", current_ok))
+        sample["crc_success_ratio"] = (delta_ok / delta_frames) if delta_frames > 0 else np.nan
+        self._adaptive_observation_samples.append(sample)
+        self._update_adaptive_observation_display()
+
+    def _finalize_adaptive_observation_segment(self):
+        if self._adaptive_observation_state is None:
+            return None
+        samples = list(self._adaptive_observation_samples)
+        if not samples:
+            return None
+        record = {
+            "adaptive_enabled": bool(self._adaptive_observation_state),
+            "started_at": float(self._adaptive_observation_started_at),
+            "duration_sec": max(0.0, time.monotonic() - self._adaptive_observation_started_at),
+            "sample_count": len(samples),
+        }
+        for key in ("crc_success_ratio", "match_ratio", "measured_ser", "fec_bit_ber", "evm_average_percent", "alpha", "beta", "recommended_alpha", "recommended_beta"):
+            values = [float(item[key]) for item in samples if np.isfinite(float(item.get(key, np.nan)))]
+            record[key] = float(np.mean(values)) if values else float("nan")
+        self._adaptive_observation_records.append(record)
+        self._adaptive_observation_samples = []
+        self._update_adaptive_observation_display()
+        return record
+
+    def _on_adaptive_enable_changed(self, state):
+        enabled = bool(state)
+        if self.backend is not None and self.test_running:
+            self._finalize_adaptive_observation_segment()
+            self._adaptive_observation_state = enabled
+            self._adaptive_observation_started_at = time.monotonic()
+            self._adaptive_observation_samples = []
+            self._adaptive_observation_start_frames = 0
+            self._adaptive_observation_start_ok = 0
+            try:
+                marker = pg.InfiniteLine(pos=max(0, self._evm_index), angle=90,
+                                         pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE, style=Qt.DashLine, width=1))
+                self.evm_plot.addItem(marker)
+                self._adaptive_toggle_markers.append(marker)
+            except Exception:
+                pass
+            self._log(f"手动{'开启' if enabled else '关闭'} α/β 自适应，开始记录切换后指标")
+        self._adaptive_toggle_pending = True
+        self._on_adaptive_config_changed()
+
+    def _update_adaptive_observation_display(self):
+        records = list(self._adaptive_observation_records)
+        before = next((r for r in reversed(records) if not r["adaptive_enabled"]), None)
+        after = next((r for r in reversed(records) if r["adaptive_enabled"]), None)
+        self.comparison_phase_label.setText(f"自适应：{'开启' if self._adaptive_observation_state else '关闭'} | 已记录 {len(records)} 个窗口")
+        def fmt(v, suffix=""):
+            return "—" if not np.isfinite(float(v)) else f"{float(v):.3g}{suffix}"
+        if before:
+            self.comparison_baseline_result_label.setText(
+                f"开启前：CRC {fmt(before['crc_success_ratio']*100, '%')} | SER {fmt(before['measured_ser'])} | EVM {fmt(before['evm_average_percent'], '%')}"
+            )
+        else:
+            self.comparison_baseline_result_label.setText("开启前：—")
+        if after:
+            self.comparison_adaptive_result_label.setText(
+                f"开启后：CRC {fmt(after['crc_success_ratio']*100, '%')} | SER {fmt(after['measured_ser'])} | EVM {fmt(after['evm_average_percent'], '%')}"
+            )
+        else:
+            self.comparison_adaptive_result_label.setText("开启后：—")
+        if before and after and np.isfinite(before["evm_average_percent"]) and np.isfinite(after["evm_average_percent"]):
+            self.comparison_improvement_label.setText(
+                f"变化：EVM {after['evm_average_percent']-before['evm_average_percent']:+.2f}pp | SER {fmt(before['measured_ser']-after['measured_ser'])}"
+            )
+        else:
+            self.comparison_improvement_label.setText("变化：请先关闭运行一段时间，再手动开启自适应")
+
+    def get_adaptive_observation_records(self):
+        return [dict(item) for item in self._adaptive_observation_records]
+
+    # ---------------- single-USRP comparison demo ----------------
+    def _start_comparison_demo(self):
+        if self.comparison_session.active:
+            return
+        try:
+            if self.backend is None:
+                self._create_backend()
+            if not self.test_running:
+                self.backend.start(); self.test_running = True
+                self.btn_start_test.setEnabled(False); self.btn_stop_test.setEnabled(True)
+                self._set_test_controls_enabled(False); self.update_timer.start(100)
+            session = self.comparison_session
+            session.reset()
+            session.phase_duration_sec = float(self.comparison_duration_spin.value())
+            session.repeat_count = int(self.comparison_repeat_spin.value())
+            session.total_phases = session.repeat_count * 2
+            session.baseline_alpha = float(self.comparison_baseline_alpha_spin.value())
+            session.baseline_beta = float(self.comparison_baseline_beta_spin.value())
+            self._comparison_evm_x = 0; self._reset_runtime_curves()
+            session.active = True
+            self._enter_comparison_phase("baseline")
+            self.btn_start_comparison.setEnabled(False); self.btn_stop_comparison.setEnabled(True)
+            self._log(f"开始单 USRP 对比演示：{session.repeat_count} 轮，阶段 {session.phase_duration_sec:.0f}s")
+        except Exception as e:
+            self.comparison_session.reset(); self._log(f"开始对比演示失败: {type(e).__name__}: {e}")
+
+    def _stop_comparison_demo(self):
+        session = self.comparison_session
+        if not session.active and session.phase != "complete":
+            return
+        try:
+            if session.active and session.phase in ("baseline", "adaptive"):
+                self._finalize_comparison_phase()
+            session.active = False; session.phase = "complete" if session.records else "idle"
+            self._update_comparison_summary(); self.btn_start_comparison.setEnabled(True); self.btn_stop_comparison.setEnabled(False)
+            self._log("对比演示已停止，已保留已完成阶段结果")
+        except Exception as e:
+            self._log(f"停止对比演示失败: {type(e).__name__}: {e}")
+
+    def _comparison_phase_mode(self, phase_index):
+        return "baseline" if int(phase_index) % 2 == 0 else "adaptive"
+
+    def _enter_comparison_phase(self, mode):
+        mode = str(mode).lower()
+        if mode not in ("baseline", "adaptive"):
+            raise ValueError(f"unknown comparison mode: {mode}")
+        session = self.comparison_session
+        kwargs = self._backend_kwargs(self.tx_text_edit.toPlainText())
+        kwargs.update(alpha=float(session.baseline_alpha), beta=float(session.baseline_beta),
+                      adaptive_alpha_beta_enable=(mode == "adaptive"))
+        if self.backend is None:
+            self._create_backend()
+        else:
+            self.backend.configure(**kwargs)
+        status = self.backend.get_status() if hasattr(self.backend, "get_status") else {}
+        session.phase = mode; session.phase_started_at = time.monotonic()
+        session.phase_start_frames = int(status.get("frames_processed", 0) or 0)
+        session.phase_start_ok = int(status.get("frames_decode_ok", 0) or 0)
+        session.phase_samples = []
+        self._update_comparison_status(); self._log(f"进入 {mode} 阶段 α/β={session.baseline_alpha:.2f}/{session.baseline_beta:.2f}")
+
+    @staticmethod
+    def _mean_or_nan(samples, key):
+        vals = []
+        for item in samples:
+            try: v = float(item.get(key, np.nan))
+            except Exception: continue
+            if np.isfinite(v): vals.append(v)
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def _sample_comparison_metrics(self, status, stats):
+        session = self.comparison_session
+        if not session.active or session.phase not in ("baseline", "adaptive"):
+            return None
+        sample = {
+            "frames_processed": int(status.get("frames_processed", 0) or 0),
+            "frames_decode_ok": int(status.get("frames_decode_ok", 0) or 0),
+            "match_ratio": float(status.get("match_ratio", stats.get("match_ratio", np.nan))),
+            "measured_ser": float(status.get("measured_ser", np.nan)),
+            "fec_bit_ber": float(status.get("fec_bit_ber", status.get("ber", np.nan))),
+            "evm_average_percent": float(status.get("evm_average_percent", status.get("evm_percent", np.nan))),
+            "alpha": float(status.get("alpha", np.nan)),
+            "beta": float(status.get("beta", np.nan)),
+            "recommended_alpha": float(status.get("adaptive_recommended_alpha", np.nan)),
+            "recommended_beta": float(status.get("adaptive_recommended_beta", np.nan)),
+        }
+        session.phase_samples.append(sample)
+        evm = sample["evm_average_percent"]
+        if np.isfinite(evm) and evm >= 0:
+            session.history.setdefault(session.phase, []).append((self._comparison_evm_x, evm)); self._comparison_evm_x += 1
+            self._update_comparison_evm_curves()
+        self._update_comparison_status(sample)
+        return sample
+
+    def _finalize_comparison_phase(self):
+        session = self.comparison_session
+        if session.phase not in ("baseline", "adaptive"):
+            return None
+        samples = list(session.phase_samples); last = samples[-1] if samples else {}
+        frames = max(0, int(last.get("frames_processed", session.phase_start_frames)) - session.phase_start_frames)
+        oks = max(0, int(last.get("frames_decode_ok", session.phase_start_ok)) - session.phase_start_ok)
+        record = ComparisonPhaseRecord(mode=session.phase, round_index=(session.phase_index // 2) + 1,
+            alpha=float(last.get("alpha", np.nan)), beta=float(last.get("beta", np.nan)),
+            frames_processed=frames, frames_decode_ok=oks, crc_success_ratio=(oks / frames) if frames else float("nan"),
+            match_ratio=self._mean_or_nan(samples, "match_ratio"), measured_ser=self._mean_or_nan(samples, "measured_ser"),
+            fec_bit_ber=self._mean_or_nan(samples, "fec_bit_ber"), evm_average_percent=self._mean_or_nan(samples, "evm_average_percent"),
+            valid_sample_count=len(samples))
+        session.records.append(record); session.phase_index += 1; session.phase_samples = []
+        self._update_comparison_summary(); self._log(self._phase_record_text(record)); return record
+
+    def _comparison_tick(self, status, stats):
+        session = self.comparison_session
+        if not session.active or self._comparison_tick_busy:
+            return
+        self._comparison_tick_busy = True
+        try:
+            self._sample_comparison_metrics(status, stats)
+            if time.monotonic() - session.phase_started_at < session.phase_duration_sec: return
+            self._finalize_comparison_phase()
+            if session.phase_index >= session.total_phases:
+                session.active = False; session.phase = "complete"
+                self.btn_start_comparison.setEnabled(True); self.btn_stop_comparison.setEnabled(False)
+                self._update_comparison_summary(); self._log("对比演示完成"); return
+            self._enter_comparison_phase(self._comparison_phase_mode(session.phase_index))
+        finally:
+            self._comparison_tick_busy = False
+
+    def _phase_record_text(self, record):
+        def fmt(v, suffix=""):
+            return "—" if not np.isfinite(v) else f"{v:.3f}{suffix}"
+        return (f"{record.mode}#{record.round_index}: frames={record.frames_processed}, CRC={fmt(record.crc_success_ratio * 100, '%')}, "
+                f"SER={fmt(record.measured_ser)}, EVM={fmt(record.evm_average_percent, '%')}, match={fmt(record.match_ratio * 100, '%')}")
+
+    def _update_comparison_status(self, sample=None):
+        session = self.comparison_session
+        if session.phase == "idle": text = "对比：未开始"
+        elif session.phase == "complete": text = "对比：已完成"
+        else:
+            remain = max(0.0, session.phase_duration_sec - (time.monotonic() - session.phase_started_at))
+            text = f"对比：{session.phase} 阶段 {session.phase_index + 1}/{session.total_phases}，剩余 {remain:.1f}s"
+            if sample: text += f" | frames={max(0, int(sample.get('frames_processed', 0)) - session.phase_start_frames)}"
+            if sample and session.phase == "adaptive":
+                a = sample.get("alpha", np.nan); b = sample.get("beta", np.nan)
+                ra = sample.get("recommended_alpha", np.nan); rb = sample.get("recommended_beta", np.nan)
+                if np.isfinite(a) and np.isfinite(b):
+                    text += f" | α/β={a:.2f}/{b:.2f}"
+                if np.isfinite(ra) and np.isfinite(rb):
+                    text += f" → 推荐 {ra:.2f}/{rb:.2f}"
+        self.comparison_status_label.setText(text); self.comparison_phase_label.setText(text)
+
+    def _update_comparison_evm_curves(self):
+        for mode, curve in (("baseline", self.evm_baseline_curve), ("adaptive", self.evm_adaptive_curve)):
+            points = self.comparison_session.history.get(mode, [])
+            curve.setData(np.asarray([p[0] for p in points]), np.asarray([p[1] for p in points])) if points else curve.setData([], [])
+
+    def _update_comparison_summary(self):
+        session = self.comparison_session
+        baseline = [r for r in session.records if r.mode == "baseline"]; adaptive = [r for r in session.records if r.mode == "adaptive"]
+        session.summary.baseline = baseline; session.summary.adaptive = adaptive
+        def avg(items, attr):
+            vals = [float(getattr(r, attr)) for r in items if np.isfinite(float(getattr(r, attr)))]
+            return float(np.mean(vals)) if vals else float("nan")
+        keys = ("crc_success_ratio", "match_ratio", "measured_ser", "fec_bit_ber", "evm_average_percent")
+        b = {k: avg(baseline, k) for k in keys}; a = {k: avg(adaptive, k) for k in keys}
+        session.summary.improvement = {"crc_success_ratio": a["crc_success_ratio"] - b["crc_success_ratio"], "match_ratio": a["match_ratio"] - b["match_ratio"], "measured_ser": b["measured_ser"] - a["measured_ser"], "fec_bit_ber": b["fec_bit_ber"] - a["fec_bit_ber"], "evm_average_percent": b["evm_average_percent"] - a["evm_average_percent"]}
+        session.summary.conclusion_available = bool(baseline and adaptive)
+        def text(v):
+            crc = "—" if not np.isfinite(v["crc_success_ratio"]) else f"{v['crc_success_ratio']*100:.1f}%"
+            match = "—" if not np.isfinite(v["match_ratio"]) else f"{v['match_ratio']*100:.1f}%"
+            ser = "—" if not np.isfinite(v["measured_ser"]) else f"{v['measured_ser']:.3g}"
+            evm = "—" if not np.isfinite(v["evm_average_percent"]) else f"{v['evm_average_percent']:.2f}%"
+            return f"CRC {crc} | 文本 {match} | SER {ser} | EVM {evm}"
+        self.comparison_baseline_result_label.setText(f"Baseline：{text(b)}"); self.comparison_adaptive_result_label.setText(f"Adaptive：{text(a)}")
+        imp = session.summary.improvement
+        self.comparison_improvement_label.setText(f"改善：EVM {imp['evm_average_percent']:+.2f}pp，SER {imp['measured_ser']:+.3g}" if session.summary.conclusion_available and np.isfinite(imp["evm_average_percent"]) else "改善：等待完成一组 baseline/adaptive")
+        self._update_comparison_evm_curves()
+        self._update_comparison_status()
+
+    def _comparison_summary_text(self):
+        return "\n".join((self.comparison_baseline_result_label.text(), self.comparison_adaptive_result_label.text(), self.comparison_improvement_label.text()))
+
+    def get_comparison_summary(self):
+        """Return a serializable snapshot for tests, logging, or future export."""
+        summary = self.comparison_session.summary
+        return {
+            "baseline": [record.as_dict() for record in summary.baseline],
+            "adaptive": [record.as_dict() for record in summary.adaptive],
+            "conclusion_available": bool(summary.conclusion_available),
+            "improvement": dict(summary.improvement),
+            "text": self._comparison_summary_text(),
+        }
 
     # ---------------- backend config ----------------
     def _current_data(self, combo: QComboBox, default: str):
@@ -848,7 +1289,10 @@ class FDIDMHardwareTestTab(QWidget):
             else:
                 self._configure_backend(self.tx_text_edit.toPlainText())
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
-            self._reset_runtime_curves(); self._refresh_tx_plot_only()
+            if not self._adaptive_toggle_pending:
+                self._reset_runtime_curves()
+            self._adaptive_toggle_pending = False
+            self._refresh_tx_plot_only()
             if live_applied:
                 self._log("FDIDM 参数已热更新，未重启 UHD。")
             elif restarted:
@@ -940,6 +1384,7 @@ class FDIDMHardwareTestTab(QWidget):
             return
         try:
             status = self.backend.get_status(); stats = self.backend.get_decode_stats()
+            self._sample_adaptive_observation(status, stats)
             samp_rate = self._extract_samp_rate(status)
             self._apply_stable_plot_ranges(samp_rate)
             err = status.get("last_error", "")
@@ -953,6 +1398,7 @@ class FDIDMHardwareTestTab(QWidget):
             stale = bool(status.get("rx_spectrum_stale", True)); age = float(status.get("rx_spectrum_stale_sec", np.nan))
             self.rx_spectrum_plot.setTitle(f"RX频谱[{self._selected_rx_spectrum_source()}] stale={stale} age={age:.1f}s")
             self._update_evm_plot(float(status.get("evm_percent", np.nan)))
+            self.evm_plot.setTitle("EVM 曲线（虚线标记自适应切换）" if self._adaptive_observation_state is not None else "EVM 曲线")
             const = self.backend.get_rx_constellation(512, source=self._current_data(self.const_mode_combo, "post_equalized"))
             if const is not None and len(const) > 0:
                 self.constellation_scatter.setData(x=np.real(const), y=np.imag(const))
@@ -1193,7 +1639,13 @@ class FDIDMHardwareTestTab(QWidget):
             f"信道自适应应用 α={rec_a:.2f}, β={rec_b:.2f}；"
             f"论文SER预测改善 {gain:.2f} dB，CSI={source}。"
         )
-        self._set_indices(rec_a, rec_b)
+        if hasattr(self.backend, "apply_alpha_beta_candidate"):
+            self.backend.apply_alpha_beta_candidate(
+                rec_a, rec_b, predicted_improvement_db=gain,
+                recommendation_seq=seq,
+            )
+        else:
+            self._set_indices(rec_a, rec_b)
 
     def _update_decode_status(self, stats, status):
         ok = bool(stats.get("decode_ok", False))
@@ -1208,7 +1660,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"raw={float(status.get('raw_bit_ber',np.nan)):.3g}, SER={float(status.get('measured_ser',np.nan)):.3g}, EVM={evm_txt}, cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, code={status.get('coding_scheme','')}, "
             f"TDLfit={float(status.get('tdl_param_fit_nmse',np.nan)):.2e}, const={status.get('constellation_source','none')}, "
-            f"ABauto={status.get('adaptive_alpha_beta_state','off')}"
+            f"ABauto={status.get('adaptive_alpha_beta_state','off')}, RXoverflow={int(status.get('rx_overflow_count',0))}"
         )
 
     def _maybe_log_runtime(self, status, stats):
@@ -1232,6 +1684,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"ABrec={float(status.get('adaptive_recommended_alpha',np.nan)):.2f}/"
             f"{float(status.get('adaptive_recommended_beta',np.nan)):.2f}, "
             f"ABgain={float(status.get('adaptive_predicted_improvement_db',np.nan)):.2f}dB"
+            f", RXoverflow={int(status.get('rx_overflow_count',0))}"
         )
 
     def _drain_debug_to_log(self):
@@ -1289,11 +1742,11 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _reset_runtime_curves(self):
         self._evm_history.clear(); self._evm_index = 0
-        self.evm_curve.setData([], []); self.constellation_scatter.setData(x=[], y=[])
+        self.evm_curve.setData([], []); self.evm_baseline_curve.setData([], []); self.evm_adaptive_curve.setData([], []); self.constellation_scatter.setData(x=[], y=[])
         self.last_status_error = ""; self._last_runtime_log_time = 0.0
 
     def _clear_plots(self):
-        self.rx_curve.setData([], []); self.evm_curve.setData([], [])
+        self.rx_curve.setData([], []); self.evm_curve.setData([], []); self.evm_baseline_curve.setData([], []); self.evm_adaptive_curve.setData([], [])
         self.constellation_scatter.setData(x=[], y=[]); self._evm_history.clear(); self._evm_index = 0
 
     def _extract_samp_rate(self, status):

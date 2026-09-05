@@ -67,6 +67,87 @@ class FDIDMAdaptiveMixin:
         """Cancel stale recommendations after either manual or adaptive switching."""
         self._invalidate_alpha_beta_adaptation(reason=reason, cooldown=True)
 
+    def apply_alpha_beta_candidate(self, alpha: float, beta: float,
+                                   predicted_improvement_db: float = float("nan"),
+                                   recommendation_seq: int = 0) -> Dict[str, Any]:
+        """Apply a candidate and arm real-link validation.
+
+        The optimizer's SER is only a hypothesis.  This method snapshots the
+        pre-change metrics, performs the normal live waveform update, then
+        enters ``validating`` so subsequent decoded frames can accept or roll
+        back the candidate.
+        """
+        old_alpha = float(getattr(self, "alpha", 0.0)); old_beta = float(getattr(self, "beta", 0.0))
+        baseline = {
+            "evm_average_percent": float(getattr(self, "last_evm_average_percent", float("nan"))),
+            "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
+            "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
+            "crc_success_ratio": (float(getattr(self, "_frames_decode_ok", 0)) /
+                                   max(float(getattr(self, "_frames_processed", 0)), 1.0)),
+        }
+        self.configure(alpha=float(alpha), beta=float(beta))
+        with self._adaptive_ab_lock:
+            self._adaptive_ab_validation = {
+                "state": "validating", "old_alpha": old_alpha, "old_beta": old_beta,
+                "candidate_alpha": float(alpha), "candidate_beta": float(beta),
+                "predicted_improvement_db": float(predicted_improvement_db),
+                "recommendation_seq": int(recommendation_seq),
+                "start_frame": int(getattr(self, "_frames_processed", 0)),
+                "settle_remaining": 3, "target_frames": 5, "samples": [],
+                "baseline": baseline, "result_reason": "",
+            }
+            self._adaptive_ab_state = "validating"
+        self._debug("INFO", f"alpha/beta candidate validating: old=({old_alpha:.2f},{old_beta:.2f}) "
+                             f"candidate=({float(alpha):.2f},{float(beta):.2f})")
+        return dict(self._adaptive_ab_validation)
+
+    def _record_alpha_beta_validation_sample_locked(self, metrics: Dict[str, Any]):
+        v = getattr(self, "_adaptive_ab_validation", None)
+        if not isinstance(v, dict) or v.get("state") != "validating":
+            return
+        if int(v.get("settle_remaining", 0)) > 0:
+            v["settle_remaining"] = int(v.get("settle_remaining", 0)) - 1
+            return
+        sample = {k: float(metrics.get(k, float("nan"))) for k in
+                  ("evm_average_percent", "measured_ser", "fec_bit_ber", "crc_success_ratio")}
+        sample["decode_ok"] = bool(metrics.get("decode_ok", False))
+        if not any(np.isfinite(x) for x in sample.values() if isinstance(x, float)):
+            return
+        v.setdefault("samples", []).append(sample)
+        if len(v["samples"]) < int(v.get("target_frames", 5)):
+            return
+        baseline = dict(v.get("baseline", {})); samples = list(v["samples"])
+        def avg(key):
+            vals = [float(s.get(key, float("nan"))) for s in samples]
+            vals = [x for x in vals if np.isfinite(x)]
+            return float(np.mean(vals)) if vals else float("nan")
+        measured = {k: avg(k) for k in ("evm_average_percent", "measured_ser", "fec_bit_ber", "crc_success_ratio")}
+        evm_bad = np.isfinite(baseline.get("evm_average_percent", np.nan)) and np.isfinite(measured["evm_average_percent"]) and measured["evm_average_percent"] > baseline["evm_average_percent"] * 1.10
+        ser_bad = np.isfinite(baseline.get("measured_ser", np.nan)) and np.isfinite(measured["measured_ser"]) and measured["measured_ser"] > baseline["measured_ser"] * 1.10
+        crc_bad = np.isfinite(baseline.get("crc_success_ratio", np.nan)) and np.isfinite(measured["crc_success_ratio"]) and measured["crc_success_ratio"] + 0.05 < baseline["crc_success_ratio"]
+        accepted = not (evm_bad or ser_bad or crc_bad)
+        v["measured"] = measured
+        v["state"] = "accepted" if accepted else "rollback"
+        v["result_reason"] = "validated_real_metrics" if accepted else "real_metrics_regressed"
+        rollback_params = None
+        if not accepted:
+            rollback_params = (float(v["old_alpha"]), float(v["old_beta"]))
+        self._adaptive_ab_state = str(v["state"])
+        if rollback_params is not None:
+            # Caller holds the RX lock; perform the live waveform swap after
+            # returning to avoid re-entering the non-reentrant lock.
+            v["rollback_pending"] = True
+        self._debug("INFO", f"alpha/beta validation {v['state']}: "
+                             f"EVM={measured['evm_average_percent']:.3g}, SER={measured['measured_ser']:.3g}, "
+                             f"CRC={measured['crc_success_ratio']:.3f}, reason={v['result_reason']}")
+        if rollback_params is not None:
+            def _rollback():
+                try:
+                    self.configure(alpha=rollback_params[0], beta=rollback_params[1])
+                except Exception as exc:
+                    self._debug("ERROR", f"alpha/beta rollback failed: {type(exc).__name__}: {exc}")
+            threading.Thread(target=_rollback, name=f"fdidm-ab-rollback-{id(self):x}", daemon=True).start()
+
     def _ensure_alpha_beta_adaptation_worker(self):
         if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
             return
@@ -558,6 +639,10 @@ class FDIDMAdaptiveMixin:
                 "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "signaling_mode": str(getattr(self, "ALPHA_BETA_SIGNALING_MODE", "shared_memory")),
+                "validation": dict(getattr(self, "_adaptive_ab_validation", {}) or {}),
+                "validation_state": str((getattr(self, "_adaptive_ab_validation", {}) or {}).get("state", "idle")),
+                "validation_measured": dict((getattr(self, "_adaptive_ab_validation", {}) or {}).get("measured", {}) or {}),
+                "validation_reason": str((getattr(self, "_adaptive_ab_validation", {}) or {}).get("result_reason", "")),
             }
 
     # =========================================================

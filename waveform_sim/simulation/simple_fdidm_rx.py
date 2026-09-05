@@ -318,6 +318,12 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         self._channel_power_db = float("nan")
         self._dynamic_base_seed = int(self.config.channel_seed)
         self._last_dynamic_block = None
+        # Dynamic phase evolution can change the coherent sum of multipath
+        # components and otherwise make all four SER curves move together by
+        # several decades. Keep a per-channel reference power so the dynamic
+        # plots show selectivity/time variation rather than an unintended SNR
+        # change.
+        self._dynamic_reference_h_power = None
         # 单调递增的仿真帧号：只随 _simulate_one_frame 增长，不随参数更新/BER 统计重置。
         # 信道块索引与自适应评估都以它为时间基准，避免"应用 α/β 后信道倒退"。
         self._sim_frame = 0
@@ -506,6 +512,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         if new.channel_seed != old.channel_seed:
             self._dynamic_base_seed = int(new.channel_seed)
             self._last_dynamic_block = None
+            self._dynamic_reference_h_power = None
         # 时变模式/相干参数变化时强制重新进入当前块。旧代码在 reset_ber_stats 里无条件
         # 重置 _last_dynamic_block，导致每次应用 α/β 都把信道重播种回第一个块。
         channel_ctx_changed = (
@@ -520,6 +527,7 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
         )
         if channel_ctx_changed:
             self._last_dynamic_block = None
+            self._dynamic_reference_h_power = None
             self._previous_h_tf_for_state = None
             self._channel_matrix_change_norm = float("nan")
             self._channel_matrix_correlation = float("nan")
@@ -1100,6 +1108,20 @@ class _LegacyFDIDMTransceiver(FDIDMSimAdaptiveMixin, threading.Thread):
                 float(nu * N * T),
                 float(np.abs(gp)),
             ))
+        # In block/fast/continuous modes, phase evolution is intended to model
+        # time selectivity. Without a power reference, constructive/destructive
+        # path summation also changes the total channel gain, causing every
+        # waveform's SER to jump together. Normalize only dynamic channels so
+        # fixed-channel behavior remains exactly unchanged.
+        if self._channel_dynamics_mode_locked() != "fixed":
+            current_power = float(np.mean(np.abs(H) ** 2)) if H.size else 0.0
+            if np.isfinite(current_power) and current_power > 1e-15:
+                reference = getattr(self, "_dynamic_reference_h_power", None)
+                if reference is None or not np.isfinite(float(reference)) or float(reference) <= 1e-15:
+                    reference = current_power
+                    self._dynamic_reference_h_power = float(reference)
+                H *= math.sqrt(float(reference) / current_power)
+
         return H, path_table
 
     def _build_tf_fade_diagonal(self):

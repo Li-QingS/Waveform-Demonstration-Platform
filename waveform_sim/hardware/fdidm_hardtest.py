@@ -372,6 +372,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.last_noise_var = float("nan")
         self._evm_history: deque = deque(maxlen=self.evm_average_frames)
         self._rx_samples_seen = 0
+        self._rx_overflow_count = 0
+        self._rx_last_overflow_samples = 0
+        self._rx_overflow_reason = ""
+        self._rx_overflow_threshold = 0
         self._last_processed_abs_start = -10 ** 18
         self._t0 = time.time()
         self._ber_hist_t: deque = deque(maxlen=200)
@@ -422,6 +426,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._adaptive_ab_recommendation: Dict[str, Any] = {}
         self._adaptive_ab_last_skip_reason = ""
         self._adaptive_ab_last_skip_log_wall = 0.0
+        self._adaptive_ab_recent_metrics = deque(maxlen=12)
+        self._adaptive_ab_validation = {
+            "state": "idle", "old_alpha": float(self.alpha), "old_beta": float(self.beta),
+            "candidate_alpha": float(self.alpha), "candidate_beta": float(self.beta),
+            "predicted_improvement_db": float("nan"), "recommendation_seq": 0,
+            "start_frame": 0, "settle_remaining": 0, "target_frames": 5,
+            "samples": [], "baseline": {}, "result_reason": "",
+        }
 
         self._set_tx_text_internal(tx_text)
         self._build_top_block()
@@ -2518,6 +2530,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._tx_preview_start_t = time.time()
             self._rx_probe_total_est = 0
             self._rx_probe_last_fp = None
+            self._rx_last_overflow_samples = 0
+            self._rx_overflow_reason = ""
             self._last_processed_abs_start = -10 ** 18
             self._diag_csi_smooth = None
             self._cfo_smooth_hz = float("nan")
@@ -2594,6 +2608,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if reset_counters:
                 self._frames_processed = 0
                 self._frames_decode_ok = 0
+                self._rx_overflow_count = 0
                 self._ber_hist_t.clear()
                 self._ber_hist_v.clear()
         self._debug("INFO", f"runtime RX state reset: reason={reason}, reset_counters={bool(reset_counters)}")
@@ -3358,6 +3373,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._buffer_keep,
             max(3 * (self.frame_len + self.inter_frame_guard_len), 8192),
         )
+        # A healthy probe update is close to the amount of data produced during
+        # one monitor period.  Multi-hundred-thousand jumps indicate that UHD
+        # dropped/queued data (or that the probe clock was re-anchored); those
+        # windows must not enter synchronization/CSI estimation.
+        self._rx_overflow_threshold = int(max(
+            4 * process_window_len,
+            max(self.sample_rate, 1.0) * max(self.update_period * 4.0, 0.20),
+        ))
         self._debug("INFO",
                     f"monitor: started, process_window_len={process_window_len}, "
                     f"buffer_keep={self._buffer_keep}, update_period={self.update_period * 1000:.0f} ms")
@@ -3385,6 +3408,29 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         else:
                             self._rx_spectrum_stale_sec = float("inf")
                     tx_buf_size = len(self._tx_buffer)
+                overflow_window = bool(
+                    rx_data_size > int(getattr(self, "_rx_overflow_threshold", 0))
+                    and rx_data_size > max(4 * int(rx_window.size), 65536)
+                )
+                if overflow_window:
+                    with self._lock:
+                        self._rx_overflow_count = int(getattr(self, "_rx_overflow_count", 0)) + 1
+                        self._rx_last_overflow_samples = int(rx_data_size)
+                        self._rx_overflow_reason = (
+                            f"rx_delta={int(rx_data_size)} > threshold={int(self._rx_overflow_threshold)}"
+                        )
+                    self._debug(
+                        "WARN",
+                        f"RX overflow/queue jump suppressed: new={int(rx_data_size)}, "
+                        f"window={int(rx_window.size)}, threshold={int(self._rx_overflow_threshold)}; "
+                        "discarding this window from decode/CSI",
+                    )
+                    # The probe has already advanced.  Continue draining and
+                    # let the next contiguous window re-establish sync.
+                    self._last_process_t = now
+                    if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
+                        break
+                    continue
                 # Heartbeat: log every ~2s so a static UI plot is easy to diagnose.
                 if now - self._monitor_last_log_t > 2.0:
                     dt = now - self._monitor_last_log_t
@@ -3777,6 +3823,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "cfo_abs_hz": abs(float(best.get("cfo_hz", 0.0))) if np.isfinite(float(best.get("cfo_hz", 0.0))) else float("nan"),
                 "decode_ok": bool(best.get("decode_ok", False)),
                 "match_ratio": float(best.get("match_bytes", 0)) / float(expected_payload),
+            })
+            self._record_alpha_beta_validation_sample_locked({
+                "evm_average_percent": float(self.last_evm_average_percent),
+                "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
+                "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
+                "crc_success_ratio": float(bool(best.get("decode_ok", False))),
+                "decode_ok": bool(best.get("decode_ok", False)),
             })
 
         adaptive_channel_valid = not (
@@ -4210,6 +4263,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "startup_settling": bool(time.time() < float(getattr(self, "_rx_settle_until_wall", 0.0)) or int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0),
                 "startup_settle_windows_remaining": int(getattr(self, "_rx_settle_windows_remaining", 0)),
                 "ber": float(self._ber_estimate) if np.isfinite(self._ber_estimate) else float("nan"),
+                "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
                 "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
                 "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
                 "htf_leakage": float(self.last_htf_nmse),
@@ -4226,6 +4280,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "rx_last_new_samples": int(getattr(self, "_rx_last_new_samples", 0)),
                 "rx_stream_updates": int(getattr(self, "_rx_stream_updates", 0)),
                 "rx_latest_window_len": int(getattr(self, "_rx_latest_window_len", 0)),
+                "rx_overflow_count": int(getattr(self, "_rx_overflow_count", 0)),
+                "rx_last_overflow_samples": int(getattr(self, "_rx_last_overflow_samples", 0)),
+                "rx_overflow_reason": str(getattr(self, "_rx_overflow_reason", "")),
+                "rx_overflow_threshold": int(getattr(self, "_rx_overflow_threshold", 0)),
                 "rx_spectrum_stale": bool(getattr(self, "_rx_spectrum_stale", True)),
                 "rx_spectrum_stale_sec": float(getattr(self, "_rx_spectrum_stale_sec", float("inf"))),
                 "constellation_source": str(getattr(self, "_last_constellation_source", "none")),
@@ -4272,6 +4330,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "adaptive_htf_source": str(adaptive_ab.get("htf_source", "")),
                 "adaptive_search_seconds": float(adaptive_ab.get("search_seconds", float("nan"))),
                 "adaptive_last_error": str(adaptive_ab.get("last_error", "")),
+                "adaptive_validation": dict(adaptive_ab.get("validation", {}) or {}),
+                "adaptive_validation_state": str(adaptive_ab.get("validation_state", "idle")),
+                "adaptive_validation_measured": dict(adaptive_ab.get("validation_measured", {}) or {}),
+                "adaptive_validation_reason": str(adaptive_ab.get("validation_reason", "")),
                 "rx_probe_mode": str(self._rx_probe_mode),
                 "rx_probe_len": int(self._rx_probe_len),
                 "process_interval_ms": float(self.process_interval_sec * 1000.0),
@@ -4352,6 +4414,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "adaptive_htf_source": str(snap.get("adaptive_htf_source", "")),
             "adaptive_search_seconds": float(snap.get("adaptive_search_seconds", float("nan"))),
             "adaptive_last_error": str(snap.get("adaptive_last_error", "")),
+            "adaptive_validation": dict(snap.get("adaptive_validation", {}) or {}),
+            "adaptive_validation_state": str(snap.get("adaptive_validation_state", "idle")),
+            "adaptive_validation_measured": dict(snap.get("adaptive_validation_measured", {}) or {}),
+            "adaptive_validation_reason": str(snap.get("adaptive_validation_reason", "")),
             "fdidm_m": int(self.M),
             "fdidm_n": int(self.N),
             "cp_len": int(self.cp_len),
@@ -4381,6 +4447,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "tdl_param_num_sinusoids": int(snap.get("tdl_param_num_sinusoids", getattr(self, "tdl_param_num_sinusoids", 8))),
             "tdl_param_max_paths": int(snap.get("tdl_param_max_paths", getattr(self, "tdl_param_max_paths", 96))),
             "rx_last_new_samples": int(snap.get("rx_last_new_samples", 0)),
+            "rx_overflow_count": int(snap.get("rx_overflow_count", 0)),
+            "rx_last_overflow_samples": int(snap.get("rx_last_overflow_samples", 0)),
+            "rx_overflow_reason": str(snap.get("rx_overflow_reason", "")),
+            "rx_overflow_threshold": int(snap.get("rx_overflow_threshold", 0)),
             "rx_spectrum_stale": bool(snap.get("rx_spectrum_stale", True)),
             "rx_spectrum_stale_sec": float(snap.get("rx_spectrum_stale_sec", float("inf"))),
             "constellation_source": str(snap.get("constellation_source", "none")),
@@ -4445,6 +4515,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "estimator_auto_note": str(getattr(self, "_estimator_auto_note", "")),
             "auto_tdl_param_for_software": bool(getattr(self, "auto_tdl_param_for_software", True)),
             "ber": snap["ber"],
+            "measured_ser": float(snap.get("measured_ser", float("nan"))),
             "fec_bit_ber": snap.get("fec_bit_ber", snap["ber"]),
             "raw_bit_ber": snap.get("raw_bit_ber", float("nan")),
             "htf_leakage": snap["htf_leakage"],

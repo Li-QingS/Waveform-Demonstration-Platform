@@ -98,6 +98,27 @@ def test_kernel_max_order_guard():
         tb._optimize_alpha_beta_snapshot(snap)
 
 
+def test_dynamic_channel_keeps_reference_power_for_ser_plot():
+    """Dynamic phase walks must not move every SER curve via total gain drift."""
+    tb = _make_backend(
+        mod_order="QPSK",
+        snr_db=10.0,
+        decoder="ZF",
+        dynamic_channel=True,
+        channel_dynamics="block",
+        channel_coherence_frames=4,
+        random_channel=True,
+        channel_seed=42,
+    )
+    powers = []
+    for _ in range(20):
+        tb.step()
+        powers.append(float(tb.get_last_metrics()["channel_power_db"]))
+    # The dynamic channel still changes its matrix/condition, but its total
+    # power is held at the first snapshot (floating-point tolerance only).
+    assert max(powers) - min(powers) < 1e-9
+
+
 # ---------------------------------------------------------------- closed loop
 def test_closed_loop_dynamic_channel_apply_and_cooldown():
     tb = _make_backend(dynamic_channel=True, channel_dynamics="block",

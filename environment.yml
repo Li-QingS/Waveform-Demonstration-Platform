@@ -3,9 +3,11 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
-  - numpy
-  - pyqt
-  - pyqtgraph
-  - pytest
+  - numpy>=1.24,<2.0
+  - pyqt>=5.15,<6.0
+  - pyqtgraph>=0.13,<0.14
+  - gnuradio>=3.10,<3.11
+  - gnuradio-uhd>=3.10,<3.11
+  - uhd>=4.5,<5.0
+  - pytest>=8.0,<9.0
   - pip
-
