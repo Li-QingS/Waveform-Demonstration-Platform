@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
+import math
 import os
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -34,74 +35,12 @@ AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
 
 
-@dataclass
-class ComparisonPhaseRecord:
-    """One completed baseline/adaptive phase of a single-USRP comparison."""
-    mode: str
-    round_index: int
-    alpha: float = float("nan")
-    beta: float = float("nan")
-    frames_processed: int = 0
-    frames_decode_ok: int = 0
-    crc_success_ratio: float = float("nan")
-    match_ratio: float = float("nan")
-    measured_ser: float = float("nan")
-    fec_bit_ber: float = float("nan")
-    evm_average_percent: float = float("nan")
-    valid_sample_count: int = 0
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-
-    def as_dict(self):
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
-
-
-@dataclass
-class ComparisonSummary:
-    baseline: list = field(default_factory=list)
-    adaptive: list = field(default_factory=list)
-    conclusion_available: bool = False
-    improvement: dict = field(default_factory=dict)
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-
-
-@dataclass
-class ComparisonSession:
-    active: bool = False
-    phase: str = "idle"
-    phase_index: int = 0
-    total_phases: int = 0
-    phase_started_at: float = 0.0
-    phase_duration_sec: float = 10.0
-    baseline_alpha: float = 0.5
-    baseline_beta: float = 1.0
-    repeat_count: int = 2
-    phase_start_frames: int = 0
-    phase_start_ok: int = 0
-    phase_samples: list = field(default_factory=list)
-    records: list = field(default_factory=list)
-    history: dict = field(default_factory=lambda: {"baseline": [], "adaptive": []})
-    summary: ComparisonSummary = field(default_factory=ComparisonSummary)
-
-    def reset(self):
-        self.active = False
-        self.phase = "idle"
-        self.phase_index = 0
-        self.total_phases = 0
-        self.phase_started_at = 0.0
-        self.phase_start_frames = 0
-        self.phase_start_ok = 0
-        self.phase_samples.clear()
-        self.records.clear()
-        self.history = {"baseline": [], "adaptive": []}
-        self.summary = ComparisonSummary()
-
-
-
 from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas, _PlotGridCell
+from .hardware_advantage_observer import (
+    CONTEXT_KEYS,
+    AdvantageObservationSession,
+    grade_from_k,
+)
 
 class FDIDMHardwareTestTab(QWidget):
     def __init__(self):
@@ -119,15 +58,17 @@ class FDIDMHardwareTestTab(QWidget):
         self._pending_apply = False
         self._suppress_param_signals = False
         self._last_adaptive_recommendation_seq = 0
-        self.comparison_session = ComparisonSession()
-        self._comparison_tick_busy = False
-        self._comparison_evm_x = 0
-        self._adaptive_observation_state = None
-        self._adaptive_observation_started_at = 0.0
-        self._adaptive_observation_samples = []
-        self._adaptive_observation_records = []
+        self.observer = AdvantageObservationSession()
         self._adaptive_toggle_markers = []
-        self._adaptive_toggle_pending = False
+        self._timeline_event_items = []
+        self._timeline_anomaly_items = []
+        self._timeline_apply_points = []
+        self._obs_t = deque(maxlen=1800)
+        self._obs_ser = deque(maxlen=1800)
+        self._obs_evm = deque(maxlen=1800)
+        self._obs_alpha = deque(maxlen=1800)
+        self._obs_beta = deque(maxlen=1800)
+        self._obs_t0 = 0.0
         self._surface_metric_items = [
             ("EVM平均(%)", "evm_average_percent", "lower"),
             ("BER(FEC)", "fec_bit_ber", "lower"),
@@ -322,32 +263,6 @@ class FDIDMHardwareTestTab(QWidget):
         layout.addWidget(adapt_group)
 
         modem_group = QGroupBox("收发/显示")
-        comparison_group = QGroupBox("单 USRP 优势对比")
-        comparison = QGridLayout(comparison_group)
-        comparison.setHorizontalSpacing(5)
-        comparison.setVerticalSpacing(5)
-        self.comparison_baseline_alpha_spin = self._dspin(-2.0, 2.0, self.alpha_spin.value(), 2, "", 0.05)
-        self.comparison_baseline_beta_spin = self._dspin(-2.0, 2.0, self.beta_spin.value(), 2, "", 0.05)
-        self.comparison_duration_spin = self._spin(2, 120, 10)
-        self.comparison_repeat_spin = self._spin(1, 10, 2)
-        self.btn_start_comparison = QPushButton("开始对比演示")
-        self.btn_stop_comparison = QPushButton("停止对比")
-        self.btn_stop_comparison.setEnabled(False)
-        self.comparison_status_label = QLabel("对比：未开始")
-        self.comparison_status_label.setWordWrap(True)
-        comparison.addWidget(QLabel("基线 α"), 0, 0); comparison.addWidget(self.comparison_baseline_alpha_spin, 0, 1)
-        comparison.addWidget(QLabel("基线 β"), 0, 2); comparison.addWidget(self.comparison_baseline_beta_spin, 0, 3)
-        comparison.addWidget(QLabel("阶段秒数"), 1, 0); comparison.addWidget(self.comparison_duration_spin, 1, 1)
-        comparison.addWidget(QLabel("交替轮数"), 1, 2); comparison.addWidget(self.comparison_repeat_spin, 1, 3)
-        comparison.addWidget(self.btn_start_comparison, 2, 0, 1, 2)
-        comparison.addWidget(self.btn_stop_comparison, 2, 2, 1, 2)
-        comparison.addWidget(self.comparison_status_label, 3, 0, 2, 4)
-        comparison_note = QLabel("同一台 USRP 按 baseline → adaptive 交替运行，用实测 CRC、SER、EVM 和文本恢复证明软波形自适应收益。")
-        comparison_note.setWordWrap(True)
-        comparison.addWidget(comparison_note, 5, 0, 1, 4)
-        layout.addWidget(comparison_group)
-        comparison_group.setVisible(False)
-
         modem = QGridLayout(modem_group)
         modem.setHorizontalSpacing(5)
         modem.setVerticalSpacing(5)
@@ -417,18 +332,44 @@ class FDIDMHardwareTestTab(QWidget):
         # 右侧四幅图必须在同一个 QGridLayout 中按 1:1 / 1:1 分配空间。
         # 不再用垂直 splitter 挤压 plot_panel，避免 OpenGL/pyqtgraph 上排图
         # 在小窗口下把下排图遮住或挤到不可见。
-        self.comparison_result_group = QGroupBox("自适应效果观测")
+        self.comparison_result_group = QGroupBox("优势观测（手动开关自适应 · 自动配对统计）")
         result_grid = QGridLayout(self.comparison_result_group)
-        self.comparison_phase_label = QLabel("自适应：未开始")
-        self.comparison_baseline_result_label = QLabel("开启前：—")
-        self.comparison_adaptive_result_label = QLabel("开启后：—")
-        self.comparison_improvement_label = QLabel("变化：—")
-        self.comparison_phase_label.setStyleSheet("font-weight: 600; color: #333333;")
-        self.comparison_improvement_label.setStyleSheet("font-weight: 600; color: #167c3a;")
-        for col, widget in enumerate((self.comparison_phase_label, self.comparison_baseline_result_label,
-                                      self.comparison_adaptive_result_label, self.comparison_improvement_label)):
-            result_grid.addWidget(widget, 0, col)
-        self.comparison_result_group.setMaximumHeight(62)
+        result_grid.setVerticalSpacing(2)
+        self.btn_start_observation = QPushButton("开始观测")
+        self.btn_stop_observation = QPushButton("结束观测")
+        self.btn_export_observation = QPushButton("导出报告")
+        self.btn_stop_observation.setEnabled(False)
+        self.btn_export_observation.setEnabled(False)
+        self.observation_state_label = QLabel("观测：未开始 | 开始观测后手动开关自适应即可积累前后窗口")
+        self.observation_state_label.setWordWrap(True)
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(self.btn_start_observation)
+        ctrl_row.addWidget(self.btn_stop_observation)
+        ctrl_row.addWidget(self.btn_export_observation)
+        ctrl_row.addWidget(self.observation_state_label, 1)
+        result_grid.addLayout(ctrl_row, 0, 0, 1, 3)
+
+        big_style = "font-size: 15px; font-weight: 600;"
+        self.observation_before_label = QLabel("开启前：—")
+        self.observation_after_label = QLabel("开启后：—")
+        self.observation_improvement_label = QLabel("SER 改善：—")
+        self.observation_before_label.setStyleSheet(big_style + " color:#333333;")
+        self.observation_after_label.setStyleSheet(big_style + " color:#333333;")
+        self.observation_improvement_label.setStyleSheet(big_style + " color:#167c3a;")
+        result_grid.addWidget(self.observation_before_label, 1, 0)
+        result_grid.addWidget(self.observation_after_label, 1, 1)
+        result_grid.addWidget(self.observation_improvement_label, 1, 2)
+
+        self.observation_badge_label = QLabel("可信度：—")
+        self.observation_badge_label.setWordWrap(True)
+        self.observation_note_label = QLabel("")
+        self.observation_note_label.setWordWrap(True)
+        result_grid.addWidget(self.observation_badge_label, 2, 0)
+        result_grid.addWidget(self.observation_note_label, 2, 1, 1, 2)
+
+        self.adaptive_state_label = QLabel("α/β：— | 搜索：— | 验证：— | α可观测：— | β可观测：—")
+        self.adaptive_state_label.setStyleSheet("color:#555555;")
+        result_grid.addWidget(self.adaptive_state_label, 3, 0, 1, 3)
         layout.addWidget(self.comparison_result_group, 0)
 
         plot_panel = QWidget()
@@ -480,6 +421,26 @@ class FDIDMHardwareTestTab(QWidget):
         grid.addWidget(self.constellation_cell, 1, 1)
         layout.addWidget(plot_panel, 1)
 
+        # 因果时间轴：上图为实测SER(log10)与EVM%信道代理，下图为α/β轨迹（T6）。
+        timeline_panel = QWidget()
+        timeline_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        timeline_panel.setMaximumHeight(220)
+        tl_layout = QVBoxLayout(timeline_panel)
+        tl_layout.setContentsMargins(0, 0, 0, 0)
+        tl_layout.setSpacing(2)
+        self.timeline_perf_plot = pg.PlotWidget(title="优势观测时间轴：实测SER(log10) 与 EVM%（信道代理）")
+        self.timeline_ab_plot = pg.PlotWidget(title="α/β 轨迹（▲=参数应用）")
+        self.timeline_ab_plot.setXLink(self.timeline_perf_plot)
+        self.timeline_perf_plot.showGrid(x=True, y=True)
+        self.timeline_ab_plot.showGrid(x=True, y=True)
+        self.timeline_perf_plot.setLabel("left", "log10(SER) / EVM %")
+        self.timeline_ab_plot.setLabel("left", "α / β")
+        self.timeline_ab_plot.setLabel("bottom", "观测时间 (s)")
+        for w in (self.timeline_perf_plot, self.timeline_ab_plot):
+            w.setMinimumSize(0, 0)
+            tl_layout.addWidget(w)
+        layout.addWidget(timeline_panel, 0)
+
         text_panel = QWidget()
         text_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         text_panel.setMaximumHeight(155)
@@ -503,10 +464,17 @@ class FDIDMHardwareTestTab(QWidget):
 
         self.rx_curve = self.rx_spectrum_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2))
         self.evm_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_PURPLE, width=2), name="current EVM")
-        self.evm_baseline_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2), name="before adaptive")
-        self.evm_adaptive_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_BLUE, width=2), name="after adaptive")
-        self.evm_baseline_curve.setVisible(False)
-        self.evm_adaptive_curve.setVisible(False)
+        self.timeline_ser_curve = self.timeline_perf_plot.plot(
+            pen=pg.mkPen(MATLAB_BLUE, width=2), name="log10(SER)", connect="finite")
+        self.timeline_evm_curve = self.timeline_perf_plot.plot(
+            pen=pg.mkPen(MATLAB_ORANGE, width=2), name="EVM%", connect="finite")
+        self.timeline_alpha_curve = self.timeline_ab_plot.plot(
+            pen=pg.mkPen(MATLAB_PURPLE, width=2), name="α", connect="finite")
+        self.timeline_beta_curve = self.timeline_ab_plot.plot(
+            pen=pg.mkPen(MATLAB_PURPLE, width=1, style=Qt.DashLine), name="β", connect="finite")
+        self.timeline_apply_scatter = pg.ScatterPlotItem(
+            size=12, symbol="t", pen=pg.mkPen(None), brush=pg.mkBrush(237, 177, 32, 220))
+        self.timeline_ab_plot.addItem(self.timeline_apply_scatter)
         self.constellation_scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(237, 177, 32, 160))
         self.constellation_plot.addItem(self.constellation_scatter)
         return panel
@@ -684,8 +652,9 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_connect.clicked.connect(self._on_connect_clicked)
         self.btn_start_test.clicked.connect(self._on_start_test_clicked)
         self.btn_stop_test.clicked.connect(self._on_stop_test_clicked)
-        self.btn_start_comparison.clicked.connect(self._start_comparison_demo)
-        self.btn_stop_comparison.clicked.connect(self._stop_comparison_demo)
+        self.btn_start_observation.clicked.connect(self._start_observation_clicked)
+        self.btn_stop_observation.clicked.connect(self._stop_observation_clicked)
+        self.btn_export_observation.clicked.connect(self._export_observation_clicked)
         self.btn_export_log.clicked.connect(self._on_export_log_clicked)
         self.btn_apply_params.clicked.connect(self._apply_params_to_backend)
         self.btn_ofdm.clicked.connect(lambda: self._set_indices(0.0, 0.0))
@@ -739,9 +708,6 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _on_start_test_clicked(self):
         try:
-            if not self.comparison_session.active:
-                self.comparison_session.reset()
-                self._update_adaptive_observation_display()
             if self.backend is None:
                 self._create_backend()
             else:
@@ -756,7 +722,6 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
-            self._reset_adaptive_observation(bool(self.adaptive_enable_check.isChecked()))
             self._log("v35 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
@@ -764,8 +729,6 @@ class FDIDMHardwareTestTab(QWidget):
             self._log(f"开始测试失败: {type(e).__name__}: {e}")
 
     def _on_stop_test_clicked(self):
-        if self.comparison_session.active:
-            self._stop_comparison_demo()
         self.test_running = False
         self.update_timer.stop()
         if self.backend is not None:
@@ -781,7 +744,12 @@ class FDIDMHardwareTestTab(QWidget):
         self._set_hw_controls_enabled(True)
         self._set_test_controls_enabled(True)
         self._clear_plots()
-        self._finalize_adaptive_observation_segment()
+        if self.observer.active:
+            self.observer.stop()
+            self.btn_start_observation.setEnabled(True)
+            self.btn_stop_observation.setEnabled(False)
+            self.btn_export_observation.setEnabled(self.observer.windows() or self.observer.events())
+            self._update_observation_display()
         self.decode_status_label.setText("解调状态：已停止")
         self._log("停止 FDIDM 测试。")
 
@@ -845,315 +813,224 @@ class FDIDMHardwareTestTab(QWidget):
         except Exception as e:
             self._log(f"导出日志失败: {type(e).__name__}: {e}")
 
-    # ---------------- manual adaptive observation ----------------
-    def _reset_adaptive_observation(self, enabled=None):
-        self._adaptive_observation_state = bool(self.adaptive_enable_check.isChecked() if enabled is None else enabled)
-        self._adaptive_observation_started_at = time.monotonic()
-        self._adaptive_observation_samples = []
-        self._adaptive_observation_start_frames = 0
-        self._adaptive_observation_start_ok = 0
-        self._adaptive_observation_records = []
-        self._adaptive_toggle_pending = False
-        for marker in list(self._adaptive_toggle_markers):
+    # ---------------- 优势观测（手动开关 + 自动配对统计） ----------------
+    def _observation_context(self):
+        ctx = {}
+        if self.backend is not None:
             try:
-                self.evm_plot.removeItem(marker)
+                st = self.backend.get_status()
+                for key in CONTEXT_KEYS:
+                    if key in st:
+                        ctx[key] = st[key]
             except Exception:
                 pass
-        self._adaptive_toggle_markers = []
-        self._update_adaptive_observation_display()
+        return ctx
 
-    @staticmethod
-    def _observation_metric_sample(status, stats):
-        return {
-            "match_ratio": float(status.get("match_ratio", stats.get("match_ratio", np.nan))),
-            "measured_ser": float(status.get("measured_ser", np.nan)),
-            "fec_bit_ber": float(status.get("fec_bit_ber", status.get("ber", np.nan))),
-            "evm_average_percent": float(status.get("evm_average_percent", status.get("evm_percent", np.nan))),
-            "crc_success_ratio": (
-                float(status.get("frames_decode_ok", 0)) / float(status.get("frames_processed", 0))
-                if int(status.get("frames_processed", 0) or 0) > 0 else np.nan
-            ),
-            "alpha": float(status.get("alpha", np.nan)),
-            "beta": float(status.get("beta", np.nan)),
-            "recommended_alpha": float(status.get("adaptive_recommended_alpha", np.nan)),
-            "recommended_beta": float(status.get("adaptive_recommended_beta", np.nan)),
-        }
-
-    def _sample_adaptive_observation(self, status, stats):
-        if self.backend is None or self._adaptive_observation_state is None:
+    def _start_observation_clicked(self):
+        if self.backend is None or not self.test_running:
+            self._log("请先连接并启动测试，再开始优势观测。")
             return
-        current_frames = int(status.get("frames_processed", 0) or 0)
-        current_ok = int(status.get("frames_decode_ok", 0) or 0)
-        if not self._adaptive_observation_samples:
-            self._adaptive_observation_start_frames = current_frames
-            self._adaptive_observation_start_ok = current_ok
-        sample = self._observation_metric_sample(status, stats)
-        delta_frames = current_frames - int(getattr(self, "_adaptive_observation_start_frames", current_frames))
-        delta_ok = current_ok - int(getattr(self, "_adaptive_observation_start_ok", current_ok))
-        sample["crc_success_ratio"] = (delta_ok / delta_frames) if delta_frames > 0 else np.nan
-        self._adaptive_observation_samples.append(sample)
-        self._update_adaptive_observation_display()
+        enabled = bool(self.adaptive_enable_check.isChecked())
+        self.observer.start(enabled, self._observation_context())
+        self._obs_t0 = self.observer.started_at()
+        self._clear_timeline()
+        self.btn_start_observation.setEnabled(False)
+        self.btn_stop_observation.setEnabled(True)
+        self.btn_export_observation.setEnabled(False)
+        self._log(f"开始优势观测（自适应初始：{'开启' if enabled else '关闭'}）；开关自适应时自动记录前后窗口。")
+        self._update_observation_display()
 
-    def _finalize_adaptive_observation_segment(self):
-        if self._adaptive_observation_state is None:
-            return None
-        samples = list(self._adaptive_observation_samples)
-        if not samples:
-            return None
-        record = {
-            "adaptive_enabled": bool(self._adaptive_observation_state),
-            "started_at": float(self._adaptive_observation_started_at),
-            "duration_sec": max(0.0, time.monotonic() - self._adaptive_observation_started_at),
-            "sample_count": len(samples),
-        }
-        for key in ("crc_success_ratio", "match_ratio", "measured_ser", "fec_bit_ber", "evm_average_percent", "alpha", "beta", "recommended_alpha", "recommended_beta"):
-            values = [float(item[key]) for item in samples if np.isfinite(float(item.get(key, np.nan)))]
-            record[key] = float(np.mean(values)) if values else float("nan")
-        self._adaptive_observation_records.append(record)
-        self._adaptive_observation_samples = []
-        self._update_adaptive_observation_display()
-        return record
+    def _stop_observation_clicked(self):
+        self.observer.stop()
+        self.btn_start_observation.setEnabled(True)
+        self.btn_stop_observation.setEnabled(False)
+        self.btn_export_observation.setEnabled(True)
+        self._log("结束优势观测；结果保留，可导出报告。")
+        self._update_observation_display()
+
+    def _export_observation_clicked(self):
+        data = self.observer.to_export_dict()
+        if not data.get("windows") and not data.get("toggle_events"):
+            self._log("尚无观测数据可导出；请先开始观测并开关自适应。")
+            return
+        log_dir = Path(__file__).resolve().parents[2] / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        default_name = str(log_dir / f"fdidm_advantage_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        path, _ = QFileDialog.getSaveFileName(self, "导出优势观测报告", default_name, "JSON (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=float)
+            self._log(f"优势观测报告已导出：{path}")
+        except Exception as e:
+            self._log(f"导出观测报告失败: {type(e).__name__}: {e}")
+
+    def _clear_timeline(self):
+        self._obs_t.clear(); self._obs_ser.clear(); self._obs_evm.clear()
+        self._obs_alpha.clear(); self._obs_beta.clear()
+        self._timeline_apply_points = []
+        self.timeline_apply_scatter.setData(x=[], y=[])
+        for item in self._timeline_event_items + self._timeline_anomaly_items:
+            try:
+                self.timeline_perf_plot.removeItem(item)
+            except Exception:
+                pass
+        self._timeline_event_items = []
+        self._timeline_anomaly_items = []
+        self._refresh_timeline_plot()
+
+    def _append_timeline_sample(self, status):
+        # 时间轴与观测会话共用引擎时钟，保证事件线/异常区与曲线同一时基
+        now = self.observer.now()
+        ser = float(status.get("measured_ser", np.nan))
+        evm = float(status.get("evm_average_percent", status.get("evm_percent", np.nan)))
+        self._obs_t.append(now - self._obs_t0)
+        self._obs_ser.append(math.log10(ser) if np.isfinite(ser) and ser > 0 else np.nan)
+        self._obs_evm.append(evm)
+        self._obs_alpha.append(float(status.get("alpha", np.nan)))
+        self._obs_beta.append(float(status.get("beta", np.nan)))
+        self._refresh_timeline_plot()
+        self._refresh_timeline_anomalies()
+
+    def _refresh_timeline_plot(self):
+        ts = list(self._obs_t)
+        self.timeline_ser_curve.setData(ts, list(self._obs_ser))
+        self.timeline_evm_curve.setData(ts, list(self._obs_evm))
+        self.timeline_alpha_curve.setData(ts, list(self._obs_alpha))
+        self.timeline_beta_curve.setData(ts, list(self._obs_beta))
+
+    def _refresh_timeline_anomalies(self):
+        drops = self.observer.anomaly_drops()
+        if len(drops) == getattr(self, "_timeline_anomaly_count", -1):
+            return
+        self._timeline_anomaly_count = len(drops)
+        for item in self._timeline_anomaly_items:
+            try:
+                self.timeline_perf_plot.removeItem(item)
+            except Exception:
+                pass
+        self._timeline_anomaly_items = []
+        t0 = getattr(self, "_obs_t0", 0.0)
+        spans = []
+        for t, _kind in drops:
+            rel = t - t0
+            if spans and rel - spans[-1][1] <= 0.35:
+                spans[-1][1] = rel
+            else:
+                spans.append([rel, rel])
+        for lo, hi in spans:
+            region = pg.LinearRegionItem([lo - 0.15, hi + 0.15], movable=False,
+                                         brush=pg.mkBrush(255, 0, 0, 35))
+            region.setZValue(-10)
+            self.timeline_perf_plot.addItem(region)
+            self._timeline_anomaly_items.append(region)
+
+    def _add_timeline_event_line(self, enabled, t_abs):
+        if not self._obs_t:
+            return
+        line = pg.InfiniteLine(pos=t_abs - self._obs_t0, angle=90,
+                               pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE,
+                                            style=Qt.DashLine, width=2))
+        self.timeline_perf_plot.addItem(line)
+        self._timeline_event_items.append(line)
+
+    def _mark_observation_apply(self, alpha, beta):
+        """α/β 推荐被应用时在时间轴 α/β 图上打标记。"""
+        if not self.observer.active or not self._obs_t or not np.isfinite(alpha):
+            return
+        self._timeline_apply_points.append((self.observer.now() - self._obs_t0, float(alpha)))
+        xs = [p[0] for p in self._timeline_apply_points]
+        ys = [p[1] for p in self._timeline_apply_points]
+        self.timeline_apply_scatter.setData(x=xs, y=ys)
+
+    def _update_adaptive_state_row(self, status):
+        a = float(status.get("alpha", np.nan))
+        b = float(status.get("beta", np.nan))
+        search = str(status.get("adaptive_alpha_beta_state", "—"))
+        valid = str(status.get("adaptive_validation_state", "—"))
+        alpha_obs = status.get("adaptive_alpha_observable")
+        beta_obs = status.get("adaptive_beta_observable")
+        if alpha_obs is None or beta_obs is None:
+            try:
+                ab = self.backend.get_alpha_beta_adaptation_status()
+                alpha_obs = ab.get("alpha_observable")
+                beta_obs = ab.get("beta_observable")
+            except Exception:
+                pass
+        def yn(v):
+            return "—" if v is None else ("是" if bool(v) else "否")
+        txt = f"α/β={a:.2f}/{b:.2f} | 搜索:{search} | 验证:{valid} | α可观测:{yn(alpha_obs)} | β可观测:{yn(beta_obs)}"
+        reason = str(status.get("adaptive_validation_reason", "") or "")
+        if reason:
+            txt += f" | {reason[:60]}"
+        self.adaptive_state_label.setText(txt)
+
+    def _update_observation_display(self):
+        started = bool(self.observer.windows() or self.observer.events())
+        state_txt = "进行中" if self.observer.active else ("已结束" if started else "未开始")
+        self.observation_state_label.setText(
+            f"观测：{state_txt} | 窗口 {len(self.observer.windows())} | 开关事件 {len(self.observer.events())}"
+            f" | 剔除 {self.observer.excluded_window_count()} 个异常窗口")
+        pair = self.observer.latest_pair()
+        if pair is None:
+            self.observation_before_label.setText("开启前：—")
+            self.observation_after_label.setText("开启后：—")
+            self.observation_improvement_label.setText("SER 改善：—")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#167c3a;")
+            self.observation_badge_label.setText("可信度：—")
+            self.observation_badge_label.setStyleSheet("")
+            self.observation_note_label.setText("开始观测后，手动关闭/开启自适应各积累一段窗口即可得到结论")
+            return
+        b, a = pair.before, pair.after
+        def fmt(v, suffix=""):
+            v = float(v)
+            return "—" if not np.isfinite(v) else f"{v:.3g}{suffix}"
+        self.observation_before_label.setText(f"开启前：SER {fmt(b.ser)} | EVM {fmt(b.evm_mean, '%')}")
+        self.observation_after_label.setText(f"开启后：SER {fmt(a.ser)} | EVM {fmt(a.evm_mean, '%')}")
+        # 样本不足的窗口不产生改善结论（F3/AC3）
+        insufficient = a.grade == "insufficient" or b.grade == "insufficient"
+        if insufficient:
+            self.observation_improvement_label.setText("SER 改善：样本不足")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b8860b;")
+        elif np.isfinite(pair.ser_improvement_db):
+            color = "#167c3a" if pair.ser_improvement_db >= 0 else "#a33b3b"
+            self.observation_improvement_label.setText(f"SER 改善：{pair.ser_improvement_db:+.2f} dB")
+            self.observation_improvement_label.setStyleSheet(f"font-size: 15px; font-weight: 600; color:{color};")
+        else:
+            self.observation_improvement_label.setText("SER 改善：—")
+        badge_map = {"trusted": ("可信", "#167c3a"), "reference": ("参考", "#777777"),
+                     "insufficient": ("样本不足", "#b8860b")}
+        name, color = badge_map.get(a.grade, ("—", "#333333"))
+        k_mark = "≈" if a.estimated_k else ""
+        self.observation_badge_label.setText(
+            f"开启后可信度：{name}（{k_mark}错误符号 {a.ser_k:.0f}/{a.ser_n}，{a.frames} 帧）")
+        self.observation_badge_label.setStyleSheet(f"color:{color}; font-weight:600;")
+        notes = []
+        if insufficient:
+            notes.append("每段需累计 ≥10 个错误符号才形成结论，≥100 为可信（继续运行积累）")
+        if self.observer.excluded_window_count():
+            notes.append(f"已剔除异常窗口 {self.observer.excluded_window_count()} 个")
+        if not pair.comparable:
+            notes.append(f"{pair.comparability_note}（可比性受限，结论仅供参考）")
+        self.observation_note_label.setText("；".join(notes))
 
     def _on_adaptive_enable_changed(self, state):
         enabled = bool(state)
         if self.backend is not None and self.test_running:
-            self._finalize_adaptive_observation_segment()
-            self._adaptive_observation_state = enabled
-            self._adaptive_observation_started_at = time.monotonic()
-            self._adaptive_observation_samples = []
-            self._adaptive_observation_start_frames = 0
-            self._adaptive_observation_start_ok = 0
-            try:
-                marker = pg.InfiniteLine(pos=max(0, self._evm_index), angle=90,
-                                         pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE, style=Qt.DashLine, width=1))
-                self.evm_plot.addItem(marker)
-                self._adaptive_toggle_markers.append(marker)
-            except Exception:
-                pass
-            self._log(f"手动{'开启' if enabled else '关闭'} α/β 自适应，开始记录切换后指标")
-        self._adaptive_toggle_pending = True
+            event = self.observer.on_toggle(enabled, self.alpha_spin.value(), self.beta_spin.value())
+            if event is not None:
+                self._add_timeline_event_line(enabled, event.t)
+                try:
+                    marker = pg.InfiniteLine(pos=max(0, self._evm_index), angle=90,
+                                             pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE, style=Qt.DashLine, width=1))
+                    self.evm_plot.addItem(marker)
+                    self._adaptive_toggle_markers.append(marker)
+                except Exception:
+                    pass
+            self._log(f"手动{'开启' if enabled else '关闭'} α/β 自适应，观测窗口已切换")
         self._on_adaptive_config_changed()
 
-    def _update_adaptive_observation_display(self):
-        records = list(self._adaptive_observation_records)
-        before = next((r for r in reversed(records) if not r["adaptive_enabled"]), None)
-        after = next((r for r in reversed(records) if r["adaptive_enabled"]), None)
-        self.comparison_phase_label.setText(f"自适应：{'开启' if self._adaptive_observation_state else '关闭'} | 已记录 {len(records)} 个窗口")
-        def fmt(v, suffix=""):
-            return "—" if not np.isfinite(float(v)) else f"{float(v):.3g}{suffix}"
-        if before:
-            self.comparison_baseline_result_label.setText(
-                f"开启前：CRC {fmt(before['crc_success_ratio']*100, '%')} | SER {fmt(before['measured_ser'])} | EVM {fmt(before['evm_average_percent'], '%')}"
-            )
-        else:
-            self.comparison_baseline_result_label.setText("开启前：—")
-        if after:
-            self.comparison_adaptive_result_label.setText(
-                f"开启后：CRC {fmt(after['crc_success_ratio']*100, '%')} | SER {fmt(after['measured_ser'])} | EVM {fmt(after['evm_average_percent'], '%')}"
-            )
-        else:
-            self.comparison_adaptive_result_label.setText("开启后：—")
-        if before and after and np.isfinite(before["evm_average_percent"]) and np.isfinite(after["evm_average_percent"]):
-            self.comparison_improvement_label.setText(
-                f"变化：EVM {after['evm_average_percent']-before['evm_average_percent']:+.2f}pp | SER {fmt(before['measured_ser']-after['measured_ser'])}"
-            )
-        else:
-            self.comparison_improvement_label.setText("变化：请先关闭运行一段时间，再手动开启自适应")
-
-    def get_adaptive_observation_records(self):
-        return [dict(item) for item in self._adaptive_observation_records]
-
-    # ---------------- single-USRP comparison demo ----------------
-    def _start_comparison_demo(self):
-        if self.comparison_session.active:
-            return
-        try:
-            if self.backend is None:
-                self._create_backend()
-            if not self.test_running:
-                self.backend.start(); self.test_running = True
-                self.btn_start_test.setEnabled(False); self.btn_stop_test.setEnabled(True)
-                self._set_test_controls_enabled(False); self.update_timer.start(100)
-            session = self.comparison_session
-            session.reset()
-            session.phase_duration_sec = float(self.comparison_duration_spin.value())
-            session.repeat_count = int(self.comparison_repeat_spin.value())
-            session.total_phases = session.repeat_count * 2
-            session.baseline_alpha = float(self.comparison_baseline_alpha_spin.value())
-            session.baseline_beta = float(self.comparison_baseline_beta_spin.value())
-            self._comparison_evm_x = 0; self._reset_runtime_curves()
-            session.active = True
-            self._enter_comparison_phase("baseline")
-            self.btn_start_comparison.setEnabled(False); self.btn_stop_comparison.setEnabled(True)
-            self._log(f"开始单 USRP 对比演示：{session.repeat_count} 轮，阶段 {session.phase_duration_sec:.0f}s")
-        except Exception as e:
-            self.comparison_session.reset(); self._log(f"开始对比演示失败: {type(e).__name__}: {e}")
-
-    def _stop_comparison_demo(self):
-        session = self.comparison_session
-        if not session.active and session.phase != "complete":
-            return
-        try:
-            if session.active and session.phase in ("baseline", "adaptive"):
-                self._finalize_comparison_phase()
-            session.active = False; session.phase = "complete" if session.records else "idle"
-            self._update_comparison_summary(); self.btn_start_comparison.setEnabled(True); self.btn_stop_comparison.setEnabled(False)
-            self._log("对比演示已停止，已保留已完成阶段结果")
-        except Exception as e:
-            self._log(f"停止对比演示失败: {type(e).__name__}: {e}")
-
-    def _comparison_phase_mode(self, phase_index):
-        return "baseline" if int(phase_index) % 2 == 0 else "adaptive"
-
-    def _enter_comparison_phase(self, mode):
-        mode = str(mode).lower()
-        if mode not in ("baseline", "adaptive"):
-            raise ValueError(f"unknown comparison mode: {mode}")
-        session = self.comparison_session
-        kwargs = self._backend_kwargs(self.tx_text_edit.toPlainText())
-        kwargs.update(alpha=float(session.baseline_alpha), beta=float(session.baseline_beta),
-                      adaptive_alpha_beta_enable=(mode == "adaptive"))
-        if self.backend is None:
-            self._create_backend()
-        else:
-            self.backend.configure(**kwargs)
-        status = self.backend.get_status() if hasattr(self.backend, "get_status") else {}
-        session.phase = mode; session.phase_started_at = time.monotonic()
-        session.phase_start_frames = int(status.get("frames_processed", 0) or 0)
-        session.phase_start_ok = int(status.get("frames_decode_ok", 0) or 0)
-        session.phase_samples = []
-        self._update_comparison_status(); self._log(f"进入 {mode} 阶段 α/β={session.baseline_alpha:.2f}/{session.baseline_beta:.2f}")
-
-    @staticmethod
-    def _mean_or_nan(samples, key):
-        vals = []
-        for item in samples:
-            try: v = float(item.get(key, np.nan))
-            except Exception: continue
-            if np.isfinite(v): vals.append(v)
-        return float(np.mean(vals)) if vals else float("nan")
-
-    def _sample_comparison_metrics(self, status, stats):
-        session = self.comparison_session
-        if not session.active or session.phase not in ("baseline", "adaptive"):
-            return None
-        sample = {
-            "frames_processed": int(status.get("frames_processed", 0) or 0),
-            "frames_decode_ok": int(status.get("frames_decode_ok", 0) or 0),
-            "match_ratio": float(status.get("match_ratio", stats.get("match_ratio", np.nan))),
-            "measured_ser": float(status.get("measured_ser", np.nan)),
-            "fec_bit_ber": float(status.get("fec_bit_ber", status.get("ber", np.nan))),
-            "evm_average_percent": float(status.get("evm_average_percent", status.get("evm_percent", np.nan))),
-            "alpha": float(status.get("alpha", np.nan)),
-            "beta": float(status.get("beta", np.nan)),
-            "recommended_alpha": float(status.get("adaptive_recommended_alpha", np.nan)),
-            "recommended_beta": float(status.get("adaptive_recommended_beta", np.nan)),
-        }
-        session.phase_samples.append(sample)
-        evm = sample["evm_average_percent"]
-        if np.isfinite(evm) and evm >= 0:
-            session.history.setdefault(session.phase, []).append((self._comparison_evm_x, evm)); self._comparison_evm_x += 1
-            self._update_comparison_evm_curves()
-        self._update_comparison_status(sample)
-        return sample
-
-    def _finalize_comparison_phase(self):
-        session = self.comparison_session
-        if session.phase not in ("baseline", "adaptive"):
-            return None
-        samples = list(session.phase_samples); last = samples[-1] if samples else {}
-        frames = max(0, int(last.get("frames_processed", session.phase_start_frames)) - session.phase_start_frames)
-        oks = max(0, int(last.get("frames_decode_ok", session.phase_start_ok)) - session.phase_start_ok)
-        record = ComparisonPhaseRecord(mode=session.phase, round_index=(session.phase_index // 2) + 1,
-            alpha=float(last.get("alpha", np.nan)), beta=float(last.get("beta", np.nan)),
-            frames_processed=frames, frames_decode_ok=oks, crc_success_ratio=(oks / frames) if frames else float("nan"),
-            match_ratio=self._mean_or_nan(samples, "match_ratio"), measured_ser=self._mean_or_nan(samples, "measured_ser"),
-            fec_bit_ber=self._mean_or_nan(samples, "fec_bit_ber"), evm_average_percent=self._mean_or_nan(samples, "evm_average_percent"),
-            valid_sample_count=len(samples))
-        session.records.append(record); session.phase_index += 1; session.phase_samples = []
-        self._update_comparison_summary(); self._log(self._phase_record_text(record)); return record
-
-    def _comparison_tick(self, status, stats):
-        session = self.comparison_session
-        if not session.active or self._comparison_tick_busy:
-            return
-        self._comparison_tick_busy = True
-        try:
-            self._sample_comparison_metrics(status, stats)
-            if time.monotonic() - session.phase_started_at < session.phase_duration_sec: return
-            self._finalize_comparison_phase()
-            if session.phase_index >= session.total_phases:
-                session.active = False; session.phase = "complete"
-                self.btn_start_comparison.setEnabled(True); self.btn_stop_comparison.setEnabled(False)
-                self._update_comparison_summary(); self._log("对比演示完成"); return
-            self._enter_comparison_phase(self._comparison_phase_mode(session.phase_index))
-        finally:
-            self._comparison_tick_busy = False
-
-    def _phase_record_text(self, record):
-        def fmt(v, suffix=""):
-            return "—" if not np.isfinite(v) else f"{v:.3f}{suffix}"
-        return (f"{record.mode}#{record.round_index}: frames={record.frames_processed}, CRC={fmt(record.crc_success_ratio * 100, '%')}, "
-                f"SER={fmt(record.measured_ser)}, EVM={fmt(record.evm_average_percent, '%')}, match={fmt(record.match_ratio * 100, '%')}")
-
-    def _update_comparison_status(self, sample=None):
-        session = self.comparison_session
-        if session.phase == "idle": text = "对比：未开始"
-        elif session.phase == "complete": text = "对比：已完成"
-        else:
-            remain = max(0.0, session.phase_duration_sec - (time.monotonic() - session.phase_started_at))
-            text = f"对比：{session.phase} 阶段 {session.phase_index + 1}/{session.total_phases}，剩余 {remain:.1f}s"
-            if sample: text += f" | frames={max(0, int(sample.get('frames_processed', 0)) - session.phase_start_frames)}"
-            if sample and session.phase == "adaptive":
-                a = sample.get("alpha", np.nan); b = sample.get("beta", np.nan)
-                ra = sample.get("recommended_alpha", np.nan); rb = sample.get("recommended_beta", np.nan)
-                if np.isfinite(a) and np.isfinite(b):
-                    text += f" | α/β={a:.2f}/{b:.2f}"
-                if np.isfinite(ra) and np.isfinite(rb):
-                    text += f" → 推荐 {ra:.2f}/{rb:.2f}"
-        self.comparison_status_label.setText(text); self.comparison_phase_label.setText(text)
-
-    def _update_comparison_evm_curves(self):
-        for mode, curve in (("baseline", self.evm_baseline_curve), ("adaptive", self.evm_adaptive_curve)):
-            points = self.comparison_session.history.get(mode, [])
-            curve.setData(np.asarray([p[0] for p in points]), np.asarray([p[1] for p in points])) if points else curve.setData([], [])
-
-    def _update_comparison_summary(self):
-        session = self.comparison_session
-        baseline = [r for r in session.records if r.mode == "baseline"]; adaptive = [r for r in session.records if r.mode == "adaptive"]
-        session.summary.baseline = baseline; session.summary.adaptive = adaptive
-        def avg(items, attr):
-            vals = [float(getattr(r, attr)) for r in items if np.isfinite(float(getattr(r, attr)))]
-            return float(np.mean(vals)) if vals else float("nan")
-        keys = ("crc_success_ratio", "match_ratio", "measured_ser", "fec_bit_ber", "evm_average_percent")
-        b = {k: avg(baseline, k) for k in keys}; a = {k: avg(adaptive, k) for k in keys}
-        session.summary.improvement = {"crc_success_ratio": a["crc_success_ratio"] - b["crc_success_ratio"], "match_ratio": a["match_ratio"] - b["match_ratio"], "measured_ser": b["measured_ser"] - a["measured_ser"], "fec_bit_ber": b["fec_bit_ber"] - a["fec_bit_ber"], "evm_average_percent": b["evm_average_percent"] - a["evm_average_percent"]}
-        session.summary.conclusion_available = bool(baseline and adaptive)
-        def text(v):
-            crc = "—" if not np.isfinite(v["crc_success_ratio"]) else f"{v['crc_success_ratio']*100:.1f}%"
-            match = "—" if not np.isfinite(v["match_ratio"]) else f"{v['match_ratio']*100:.1f}%"
-            ser = "—" if not np.isfinite(v["measured_ser"]) else f"{v['measured_ser']:.3g}"
-            evm = "—" if not np.isfinite(v["evm_average_percent"]) else f"{v['evm_average_percent']:.2f}%"
-            return f"CRC {crc} | 文本 {match} | SER {ser} | EVM {evm}"
-        self.comparison_baseline_result_label.setText(f"Baseline：{text(b)}"); self.comparison_adaptive_result_label.setText(f"Adaptive：{text(a)}")
-        imp = session.summary.improvement
-        self.comparison_improvement_label.setText(f"改善：EVM {imp['evm_average_percent']:+.2f}pp，SER {imp['measured_ser']:+.3g}" if session.summary.conclusion_available and np.isfinite(imp["evm_average_percent"]) else "改善：等待完成一组 baseline/adaptive")
-        self._update_comparison_evm_curves()
-        self._update_comparison_status()
-
-    def _comparison_summary_text(self):
-        return "\n".join((self.comparison_baseline_result_label.text(), self.comparison_adaptive_result_label.text(), self.comparison_improvement_label.text()))
-
-    def get_comparison_summary(self):
-        """Return a serializable snapshot for tests, logging, or future export."""
-        summary = self.comparison_session.summary
-        return {
-            "baseline": [record.as_dict() for record in summary.baseline],
-            "adaptive": [record.as_dict() for record in summary.adaptive],
-            "conclusion_available": bool(summary.conclusion_available),
-            "improvement": dict(summary.improvement),
-            "text": self._comparison_summary_text(),
-        }
 
     # ---------------- backend config ----------------
     def _current_data(self, combo: QComboBox, default: str):
@@ -1384,7 +1261,11 @@ class FDIDMHardwareTestTab(QWidget):
             return
         try:
             status = self.backend.get_status(); stats = self.backend.get_decode_stats()
-            self._sample_adaptive_observation(status, stats)
+            self.observer.on_sample(status)
+            if self.observer.active:
+                self._append_timeline_sample(status)
+                self._update_adaptive_state_row(status)
+            self._update_observation_display()
             samp_rate = self._extract_samp_rate(status)
             self._apply_stable_plot_ranges(samp_rate)
             err = status.get("last_error", "")
@@ -1398,7 +1279,7 @@ class FDIDMHardwareTestTab(QWidget):
             stale = bool(status.get("rx_spectrum_stale", True)); age = float(status.get("rx_spectrum_stale_sec", np.nan))
             self.rx_spectrum_plot.setTitle(f"RX频谱[{self._selected_rx_spectrum_source()}] stale={stale} age={age:.1f}s")
             self._update_evm_plot(float(status.get("evm_percent", np.nan)))
-            self.evm_plot.setTitle("EVM 曲线（虚线标记自适应切换）" if self._adaptive_observation_state is not None else "EVM 曲线")
+            self.evm_plot.setTitle("EVM 曲线（虚线标记自适应切换）" if self.observer.active else "EVM 曲线")
             const = self.backend.get_rx_constellation(512, source=self._current_data(self.const_mode_combo, "post_equalized"))
             if const is not None and len(const) > 0:
                 self.constellation_scatter.setData(x=np.real(const), y=np.imag(const))
@@ -1630,6 +1511,7 @@ class FDIDMHardwareTestTab(QWidget):
                 or seq <= int(self._last_adaptive_recommendation_seq)):
             return
         self._last_adaptive_recommendation_seq = seq
+        self._mark_observation_apply(rec_a, rec_b)
         if not (np.isfinite(rec_a) and np.isfinite(rec_b)):
             return
         delta = abs(rec_a - self.alpha_spin.value()) + abs(rec_b - self.beta_spin.value())
@@ -1742,11 +1624,11 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _reset_runtime_curves(self):
         self._evm_history.clear(); self._evm_index = 0
-        self.evm_curve.setData([], []); self.evm_baseline_curve.setData([], []); self.evm_adaptive_curve.setData([], []); self.constellation_scatter.setData(x=[], y=[])
+        self.evm_curve.setData([], []); self.constellation_scatter.setData(x=[], y=[])
         self.last_status_error = ""; self._last_runtime_log_time = 0.0
 
     def _clear_plots(self):
-        self.rx_curve.setData([], []); self.evm_curve.setData([], []); self.evm_baseline_curve.setData([], []); self.evm_adaptive_curve.setData([], [])
+        self.rx_curve.setData([], []); self.evm_curve.setData([], [])
         self.constellation_scatter.setData(x=[], y=[]); self._evm_history.clear(); self._evm_index = 0
 
     def _extract_samp_rate(self, status):
