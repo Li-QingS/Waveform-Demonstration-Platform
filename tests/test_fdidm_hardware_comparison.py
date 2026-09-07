@@ -137,6 +137,9 @@ def test_observation_pair_updates_panel_and_timeline(app):
     pair = tab.observer.latest_pair()
     assert pair is not None and pair.comparable
     assert "dB" in tab.observation_improvement_label.text()
+    # v2：两页签各四宫格；观测页统计表出现窗口汇总行（AC6/AC7）
+    assert tab.plot_tabs.count() == 2
+    assert "开启前" in tab.observation_stats_label.text()
     assert "可信" in tab.observation_badge_label.text()
     assert "SER" in tab.observation_before_label.text()
     # 时间轴：曲线有数据 + 一条开关事件竖线（AC4）

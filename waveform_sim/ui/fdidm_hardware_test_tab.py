@@ -38,6 +38,8 @@ BORDER_COLOR = (225, 225, 225)
 from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas
 from .hardware_advantage_observer import (
     CONTEXT_KEYS,
+    MODE_OFF,
+    MODE_ON,
     AdvantageObservationSession,
     grade_from_k,
 )
@@ -389,6 +391,26 @@ class FDIDMHardwareTestTab(QWidget):
         result_grid.addWidget(self.adaptive_state_label, 3, 0, 1, 3)
         layout.addWidget(self.comparison_result_group, 0)
 
+        # 观测页签的时间轴三图（SER / EVM / αβ 轨迹）与统计表；x 轴联动对齐。
+        self.timeline_ser_plot = pg.PlotWidget(title="实测 SER（log10）")
+        self.timeline_evm_plot = pg.PlotWidget(title="EVM%（信道代理）")
+        self.timeline_ab_plot = pg.PlotWidget(title="α/β 轨迹（▲=参数应用）")
+        self.timeline_ab_plot.setXLink(self.timeline_ser_plot)
+        self.timeline_evm_plot.setXLink(self.timeline_ser_plot)
+        self.timeline_ser_plot.setLabel("left", "log10(SER)")
+        self.timeline_evm_plot.setLabel("left", "EVM %")
+        self.timeline_ab_plot.setLabel("left", "α / β")
+        self.timeline_ser_plot.setLabel("bottom", "观测时间 (s)")
+        self.timeline_evm_plot.setLabel("bottom", "观测时间 (s)")
+        self.timeline_ab_plot.setLabel("bottom", "观测时间 (s)")
+
+        self.observation_stats_group = QGroupBox("窗口汇总")
+        stats_layout = QVBoxLayout(self.observation_stats_group)
+        self.observation_stats_label = QLabel("开始观测后此处显示各窗口汇总")
+        self.observation_stats_label.setWordWrap(True)
+        self.observation_stats_label.setStyleSheet("color:#555555; font-size: 12px;")
+        stats_layout.addWidget(self.observation_stats_label)
+
         self.ab_surface_panel = self._create_ab_surface_panel()
         self.rx_spectrum_plot = pg.PlotWidget(title="RX 频谱")
         self.evm_plot = pg.PlotWidget(title="EVM 曲线")
@@ -408,35 +430,53 @@ class FDIDMHardwareTestTab(QWidget):
         self.constellation_plot.setXRange(-2, 2, padding=0)
         self.constellation_plot.setYRange(-2, 2, padding=0)
 
+        # 两个页签、每页 2×2 四宫格（v2 方向修订）。恢复 _PlotGridCell 包装：
+        # 它刻意压小 sizeHint，让网格拉伸规则主导，防止 OpenGL/pyqtgraph
+        # 组件的大 sizeHint 把四宫格挤变形。
+        from .fdidm_plot_widgets import _PlotGridCell as _Cell
+        self.ab_surface_cell = _Cell(self.ab_surface_panel)
+        self.rx_spectrum_cell = _Cell(self.rx_spectrum_plot)
+        self.evm_cell = _Cell(self.evm_plot)
+        self.constellation_cell = _Cell(self.constellation_plot)
+
+        diag_grid = QWidget()
+        diag_grid.setMinimumSize(0, 0)
+        diag_grid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        dg = QGridLayout(diag_grid)
+        dg.setContentsMargins(0, 0, 0, 0)
+        dg.setSpacing(6)
+        for r in (0, 1):
+            dg.setRowStretch(r, 1)
+        for c in (0, 1):
+            dg.setColumnStretch(c, 1)
+        dg.addWidget(self.ab_surface_cell, 0, 0)
+        dg.addWidget(self.rx_spectrum_cell, 0, 1)
+        dg.addWidget(self.evm_cell, 1, 0)
+        dg.addWidget(self.constellation_cell, 1, 1)
+
+        obs_grid = QWidget()
+        obs_grid.setMinimumSize(0, 0)
+        obs_grid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        og = QGridLayout(obs_grid)
+        og.setContentsMargins(0, 0, 0, 0)
+        og.setSpacing(6)
+        for r in (0, 1):
+            og.setRowStretch(r, 1)
+        for c in (0, 1):
+            og.setColumnStretch(c, 1)
+        self.timeline_ser_cell = _Cell(self.timeline_ser_plot)
+        self.timeline_evm_cell = _Cell(self.timeline_evm_plot)
+        self.timeline_ab_cell = _Cell(self.timeline_ab_plot)
+        og.addWidget(self.timeline_ser_cell, 0, 0)
+        og.addWidget(self.timeline_evm_cell, 0, 1)
+        og.addWidget(self.timeline_ab_cell, 1, 0)
+        og.addWidget(self.observation_stats_group, 1, 1)
+
         self.plot_tabs = QTabWidget()
-        self.plot_tabs.addTab(self.ab_surface_panel, "α/β 性能面")
-        self.plot_tabs.addTab(self.rx_spectrum_plot, "RX 频谱")
-        self.plot_tabs.addTab(self.evm_plot, "EVM 曲线")
-        self.plot_tabs.addTab(self.constellation_plot, "接收星座")
+        self.plot_tabs.addTab(diag_grid, "链路诊断")
+        self.plot_tabs.addTab(obs_grid, "优势观测")
         self.plot_tabs.setCurrentIndex(0)
         layout.addWidget(self.plot_tabs, 1)
-
-        # 因果时间轴：左图实测SER(log10)与EVM%信道代理，右图α/β轨迹；共享 x 轴联动。
-        timeline_panel = QWidget()
-        timeline_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        timeline_panel.setMinimumHeight(150)
-        timeline_panel.setMaximumHeight(200)
-        tl_layout = QHBoxLayout(timeline_panel)
-        tl_layout.setContentsMargins(0, 0, 0, 0)
-        tl_layout.setSpacing(8)
-        self.timeline_perf_plot = pg.PlotWidget(title="观测时间轴：SER(log10) / EVM%（信道代理）")
-        self.timeline_ab_plot = pg.PlotWidget(title="α/β 轨迹（▲=参数应用）")
-        self.timeline_ab_plot.setXLink(self.timeline_perf_plot)
-        self.timeline_perf_plot.showGrid(x=True, y=True)
-        self.timeline_ab_plot.showGrid(x=True, y=True)
-        self.timeline_perf_plot.setLabel("left", "log10(SER) / EVM %")
-        self.timeline_ab_plot.setLabel("left", "α / β")
-        self.timeline_perf_plot.setLabel("bottom", "观测时间 (s)")
-        for w in (self.timeline_perf_plot, self.timeline_ab_plot):
-            w.setMinimumSize(0, 0)
-        tl_layout.addWidget(self.timeline_perf_plot, 3)
-        tl_layout.addWidget(self.timeline_ab_plot, 2)
-        layout.addWidget(timeline_panel, 0)
 
         text_panel = QWidget()
         text_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -460,9 +500,9 @@ class FDIDMHardwareTestTab(QWidget):
 
         self.rx_curve = self.rx_spectrum_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2))
         self.evm_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_PURPLE, width=2), name="current EVM")
-        self.timeline_ser_curve = self.timeline_perf_plot.plot(
+        self.timeline_ser_curve = self.timeline_ser_plot.plot(
             pen=pg.mkPen(MATLAB_BLUE, width=2), name="log10(SER)", connect="finite")
-        self.timeline_evm_curve = self.timeline_perf_plot.plot(
+        self.timeline_evm_curve = self.timeline_evm_plot.plot(
             pen=pg.mkPen(MATLAB_ORANGE, width=2), name="EVM%", connect="finite")
         self.timeline_alpha_curve = self.timeline_ab_plot.plot(
             pen=pg.mkPen(MATLAB_PURPLE, width=2), name="α", connect="finite")
@@ -625,7 +665,7 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _init_plot_style(self):
         plot_widgets = [self.rx_spectrum_plot, self.evm_plot, self.constellation_plot,
-                        self.timeline_perf_plot, self.timeline_ab_plot]
+                        self.timeline_ser_plot, self.timeline_evm_plot, self.timeline_ab_plot]
         if getattr(self, "ab_surface_fallback_plot", None) is not None:
             plot_widgets.insert(0, self.ab_surface_fallback_plot)
         for p in plot_widgets:
@@ -870,7 +910,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.timeline_apply_scatter.setData(x=[], y=[])
         for item in self._timeline_event_items + self._timeline_anomaly_items:
             try:
-                self.timeline_perf_plot.removeItem(item)
+                self.timeline_ser_plot.removeItem(item)
             except Exception:
                 pass
         self._timeline_event_items = []
@@ -904,7 +944,7 @@ class FDIDMHardwareTestTab(QWidget):
         self._timeline_anomaly_count = len(drops)
         for item in self._timeline_anomaly_items:
             try:
-                self.timeline_perf_plot.removeItem(item)
+                self.timeline_ser_plot.removeItem(item)
             except Exception:
                 pass
         self._timeline_anomaly_items = []
@@ -920,7 +960,7 @@ class FDIDMHardwareTestTab(QWidget):
             region = pg.LinearRegionItem([lo - 0.15, hi + 0.15], movable=False,
                                          brush=pg.mkBrush(255, 0, 0, 35))
             region.setZValue(-10)
-            self.timeline_perf_plot.addItem(region)
+            self.timeline_ser_plot.addItem(region)
             self._timeline_anomaly_items.append(region)
 
     def _add_timeline_event_line(self, enabled, t_abs):
@@ -929,7 +969,7 @@ class FDIDMHardwareTestTab(QWidget):
         line = pg.InfiniteLine(pos=t_abs - self._obs_t0, angle=90,
                                pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE,
                                             style=Qt.DashLine, width=2))
-        self.timeline_perf_plot.addItem(line)
+        self.timeline_ser_plot.addItem(line)
         self._timeline_event_items.append(line)
 
     def _mark_observation_apply(self, alpha, beta):
@@ -1012,6 +1052,29 @@ class FDIDMHardwareTestTab(QWidget):
         if not pair.comparable:
             notes.append(f"{pair.comparability_note}（可比性受限，结论仅供参考）")
         self.observation_note_label.setText("；".join(notes))
+        self._update_observation_stats()
+
+    def _update_observation_stats(self):
+        """观测页签右下角统计表：最近窗口的汇总数字。"""
+        name_map = {MODE_ON: "开启后", MODE_OFF: "开启前"}
+        wins = self.observer.windows()
+        if not wins:
+            self.observation_stats_label.setText("开始观测后此处显示各窗口汇总")
+            return
+        lines = []
+        for w in wins[-4:]:
+            agg = w.aggregate
+            label = name_map.get(w.mode, w.mode)
+            if agg is None:
+                lines.append(f"{label}  已剔除（{w.exclusion_reason}）")
+            else:
+                lines.append(
+                    f"{label}  {agg.frames}帧  SER {agg.ser:.3g}"
+                    f"（k={agg.ser_k:.0f}/{agg.ser_n}）  {agg.grade}  EVM {agg.evm_mean:.3g}%")
+        pair = self.observer.latest_pair()
+        if pair is not None and np.isfinite(pair.ser_improvement_db):
+            lines.append(f"SER 改善 {pair.ser_improvement_db:+.2f} dB · 剔除窗口 {self.observer.excluded_window_count()}")
+        self.observation_stats_label.setText("\n".join(lines))
 
     def _on_adaptive_enable_changed(self, state):
         enabled = bool(state)
