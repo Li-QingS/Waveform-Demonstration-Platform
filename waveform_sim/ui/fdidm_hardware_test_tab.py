@@ -355,6 +355,7 @@ class FDIDMHardwareTestTab(QWidget):
         result_grid.addLayout(ctrl_row, 0, 0, 1, 3)
 
         big_style = "font-size: 18px; font-weight: 700;"
+        # 大数字行只放 SER 前后与改善量（均分三列，文本短于一列宽度，不裁尾）
         self.observation_before_label = QLabel("开启前：—")
         self.observation_after_label = QLabel("开启后：—")
         self.observation_improvement_label = QLabel("SER 改善：—")
@@ -369,14 +370,22 @@ class FDIDMHardwareTestTab(QWidget):
         result_grid.addWidget(self.observation_after_label, 1, 1)
         result_grid.addWidget(self.observation_improvement_label, 1, 2)
 
+        # 第二行：徽标与 EVM 变化按自然宽度，注记吃剩余宽度
         self.observation_badge_label = QLabel("可信度：—")
+        self.observation_evm_label = QLabel("EVM：—")
+        self.observation_evm_label.setStyleSheet("color:#555555; font-size: 14px;")
         self.observation_note_label = QLabel("")
         self.observation_note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.adaptive_state_label = QLabel("α/β：— | 搜索：— | 验证：— | α可观测：— | β可观测：—")
         self.adaptive_state_label.setStyleSheet("color:#555555; font-size: 12px;")
         self.adaptive_state_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        result_grid.addWidget(self.observation_badge_label, 2, 0)
-        result_grid.addWidget(self.observation_note_label, 2, 1, 1, 2)
+        result_grid.addWidget(self.observation_badge_label, 2, 0, 1, 2)
+        result_grid.addWidget(self.observation_evm_label, 2, 2)
+        state_row = QHBoxLayout()
+        state_row.setSpacing(12)
+        state_row.addWidget(self.adaptive_state_label, 3)
+        state_row.addWidget(self.observation_note_label, 2)
+        result_grid.addLayout(state_row, 3, 0, 1, 3)
         result_grid.addWidget(self.adaptive_state_label, 3, 0, 1, 3)
         layout.addWidget(self.comparison_result_group, 0)
 
@@ -974,8 +983,9 @@ class FDIDMHardwareTestTab(QWidget):
         def fmt(v, suffix=""):
             v = float(v)
             return "—" if not np.isfinite(v) else f"{v:.3g}{suffix}"
-        self.observation_before_label.setText(f"开启前：SER {fmt(b.ser)} | EVM {fmt(b.evm_mean, '%')}")
-        self.observation_after_label.setText(f"开启后：SER {fmt(a.ser)} | EVM {fmt(a.evm_mean, '%')}")
+        self.observation_before_label.setText(f"开启前 SER {fmt(b.ser)}")
+        self.observation_after_label.setText(f"开启后 SER {fmt(a.ser)}")
+        self.observation_evm_label.setText(f"EVM {fmt(b.evm_mean, '%')} → {fmt(a.evm_mean, '%')}")
         # 样本不足的窗口不产生改善结论（F3/AC3）
         insufficient = a.grade == "insufficient" or b.grade == "insufficient"
         if insufficient:
@@ -992,7 +1002,7 @@ class FDIDMHardwareTestTab(QWidget):
         name, color = badge_map.get(a.grade, ("—", "#333333"))
         k_mark = "≈" if a.estimated_k else ""
         self.observation_badge_label.setText(
-            f"开启后可信度：{name}（{k_mark}错误符号 {a.ser_k:.0f}/{a.ser_n}，{a.frames} 帧）")
+            f"{name}（{k_mark}{a.ser_k:.0f}/{a.ser_n} 符号错误 · {a.frames} 帧）")
         self.observation_badge_label.setStyleSheet(f"color:{color}; font-weight:600;")
         notes = []
         if insufficient:
