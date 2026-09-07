@@ -19,7 +19,7 @@ except Exception:
     _PG_OPENGL_AVAILABLE = False
 from PyQt5.QtCore import Qt, QTimer, QSignalBlocker, pyqtSignal, QEvent, QSize
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton, QTabWidget,
     QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QSplitter,
     QScrollArea, QSizePolicy, QCheckBox, QFileDialog, QDialog, QStackedLayout,
 )
@@ -35,7 +35,7 @@ AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
 
 
-from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas, _PlotGridCell
+from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas
 from .hardware_advantage_observer import (
     CONTEXT_KEYS,
     AdvantageObservationSession,
@@ -116,18 +116,18 @@ class FDIDMHardwareTestTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(340)
-        scroll.setMaximumWidth(410)
+        scroll.setMinimumWidth(360)
+        scroll.setMaximumWidth(470)
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         hw_group = QGroupBox("链路配置")
         hw = QGridLayout(hw_group)
-        hw.setHorizontalSpacing(5)
-        hw.setVerticalSpacing(5)
+        hw.setHorizontalSpacing(6)
+        hw.setVerticalSpacing(6)
         self.device_combo = self._combo([("B210", "USRP B210"), ("N210", "USRP N210"), ("X310", "USRP X310")])
         self.samp_rate_spin = self._dspin(1e5, 100e6, 500_000, 0, " Hz")
         self.fc_spin = self._dspin(70e6, 6e9, 2.4e9, 0, " Hz")
@@ -138,8 +138,8 @@ class FDIDMHardwareTestTab(QWidget):
 
         fd_group = QGroupBox("FDIDM 参数")
         fd = QGridLayout(fd_group)
-        fd.setHorizontalSpacing(5)
-        fd.setVerticalSpacing(5)
+        fd.setHorizontalSpacing(6)
+        fd.setVerticalSpacing(6)
         self.alpha_spin = self._dspin(-2.0, 2.0, 0.5, 2, "", 0.05)
         self.beta_spin = self._dspin(-2.0, 2.0, 1.0, 2, "", 0.05)
         self.m_spin = self._spin(4, 64, 16)
@@ -228,8 +228,8 @@ class FDIDMHardwareTestTab(QWidget):
 
         adapt_group = QGroupBox("α/β 信道自适应（论文SER）")
         adapt = QGridLayout(adapt_group)
-        adapt.setHorizontalSpacing(5)
-        adapt.setVerticalSpacing(5)
+        adapt.setHorizontalSpacing(6)
+        adapt.setVerticalSpacing(6)
         self.adaptive_enable_check = QCheckBox("启用信道自适应")
         # The demo starts in fixed mode so the operator can explicitly enable
         # adaptation and observe the before/after change.
@@ -264,8 +264,8 @@ class FDIDMHardwareTestTab(QWidget):
 
         modem_group = QGroupBox("收发/显示")
         modem = QGridLayout(modem_group)
-        modem.setHorizontalSpacing(5)
-        modem.setVerticalSpacing(5)
+        modem.setHorizontalSpacing(6)
+        modem.setVerticalSpacing(6)
         self.tx_gain_spin = self._dspin(0, 80, 10, 1, " dB")
         self.rx_gain_spin = self._dspin(0, 80, 20, 1, " dB")
         self.mod_order_combo = self._combo([("QPSK", "QPSK"), ("16QAM", "16QAM"), ("64QAM", "64QAM")])
@@ -329,76 +329,64 @@ class FDIDMHardwareTestTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # 右侧四幅图必须在同一个 QGridLayout 中按 1:1 / 1:1 分配空间。
-        # 不再用垂直 splitter 挤压 plot_panel，避免 OpenGL/pyqtgraph 上排图
-        # 在小窗口下把下排图遮住或挤到不可见。
+        # 右栏四层：①优势观测横条（固定紧凑）②诊断图页签（主伸展，单幅满幅）
+        # ③时间轴（左右并排）④文本区。页签替代旧 2×2 网格：每次只呈现一幅诊断图，
+        # 幅面约为原四宫格单格的 4 倍，且彻底避免 OpenGL sizeHint 把网格挤变形。
         self.comparison_result_group = QGroupBox("优势观测（手动开关自适应 · 自动配对统计）")
+        self.comparison_result_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         result_grid = QGridLayout(self.comparison_result_group)
         result_grid.setVerticalSpacing(2)
+        result_grid.setHorizontalSpacing(12)
         self.btn_start_observation = QPushButton("开始观测")
         self.btn_stop_observation = QPushButton("结束观测")
         self.btn_export_observation = QPushButton("导出报告")
+        for btn in (self.btn_start_observation, self.btn_stop_observation, self.btn_export_observation):
+            btn.setMinimumWidth(96)
+            btn.setMinimumHeight(28)
         self.btn_stop_observation.setEnabled(False)
         self.btn_export_observation.setEnabled(False)
         self.observation_state_label = QLabel("观测：未开始 | 开始观测后手动开关自适应即可积累前后窗口")
-        self.observation_state_label.setWordWrap(True)
         ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
         ctrl_row.addWidget(self.btn_start_observation)
         ctrl_row.addWidget(self.btn_stop_observation)
         ctrl_row.addWidget(self.btn_export_observation)
         ctrl_row.addWidget(self.observation_state_label, 1)
         result_grid.addLayout(ctrl_row, 0, 0, 1, 3)
 
-        big_style = "font-size: 15px; font-weight: 600;"
+        big_style = "font-size: 18px; font-weight: 700;"
         self.observation_before_label = QLabel("开启前：—")
         self.observation_after_label = QLabel("开启后：—")
         self.observation_improvement_label = QLabel("SER 改善：—")
         self.observation_before_label.setStyleSheet(big_style + " color:#333333;")
         self.observation_after_label.setStyleSheet(big_style + " color:#333333;")
         self.observation_improvement_label.setStyleSheet(big_style + " color:#167c3a;")
+        # 单行省略：宽度不足时裁切而不是换行把横条撑高
+        for lbl in (self.observation_before_label, self.observation_after_label,
+                    self.observation_improvement_label):
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         result_grid.addWidget(self.observation_before_label, 1, 0)
         result_grid.addWidget(self.observation_after_label, 1, 1)
         result_grid.addWidget(self.observation_improvement_label, 1, 2)
 
         self.observation_badge_label = QLabel("可信度：—")
-        self.observation_badge_label.setWordWrap(True)
         self.observation_note_label = QLabel("")
-        self.observation_note_label.setWordWrap(True)
+        self.observation_note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.adaptive_state_label = QLabel("α/β：— | 搜索：— | 验证：— | α可观测：— | β可观测：—")
+        self.adaptive_state_label.setStyleSheet("color:#555555; font-size: 12px;")
+        self.adaptive_state_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         result_grid.addWidget(self.observation_badge_label, 2, 0)
         result_grid.addWidget(self.observation_note_label, 2, 1, 1, 2)
-
-        self.adaptive_state_label = QLabel("α/β：— | 搜索：— | 验证：— | α可观测：— | β可观测：—")
-        self.adaptive_state_label.setStyleSheet("color:#555555;")
         result_grid.addWidget(self.adaptive_state_label, 3, 0, 1, 3)
         layout.addWidget(self.comparison_result_group, 0)
 
-        plot_panel = QWidget()
-        plot_panel.setMinimumSize(0, 0)
-        plot_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        grid = QGridLayout(plot_panel)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(8)
-        grid.setRowStretch(0, 1)
-        grid.setRowStretch(1, 1)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnMinimumWidth(0, 0)
-        grid.setColumnMinimumWidth(1, 0)
-        grid.setRowMinimumHeight(0, 0)
-        grid.setRowMinimumHeight(1, 0)
-
         self.ab_surface_panel = self._create_ab_surface_panel()
-        self.rx_spectrum_plot = pg.PlotWidget(title="RX频谱")
+        self.rx_spectrum_plot = pg.PlotWidget(title="RX 频谱")
         self.evm_plot = pg.PlotWidget(title="EVM 曲线")
         self.constellation_plot = pg.PlotWidget(title="接收星座")
         for w in (self.ab_surface_panel, self.rx_spectrum_plot, self.evm_plot, self.constellation_plot):
             w.setMinimumSize(0, 0)
             w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        for p in (self.rx_spectrum_plot, self.evm_plot, self.constellation_plot):
-            p.showGrid(x=True, y=True)
-            p.setMinimumSize(0, 0)
-            p.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
         self.rx_spectrum_plot.setLabel("left", "幅度", units="dB")
         self.rx_spectrum_plot.setLabel("bottom", "频率", units="Hz")
@@ -411,50 +399,49 @@ class FDIDMHardwareTestTab(QWidget):
         self.constellation_plot.setXRange(-2, 2, padding=0)
         self.constellation_plot.setYRange(-2, 2, padding=0)
 
-        self.ab_surface_cell = _PlotGridCell(self.ab_surface_panel)
-        self.rx_spectrum_cell = _PlotGridCell(self.rx_spectrum_plot)
-        self.evm_cell = _PlotGridCell(self.evm_plot)
-        self.constellation_cell = _PlotGridCell(self.constellation_plot)
-        grid.addWidget(self.ab_surface_cell, 0, 0)
-        grid.addWidget(self.rx_spectrum_cell, 0, 1)
-        grid.addWidget(self.evm_cell, 1, 0)
-        grid.addWidget(self.constellation_cell, 1, 1)
-        layout.addWidget(plot_panel, 1)
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.addTab(self.ab_surface_panel, "α/β 性能面")
+        self.plot_tabs.addTab(self.rx_spectrum_plot, "RX 频谱")
+        self.plot_tabs.addTab(self.evm_plot, "EVM 曲线")
+        self.plot_tabs.addTab(self.constellation_plot, "接收星座")
+        self.plot_tabs.setCurrentIndex(0)
+        layout.addWidget(self.plot_tabs, 1)
 
-        # 因果时间轴：上图为实测SER(log10)与EVM%信道代理，下图为α/β轨迹（T6）。
+        # 因果时间轴：左图实测SER(log10)与EVM%信道代理，右图α/β轨迹；共享 x 轴联动。
         timeline_panel = QWidget()
         timeline_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        timeline_panel.setMaximumHeight(220)
-        tl_layout = QVBoxLayout(timeline_panel)
+        timeline_panel.setMinimumHeight(150)
+        timeline_panel.setMaximumHeight(200)
+        tl_layout = QHBoxLayout(timeline_panel)
         tl_layout.setContentsMargins(0, 0, 0, 0)
-        tl_layout.setSpacing(2)
-        self.timeline_perf_plot = pg.PlotWidget(title="优势观测时间轴：实测SER(log10) 与 EVM%（信道代理）")
+        tl_layout.setSpacing(8)
+        self.timeline_perf_plot = pg.PlotWidget(title="观测时间轴：SER(log10) / EVM%（信道代理）")
         self.timeline_ab_plot = pg.PlotWidget(title="α/β 轨迹（▲=参数应用）")
         self.timeline_ab_plot.setXLink(self.timeline_perf_plot)
         self.timeline_perf_plot.showGrid(x=True, y=True)
         self.timeline_ab_plot.showGrid(x=True, y=True)
         self.timeline_perf_plot.setLabel("left", "log10(SER) / EVM %")
         self.timeline_ab_plot.setLabel("left", "α / β")
-        self.timeline_ab_plot.setLabel("bottom", "观测时间 (s)")
+        self.timeline_perf_plot.setLabel("bottom", "观测时间 (s)")
         for w in (self.timeline_perf_plot, self.timeline_ab_plot):
             w.setMinimumSize(0, 0)
-            tl_layout.addWidget(w)
+        tl_layout.addWidget(self.timeline_perf_plot, 3)
+        tl_layout.addWidget(self.timeline_ab_plot, 2)
         layout.addWidget(timeline_panel, 0)
 
         text_panel = QWidget()
         text_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        text_panel.setMaximumHeight(155)
+        text_panel.setMaximumHeight(120)
         text_grid = QGridLayout(text_panel)
         text_grid.setContentsMargins(0, 0, 0, 0)
         text_grid.setHorizontalSpacing(8)
-        text_grid.setVerticalSpacing(4)
+        text_grid.setVerticalSpacing(2)
         self.decode_status_label = QLabel("解调状态：未开始")
-        self.decode_status_label.setMinimumHeight(26)
-        self.decode_status_label.setMaximumHeight(52)
+        self.decode_status_label.setMinimumHeight(22)
+        self.decode_status_label.setMaximumHeight(24)
         self.decode_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.decode_status_label.setWordWrap(True)
-        self.tx_text_view = QTextEdit(); self.tx_text_view.setReadOnly(True); self.tx_text_view.setMaximumHeight(88)
-        self.rx_text_view = QTextEdit(); self.rx_text_view.setReadOnly(True); self.rx_text_view.setMaximumHeight(88)
+        self.tx_text_view = QTextEdit(); self.tx_text_view.setReadOnly(True); self.tx_text_view.setMaximumHeight(64)
+        self.rx_text_view = QTextEdit(); self.rx_text_view.setReadOnly(True); self.rx_text_view.setMaximumHeight(64)
         text_grid.addWidget(self.decode_status_label, 0, 0, 1, 2)
         text_grid.addWidget(QLabel("发送文本"), 1, 0)
         text_grid.addWidget(QLabel("接收文本"), 1, 1)
@@ -588,15 +575,15 @@ class FDIDMHardwareTestTab(QWidget):
         combo.setMinimumContentsLength(int(chars))
         combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        combo.setMaximumWidth(210)
+        combo.setMaximumWidth(260)
         return combo
 
     def _compact_left_controls(self, panel):
         for combo in panel.findChildren(QComboBox):
             self._compact_combo(combo, 8)
         for edit in panel.findChildren((QSpinBox, QDoubleSpinBox)):
-            edit.setMinimumWidth(68)
-            edit.setMaximumWidth(116)
+            edit.setMinimumWidth(80)
+            edit.setMaximumWidth(140)
 
     def _dspin(self, lo, hi, val, dec, suffix="", step=None):
         s = QDoubleSpinBox()
@@ -607,7 +594,7 @@ class FDIDMHardwareTestTab(QWidget):
         if step is not None:
             s.setSingleStep(float(step))
         s.setMinimumHeight(26)
-        s.setMaximumWidth(116)
+        s.setMaximumWidth(140)
         return s
 
     def _spin(self, lo, hi, val):
@@ -615,7 +602,7 @@ class FDIDMHardwareTestTab(QWidget):
         s.setRange(int(lo), int(hi))
         s.setValue(int(val))
         s.setMinimumHeight(26)
-        s.setMaximumWidth(116)
+        s.setMaximumWidth(140)
         return s
 
     def _apply_control_style(self, widget):
@@ -628,7 +615,8 @@ class FDIDMHardwareTestTab(QWidget):
         """)
 
     def _init_plot_style(self):
-        plot_widgets = [self.rx_spectrum_plot, self.evm_plot, self.constellation_plot]
+        plot_widgets = [self.rx_spectrum_plot, self.evm_plot, self.constellation_plot,
+                        self.timeline_perf_plot, self.timeline_ab_plot]
         if getattr(self, "ab_surface_fallback_plot", None) is not None:
             plot_widgets.insert(0, self.ab_surface_fallback_plot)
         for p in plot_widgets:
