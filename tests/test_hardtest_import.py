@@ -14,3 +14,8 @@ def test_hardtest_modules_import():
         mod = importlib.import_module(mod_name)
         assert hasattr(mod, cls_name), f"{mod_name} 缺少 {cls_name}"
 
+
+def test_hardware_evidence_module_imports_without_runtime():
+    mod = importlib.import_module("waveform_sim.hardware.evidence")
+    assert hasattr(mod, "TxPowerContract")
+    assert hasattr(mod, "classify_validation")

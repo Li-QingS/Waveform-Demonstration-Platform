@@ -8,6 +8,7 @@ import threading
 import time
 import zlib
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -17,11 +18,43 @@ from .stream import SampleRing as _SampleRing
 from .channel import NTNTDLChannel as _NTNTDLChannel
 from .fec import FECMixin
 from .fdidm_adaptive import FDIDMAdaptiveMixin
+from .evidence import (
+    KnownSymbolMetrics,
+    PilotFitMetrics,
+    TxPowerContract,
+    TxPowerMetrics,
+    analyze_unscaled_power,
+    create_power_contract,
+    frame_structure_metrics,
+    measure_known_symbols,
+    measure_pilot_fit,
+    scale_waveform_to_rms,
+)
 
 
 def project_log_directory() -> Path:
     """Return the repository-local directory used for FDIDM log exports."""
     return Path(__file__).resolve().parents[2] / "log"
+
+
+@dataclass
+class WaveformBuildResult:
+    """Complete deterministic build result before it is committed to runtime."""
+
+    text: str
+    payload: bytes
+    frame: bytes
+    frame_bits: np.ndarray
+    coded_frame_bits: np.ndarray
+    bits_frames: List[np.ndarray]
+    first_x_cross: np.ndarray
+    first_x_tf: np.ndarray
+    tx_waveform: np.ndarray
+    base_cycle_len: int
+    uhd_repeats: int
+    tdl_prerendered: bool
+    power_metrics: TxPowerMetrics
+    known_reference_symbols: np.ndarray
 
 
 class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
@@ -184,12 +217,19 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._tx_tdl_prerendered = False
         self._tx_peak_limited = False
         self._tx_rms_target = 0.35
+        self._tx_peak_limit = 0.9
+        self._tx_power_metrics = TxPowerMetrics(target_rms=self._tx_rms_target)
+        self._tx_power_contract: Optional[TxPowerContract] = None
         self._tx_coded_frame_bits = np.zeros(0, dtype=np.int8)
         self._tx_coded_bits_len = 0
         self._tx_uncoded_bits_len = 0
         self._last_fec_bit_ber = float("nan")
         self._last_raw_bit_ber = float("nan")
         self._last_measured_ser = float("nan")
+        self._last_known_symbol_metrics = KnownSymbolMetrics()
+        self._last_pilot_fit_metrics = PilotFitMetrics()
+        self._ser_errors_total = 0
+        self._ser_symbols_total = 0
 
         # Channel path. Every supported mode now traverses the real USRP RF path.
         # Baseband-only TDL loopback was removed because it does not exercise
@@ -443,7 +483,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames} frame(s), "
                     f"channel_mode={self.channel_mode}, "
                     f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f} ns, fd={self.tdl_doppler_hz:.1f} Hz, "
-                    f"spread={self.tdl_doppler_spread_hz:.1f} Hz, SNR={self.tdl_snr_db:.1f} dB, "
+                    f"spread={self.tdl_doppler_spread_hz:.1f} Hz, TDL_injected_SNR={self.tdl_snr_db:.1f} dB, "
                     f"process_interval={self.process_interval_sec*1000:.0f} ms, "
                     f"M={self.M} N={self.N} CP={self.cp_len} alpha={self.alpha:.3f} beta={self.beta:.3f} "
                     f"mod={self.mod_order} eq={self.equalizer} coding={self._coding_summary()} "
@@ -773,9 +813,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         for start in range(0, x.size, step):
             chunks.append(channel.process(x[start:start + step]))
         y = np.concatenate(chunks).astype(np.complex64) if chunks else np.zeros(0, dtype=np.complex64)
-        peak = float(np.max(np.abs(y)) + 1e-12) if y.size else 1.0
-        if peak > 0:
-            y = (0.9 / peak) * y
+        # Final RMS normalization and the RF peak guard are applied after this
+        # deterministic pre-render, so TDL candidates obey the same contract as
+        # RF-only candidates instead of being silently forced to peak=0.9.
         return y.astype(np.complex64)
 
     # =========================================================
@@ -824,10 +864,17 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             out[fb.size:] = rng.integers(0, 2, size=max_bits - fb.size, dtype=np.int8)
         return out
 
-    def _build_one_physical_frame(self, data_bits: np.ndarray, pilot_block: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _build_one_physical_frame(self, data_bits: np.ndarray, pilot_block: np.ndarray,
+                                  alpha: Optional[float] = None,
+                                  beta: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         qam = self._qam_modulate(data_bits, self.mod_order)
         x_cross = qam.reshape((self.M, self.N), order="F")
-        x_tf = self._ifdit(x_cross)
+        if alpha is None and beta is None:
+            x_tf = self._ifdit(x_cross)
+        else:
+            a = float(self.alpha if alpha is None else alpha)
+            b = float(self.beta if beta is None else beta)
+            x_tf = self._apply_gamma_axis(self._apply_gamma_axis(x_cross, a, axis=0), -b, axis=1)
         data_block = self._heisenberg(x_tf)
         one_frame = np.concatenate([
             np.zeros(self.pre_guard_len, dtype=np.complex128),
@@ -840,7 +887,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             raise RuntimeError(f"internal frame length mismatch: {one_frame.size} != {self.frame_len}")
         return one_frame, x_cross, x_tf
 
-    def _set_tx_text_internal(self, text: str):
+    def _build_waveform_result(self, text: str, *, alpha: float, beta: float,
+                               target_rms: float, contract_id: str = "") -> WaveformBuildResult:
+        """Build a complete waveform without changing backend runtime state."""
         if text is None or len(text) == 0:
             text = " "
         payload = text.encode("utf-8") or b" "
@@ -868,17 +917,21 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
         guard = np.zeros(self.inter_frame_guard_len, dtype=np.complex128)
         frames = []
+        data_blocks = []
         bits_frames: List[np.ndarray] = []
         first_x_cross = None
         first_x_tf = None
         # Do not let the USRP repeat a single identical frame. Even if the UI
         # requests 1-2 physical frames, build a short pseudo-random super-cycle
         # whose application payload is the same but whose filler bits differ.
-        self._tx_cycle_frame_count = int(max(self.tx_frame_count, 8))
-        for frame_idx in range(self._tx_cycle_frame_count):
+        cycle_frame_count = int(max(self.tx_frame_count, 8))
+        for frame_idx in range(cycle_frame_count):
             tx_bits_i = self._make_data_bits_for_frame(coded_frame_bits, frame_idx)
-            one_frame, x_cross_i, x_tf_i = self._build_one_physical_frame(tx_bits_i, pilot_block)
+            one_frame, x_cross_i, x_tf_i = self._build_one_physical_frame(
+                tx_bits_i, pilot_block, alpha=alpha, beta=beta
+            )
             frames.append(one_frame)
+            data_blocks.append(one_frame[self._off_data:self._off_end].copy())
             bits_frames.append(tx_bits_i.astype(np.int8, copy=True))
             if first_x_cross is None:
                 first_x_cross = x_cross_i.copy()
@@ -886,44 +939,124 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if self.inter_frame_guard_len > 0:
                 frames.append(guard.copy())
         tx_cycle = np.concatenate(frames) if frames else np.zeros(1, dtype=np.complex128)
-        # Normalize alpha/beta candidates to a common RMS power first. Apply a
-        # separate peak safety clamp only when the waveform crest factor exceeds
-        # the hardware limit, and expose that fact in diagnostics.
-        rms = float(np.sqrt(np.mean(np.abs(tx_cycle) ** 2))) if tx_cycle.size else 0.0
-        if rms > 1e-12:
-            tx_cycle = (float(self._tx_rms_target) / rms) * tx_cycle
-        peak = float(np.max(np.abs(tx_cycle)) + 1e-12) if tx_cycle.size else 0.0
-        self._tx_peak_limited = bool(peak > 0.9)
-        if self._tx_peak_limited:
-            tx_cycle = (0.9 / peak) * tx_cycle
+        data_samples = np.concatenate(data_blocks) if data_blocks else np.zeros(0, dtype=np.complex128)
         tx_wave, base_cycle_len, uhd_repeats = self._expand_waveform_for_uhd(tx_cycle.astype(np.complex64))
         tdl_prerendered = False
         if self._tdl_before_rf_enabled():
             tx_wave = self._make_prerendered_tdl_tx(tx_wave)
             tdl_prerendered = True
+        scaled_wave, power_metrics = scale_waveform_to_rms(
+            tx_wave,
+            data_samples,
+            target_rms=float(target_rms),
+            peak_limit=float(self._tx_peak_limit),
+            contract_id=contract_id,
+        )
+        bps = max(int(self.bits_per_symbol), 1)
+        usable = (int(coded_frame_bits.size) // bps) * bps
+        known_reference = (
+            self._qam_modulate(coded_frame_bits[:usable], self.mod_order).astype(np.complex128)
+            if usable > 0 else np.zeros(0, dtype=np.complex128)
+        )
+        return WaveformBuildResult(
+            text=text,
+            payload=payload,
+            frame=frame,
+            frame_bits=frame_bits.astype(np.int8),
+            coded_frame_bits=coded_frame_bits.astype(np.int8),
+            bits_frames=bits_frames,
+            first_x_cross=(first_x_cross if first_x_cross is not None
+                           else np.zeros((self.M, self.N), dtype=np.complex128)),
+            first_x_tf=(first_x_tf if first_x_tf is not None
+                        else np.zeros((self.M, self.N), dtype=np.complex128)),
+            tx_waveform=scaled_wave.astype(np.complex64),
+            base_cycle_len=int(base_cycle_len),
+            uhd_repeats=int(uhd_repeats),
+            tdl_prerendered=bool(tdl_prerendered),
+            power_metrics=power_metrics,
+            known_reference_symbols=known_reference,
+        )
 
-        self._tx_text = text
-        self._tx_payload = payload
-        self._tx_frame = frame
-        self._tx_frame_bits = frame_bits.astype(np.int8)
-        self._tx_coded_frame_bits = coded_frame_bits.astype(np.int8)
-        self._tx_coded_bits_len = int(coded_frame_bits.size)
-        self._tx_uncoded_bits_len = int(frame_bits.size)
-        self._tx_base_cycle_len = int(base_cycle_len)
-        self._tx_uhd_repeats = int(uhd_repeats)
-        self._tx_tdl_prerendered = bool(tdl_prerendered)
-        self._tx_bits_frame = bits_frames[0].astype(np.int8) if bits_frames else np.zeros(max_bits, dtype=np.int8)
-        self._tx_bits_frames = bits_frames
-        self._tx_x_cross = first_x_cross if first_x_cross is not None else np.zeros((self.M, self.N), dtype=np.complex128)
-        self._tx_x_tf = first_x_tf if first_x_tf is not None else np.zeros((self.M, self.N), dtype=np.complex128)
-        self._tx_waveform = tx_wave.astype(np.complex64)
+    def _preview_waveform_build(self, alpha: float, beta: float) -> WaveformBuildResult:
+        """Preview one alpha/beta waveform without mutating live state."""
+        text = str(getattr(self, "_tx_text", "") or " ")
+        gamma_cache = dict(getattr(self, "_gamma_cache", {}))
+        try:
+            return self._build_waveform_result(
+                text,
+                alpha=float(alpha),
+                beta=float(beta),
+                target_rms=float(self._tx_rms_target),
+            )
+        finally:
+            self._gamma_cache = gamma_cache
+
+    def _prepare_power_contract(self, alpha: float, beta: float) -> TxPowerContract:
+        baseline = self._preview_waveform_build(self.alpha, self.beta)
+        candidate = self._preview_waveform_build(alpha, beta)
+        contract = create_power_contract(
+            baseline.power_metrics,
+            candidate.power_metrics,
+            baseline_alpha=float(self.alpha),
+            baseline_beta=float(self.beta),
+            candidate_alpha=float(alpha),
+            candidate_beta=float(beta),
+            requested_rms=float(self._tx_rms_target),
+            peak_limit=float(self._tx_peak_limit),
+        )
+        self._tx_power_contract = contract
+        return contract
+
+    def _commit_waveform_build(self, alpha: float, beta: float,
+                               forced_rms: Optional[float] = None,
+                               contract_id: str = "",
+                               text: Optional[str] = None) -> WaveformBuildResult:
+        """Build and atomically publish a waveform to the backend state."""
+        target_rms = float(self._tx_rms_target if forced_rms is None else forced_rms)
+        result = self._build_waveform_result(
+            str(getattr(self, "_tx_text", "") if text is None else text),
+            alpha=float(alpha),
+            beta=float(beta),
+            target_rms=target_rms,
+            contract_id=contract_id,
+        )
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self._pilot_X_cross = self._fdit(self._pilot_X_tf)
+
+        self._tx_text = result.text
+        self._tx_payload = result.payload
+        self._tx_frame = result.frame
+        self._tx_frame_bits = result.frame_bits.copy()
+        self._tx_coded_frame_bits = result.coded_frame_bits.copy()
+        self._tx_coded_bits_len = int(result.coded_frame_bits.size)
+        self._tx_uncoded_bits_len = int(result.frame_bits.size)
+        self._tx_cycle_frame_count = int(max(self.tx_frame_count, 8))
+        self._tx_base_cycle_len = int(result.base_cycle_len)
+        self._tx_uhd_repeats = int(result.uhd_repeats)
+        self._tx_tdl_prerendered = bool(result.tdl_prerendered)
+        self._tx_bits_frame = (result.bits_frames[0].astype(np.int8, copy=True)
+                               if result.bits_frames else np.zeros(self._max_data_bits_capacity(), dtype=np.int8))
+        self._tx_bits_frames = [bits.astype(np.int8, copy=True) for bits in result.bits_frames]
+        self._tx_x_cross = result.first_x_cross.copy()
+        self._tx_x_tf = result.first_x_tf.copy()
+        self._tx_waveform = result.tx_waveform.copy()
+        self._tx_power_metrics = result.power_metrics
+        self._tx_peak_limited = bool(result.power_metrics.peak_limited)
+        if not contract_id:
+            self._tx_power_contract = None
+        self._tx_known_reference_symbols = result.known_reference_symbols.copy()
         if hasattr(self, "_debug_log"):
             self._debug(
                 "INFO",
-                f"TX waveform rebuilt: payload={len(payload)}B, uncoded={frame_bits.size}b, "
-                f"coded={coded_frame_bits.size}b/{max_bits}b, coding={self._coding_summary()}, "
-                f"cycle={base_cycle_len} samp, repeats={uhd_repeats}, txvec={self._tx_waveform.size} samp, "
-                f"TDL_prerender={tdl_prerendered}, mode={self.channel_mode}"
+                f"TX waveform rebuilt: payload={len(result.payload)}B, uncoded={result.frame_bits.size}b, "
+                f"coded={result.coded_frame_bits.size}b/{self._max_data_bits_capacity()}b, coding={self._coding_summary()}, "
+                f"cycle={result.base_cycle_len} samp, repeats={result.uhd_repeats}, txvec={self._tx_waveform.size} samp, "
+                f"cycle_rms={result.power_metrics.cycle_rms:.6f}, data_rms={result.power_metrics.data_rms:.6f}, "
+                f"peak={result.power_metrics.peak:.6f}, PAPR={result.power_metrics.papr_db:.3f}dB, "
+                f"backoff={result.power_metrics.backoff_db:.3f}dB, peak_limited={result.power_metrics.peak_limited}, "
+                f"contract={result.power_metrics.contract_id or 'none'}, "
+                f"TDL_prerender={result.tdl_prerendered}, mode={self.channel_mode}"
             )
         self._rx_text = ""
         self._decode_ok = False
@@ -949,6 +1082,18 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._evm_history.clear()
         self.last_evm_instant_percent = float("nan")
         self.last_evm_average_percent = float("nan")
+        return result
+
+    def _set_tx_text_internal(self, text: str):
+        self._commit_waveform_build(self.alpha, self.beta, text=text)
+
+    def _frame_structure_evidence(self) -> Dict[str, Any]:
+        return frame_structure_metrics(
+            data_samples=int(self.data_frame_len),
+            pilot_samples=int(self.pilot_frame_len),
+            sync_samples=int(self.sync_len),
+            guard_samples=int(self.pre_guard_len + self.post_guard_len + self.inter_frame_guard_len),
+        )
 
     # =========================================================
     # FSIT / FDIT (unchanged math; identical to paper Eqs. 1, 2, 6, 13)
@@ -1501,6 +1646,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         x_tf = self._pilot_X_tf                                   # (M, N), |x|=const
         safe_x = np.where(np.abs(x_tf) < 1e-10, 1e-10 + 0j, x_tf)
         h_cell = (y_tf / safe_x).astype(np.complex128)           # raw per-cell
+
+        # This is a model-fit diagnostic only.  It intentionally observes the
+        # raw current-frame pilot grid and does not feed back into smoothing or
+        # equalization, so existing receiver behaviour remains unchanged.
+        raw_diagonal_fit = np.repeat(np.mean(h_cell, axis=1)[:, None], self.N, axis=1)
+        self._last_pilot_fit_metrics = measure_pilot_fit(h_cell, raw_diagonal_fit)
 
         # Smooth the complete time-frequency pilot estimate once per frame.  The
         # equalizer below still consumes the time average, while the adaptive
@@ -2121,16 +2272,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._last_fec_bit_ber = float(ber)
         self._last_raw_bit_ber = float(raw_ber)
         try:
-            ref_syms = self._known_preamble_ref_syms()
-            ll = int(min(ref_syms.size, syms_best.size))
-            if ll > 0:
-                refs = ref_syms[:ll]
-                ideal = self._ideal_constellation_points()
-                decisions = ideal[np.argmin(np.abs(syms_best[:ll, None] - ideal[None, :]), axis=1)]
-                self._last_measured_ser = float(np.mean(decisions != refs))
-            else:
-                self._last_measured_ser = float("nan")
+            known = measure_known_symbols(
+                syms_best, self._known_preamble_ref_syms(), self._ideal_constellation_points()
+            )
+            self._last_known_symbol_metrics = known
+            self._last_measured_ser = float(known.ser)
         except Exception:
+            self._last_known_symbol_metrics = KnownSymbolMetrics()
             self._last_measured_ser = float("nan")
         return float(ber), frame_bytes, payload, text, int(match), bool(decode_ok), syms_best, float(evm)
 
@@ -2583,6 +2731,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._last_fec_bit_ber = float("nan")
             self._last_raw_bit_ber = float("nan")
             self._last_measured_ser = float("nan")
+            self._last_known_symbol_metrics = KnownSymbolMetrics()
+            self._last_pilot_fit_metrics = PilotFitMetrics()
             self.last_frame_ok = False
             self.last_bad_reason = reason
             self.last_sync_metric = 0.0
@@ -2609,6 +2759,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._frames_processed = 0
                 self._frames_decode_ok = 0
                 self._rx_overflow_count = 0
+                self._ser_errors_total = 0
+                self._ser_symbols_total = 0
                 self._ber_hist_t.clear()
                 self._ber_hist_v.clear()
         self._debug("INFO", f"runtime RX state reset: reason={reason}, reset_counters={bool(reset_counters)}")
@@ -3187,7 +3339,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                             f"live software TDL channel updated without UHD rebuild: "
                             f"mode={self.channel_mode}, DS={self.tdl_rms_delay_spread_ns:.1f}ns, "
                             f"fd={self.tdl_doppler_hz:.1f}Hz, spread={self.tdl_doppler_spread_hz:.1f}Hz, "
-                            f"SNR={self.tdl_snr_db:.1f}dB")
+                            f"TDL_injected_SNR={self.tdl_snr_db:.1f}dB")
             elif self._tdl_after_rf_enabled():
                 if self._running:
                     raise RuntimeError("Cannot live-update RF->TDL block because the TDL block is unavailable; stop first.")
@@ -3196,7 +3348,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         if tdl_metadata_only_changed and not (rebuild_waveform or rebuild_top_block or tdl_live_reconfigure):
             self._debug("INFO",
                         f"TDL parameter recorded for future software-channel use only: "
-                        f"channel_mode={self.channel_mode}, SNR={self.tdl_snr_db:.1f}dB; "
+                        f"channel_mode={self.channel_mode}, TDL_injected_SNR={self.tdl_snr_db:.1f}dB; "
                         "active RF-only graph/waveform left unchanged")
 
         adaptive_context_after = self._alpha_beta_adaptation_context_key()
@@ -3238,7 +3390,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._debug("INFO",
                         f"configure() rebuilding top_block for path={self.channel_mode}, device_type={self.device_type}, "
                         f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f}ns, fd={self.tdl_doppler_hz:.1f}Hz, "
-                        f"spread={self.tdl_doppler_spread_hz:.1f}Hz, SNR={self.tdl_snr_db:.1f}dB")
+                        f"spread={self.tdl_doppler_spread_hz:.1f}Hz, TDL_injected_SNR={self.tdl_snr_db:.1f}dB")
             self._usrp_args = self._build_device_args()
             self._build_top_block()
             self._debug("INFO", self._format_link_limit_summary())
@@ -3719,6 +3871,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         f"peaks={peaks}")
             return
 
+        known_metrics = measure_known_symbols(
+            best.get("rx_syms", np.zeros(0, dtype=np.complex64)),
+            self._known_preamble_ref_syms(),
+            self._ideal_constellation_points(),
+        )
+
         self._frames_processed += 1
         if best["decode_ok"]:
             self._frames_decode_ok += 1
@@ -3756,6 +3914,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         const_source = "post_eq_good" if good_quality else "post_eq_diagnostic_bad_frame"
         t_now = time.time() - self._t0
         with self._lock:
+            self._last_known_symbol_metrics = known_metrics
+            self._last_measured_ser = float(known_metrics.ser)
+            self._ser_errors_total += int(known_metrics.ser_errors)
+            self._ser_symbols_total += int(known_metrics.ser_symbols)
             self._last_processed_abs_start = best["abs_frame_start"]
             self.last_sync_index = int(best["frame_start"])
             self.last_payload_start = int(best["frame_start"] + self._off_data)
@@ -3826,10 +3988,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             })
             self._record_alpha_beta_validation_sample_locked({
                 "evm_average_percent": float(self.last_evm_average_percent),
+                "data_aided_evm_percent": float(known_metrics.data_aided_evm_percent),
+                "decision_directed_evm_percent": float(known_metrics.decision_directed_evm_percent),
                 "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
+                "ser_errors": int(known_metrics.ser_errors),
+                "ser_symbols": int(known_metrics.ser_symbols),
                 "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
+                "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
                 "crc_success_ratio": float(bool(best.get("decode_ok", False))),
                 "decode_ok": bool(best.get("decode_ok", False)),
+                "sync_valid": bool(best.get("sync_metric", 0.0) >= self.sync_metric_threshold),
+                "overflow": False,
+                "tx_power_contract_id": str(self._tx_power_metrics.contract_id),
+                "tx_cycle_rms": float(self._tx_power_metrics.cycle_rms),
+                "context_key": self._alpha_beta_adaptation_context_key(),
             })
 
         adaptive_channel_valid = not (
@@ -3850,7 +4022,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             f"v33 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
             f"alias={best.get('cfo_alias_hz', float('nan')):.1f}Hz, scanScore={best.get('cfo_scan_score', float('nan')):.3f}, "
             f"Hleak={best['htf_leakage']:.3f}, cond={best['cond_h']:.2e}, "
-            f"BER={best['ber']:.3e}, rawBER={float(getattr(self, '_last_raw_bit_ber', float('nan'))):.3e}, SER={float(getattr(self, '_last_measured_ser', float('nan'))):.3e}, FECBER={float(getattr(self, '_last_fec_bit_ber', float('nan'))):.3e}, EVM={best['evm_inst']:.2f}%, "
+            f"BER={best['ber']:.3e}, rawBER={float(getattr(self, '_last_raw_bit_ber', float('nan'))):.3e}, "
+            f"measured_SER={known_metrics.ser:.3e}({known_metrics.ser_errors}/{known_metrics.ser_symbols}), "
+            f"FECBER={float(getattr(self, '_last_fec_bit_ber', float('nan'))):.3e}, "
+            f"data_aided_EVM={known_metrics.data_aided_evm_percent:.2f}%, "
+            f"decision_EVM={known_metrics.decision_directed_evm_percent:.2f}%, "
+            f"pilot_residual_SINR={self._last_pilot_fit_metrics.residual_sinr_db:.2f}dB, "
+            f"pilot_fit_NMSE={self._last_pilot_fit_metrics.fit_nmse:.3e}, "
             f"noise_var={best['noise_var']:.2e}, "
             f"TDLfit={float(getattr(self, '_last_tdl_param_fit_nmse', float('nan'))):.2e}/"
             f"{int(getattr(self, 'last_tdl_param_path_count', 0))}p, "
@@ -4266,6 +4444,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
                 "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
                 "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
+                "ser_errors": int(getattr(self._last_known_symbol_metrics, "ser_errors", 0)),
+                "ser_symbols": int(getattr(self._last_known_symbol_metrics, "ser_symbols", 0)),
+                "ser_errors_total": int(getattr(self, "_ser_errors_total", 0)),
+                "ser_symbols_total": int(getattr(self, "_ser_symbols_total", 0)),
+                "data_aided_evm_percent": float(getattr(self._last_known_symbol_metrics, "data_aided_evm_percent", float("nan"))),
+                "decision_directed_evm_percent": float(getattr(self._last_known_symbol_metrics, "decision_directed_evm_percent", float("nan"))),
                 "htf_leakage": float(self.last_htf_nmse),
                 "cond_h_cross": float(self.last_cond_h_cross),
                 "noise_var": float(self.last_noise_var),
@@ -4325,6 +4509,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "adaptive_alpha_span": float(adaptive_ab.get("alpha_span", float("nan"))),
                 "adaptive_beta_span": float(adaptive_ab.get("beta_span", float("nan"))),
                 "tx_peak_limited": bool(getattr(self, "_tx_peak_limited", False)),
+                "tx_cycle_rms": float(getattr(self._tx_power_metrics, "cycle_rms", float("nan"))),
+                "tx_data_rms": float(getattr(self._tx_power_metrics, "data_rms", float("nan"))),
+                "tx_peak": float(getattr(self._tx_power_metrics, "peak", float("nan"))),
+                "tx_papr_db": float(getattr(self._tx_power_metrics, "papr_db", float("nan"))),
+                "tx_power_target_rms": float(getattr(self._tx_power_metrics, "target_rms", float("nan"))),
+                "tx_power_safe_rms": float(getattr(self._tx_power_metrics, "safe_rms", float("nan"))),
+                "tx_power_backoff_db": float(getattr(self._tx_power_metrics, "backoff_db", float("nan"))),
+                "tx_power_contract_id": str(getattr(self._tx_power_metrics, "contract_id", "")),
+                "tx_power_contract": (self._tx_power_contract.as_dict()
+                                      if self._tx_power_contract is not None else None),
                 "adaptive_stable_count": int(adaptive_ab.get("stable_count", 0)),
                 "adaptive_stable_required": int(adaptive_ab.get("stable_required", 0)),
                 "adaptive_htf_source": str(adaptive_ab.get("htf_source", "")),
@@ -4374,6 +4568,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "rx_data_samples": int(np.asarray(getattr(self, "_latest_rx_data_samples", []), dtype=np.complex64).size),
                 "rx_pilot_samples": int(np.asarray(getattr(self, "_latest_rx_pilot_samples", []), dtype=np.complex64).size),
                 "usrp_buffer_frames": int(self.usrp_buffer_frames),
+                "pilot_fit_nmse": float(getattr(self._last_pilot_fit_metrics, "fit_nmse", float("nan"))),
+                "pilot_residual_sinr_db": float(getattr(self._last_pilot_fit_metrics, "residual_sinr_db", float("nan"))),
+                "pilot_residual_power": float(getattr(self._last_pilot_fit_metrics, "residual_power", float("nan"))),
+                "pilot_fitted_power": float(getattr(self._last_pilot_fit_metrics, "fitted_power", float("nan"))),
+                "frame_structure": self._frame_structure_evidence(),
             }
 
     def get_status(self) -> Dict[str, Any]:
@@ -4470,6 +4669,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "tx_uhd_repeats": int(snap.get("tx_uhd_repeats", getattr(self, "_tx_uhd_repeats", 1))),
             "tx_tdl_prerendered": bool(snap.get("tx_tdl_prerendered", getattr(self, "_tx_tdl_prerendered", False))),
             "tx_prerender_tdl_before_rf": bool(snap.get("tx_prerender_tdl_before_rf", getattr(self, "tx_prerender_tdl_before_rf", True))),
+            "tx_cycle_rms": float(snap.get("tx_cycle_rms", float("nan"))),
+            "tx_data_rms": float(snap.get("tx_data_rms", float("nan"))),
+            "tx_peak": float(snap.get("tx_peak", float("nan"))),
+            "tx_papr_db": float(snap.get("tx_papr_db", float("nan"))),
+            "tx_power_target_rms": float(snap.get("tx_power_target_rms", float("nan"))),
+            "tx_power_safe_rms": float(snap.get("tx_power_safe_rms", float("nan"))),
+            "tx_power_backoff_db": float(snap.get("tx_power_backoff_db", float("nan"))),
+            "tx_peak_limited": bool(snap.get("tx_peak_limited", False)),
+            "tx_power_contract_id": str(snap.get("tx_power_contract_id", "")),
+            "tx_power_contract": snap.get("tx_power_contract"),
             "coding_scheme": str(snap.get("coding_scheme", getattr(self, "coding_scheme", "none"))),
             "coding_summary": str(snap.get("coding_summary", self._coding_summary())),
             "coding_interleaver": bool(snap.get("coding_interleaver", getattr(self, "coding_interleaver", False))),
@@ -4485,6 +4694,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "tdl_doppler_hz": float(self.tdl_doppler_hz),
             "tdl_doppler_spread_hz": float(self.tdl_doppler_spread_hz),
             "tdl_snr_db": float(self.tdl_snr_db),
+            "tdl_injected_snr_db": float(self.tdl_snr_db),
             "tdl_seed": int(self.tdl_seed),
             "tdl_normalize_power": bool(self.tdl_normalize_power),
             "tx_frame_count": int(self.tx_frame_count),
@@ -4516,6 +4726,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "auto_tdl_param_for_software": bool(getattr(self, "auto_tdl_param_for_software", True)),
             "ber": snap["ber"],
             "measured_ser": float(snap.get("measured_ser", float("nan"))),
+            "ser_errors": int(snap.get("ser_errors", 0)),
+            "ser_symbols": int(snap.get("ser_symbols", 0)),
+            "ser_errors_total": int(snap.get("ser_errors_total", 0)),
+            "ser_symbols_total": int(snap.get("ser_symbols_total", 0)),
             "fec_bit_ber": snap.get("fec_bit_ber", snap["ber"]),
             "raw_bit_ber": snap.get("raw_bit_ber", float("nan")),
             "htf_leakage": snap["htf_leakage"],
@@ -4526,6 +4740,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "evm_average_percent": snap["evm_average_percent"],
             "evm_average_count": snap["evm_average_count"],
             "evm_average_frames": snap["evm_average_frames"],
+            "data_aided_evm_percent": float(snap.get("data_aided_evm_percent", float("nan"))),
+            "decision_directed_evm_percent": float(snap.get("decision_directed_evm_percent", snap["evm_average_percent"])),
+            "pilot_fit_nmse": float(snap.get("pilot_fit_nmse", float("nan"))),
+            "pilot_residual_sinr_db": float(snap.get("pilot_residual_sinr_db", float("nan"))),
+            "pilot_residual_power": float(snap.get("pilot_residual_power", float("nan"))),
+            "pilot_fitted_power": float(snap.get("pilot_fitted_power", float("nan"))),
+            "frame_structure": dict(snap.get("frame_structure", {}) or {}),
             "rx_samples_seen": snap["rx_samples_seen"],
             "rx_last_new_samples": int(snap.get("rx_last_new_samples", 0)),
             "rx_stream_updates": int(snap.get("rx_stream_updates", 0)),
