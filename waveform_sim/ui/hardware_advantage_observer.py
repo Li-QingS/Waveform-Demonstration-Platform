@@ -13,6 +13,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from waveform_sim.hardware.evidence import (
+    EvidenceWindow,
+    assess_power_comparability,
+    classify_validation,
+    wilson_interval,
+)
+
 # 分级阈值（MATLAB ≥100 错误建议，与 UPGRADE_PLAN 问题 2 同源）
 GRADE_TRUSTED_K = 100
 GRADE_REFERENCE_K = 10
@@ -38,7 +45,24 @@ CONTEXT_KEYS = (
     "tdl_seed",
 )
 
-SCHEMA_VERSION = 1
+EVIDENCE_CONTEXT_KEYS = (
+    "tx_power_contract_id",
+    "tx_cycle_rms",
+    "tx_data_rms",
+    "tx_peak",
+    "tx_papr_db",
+    "tx_power_backoff_db",
+    "tx_peak_limited",
+    "adaptive_validation_state",
+    "adaptive_validation_reason",
+    "adaptive_validation",
+    "frame_structure",
+    "pilot_residual_sinr_db",
+    "pilot_fit_nmse",
+    "tdl_injected_snr_db",
+)
+
+SCHEMA_VERSION = 2
 
 
 def grade_from_k(k: float) -> str:
@@ -88,6 +112,13 @@ class WindowSample:
     evm_percent: float
     alpha: float
     beta: float
+    ser_errors_delta: int = 0
+    ser_symbols_delta: int = 0
+    estimated_counts: bool = True
+    decision_evm_percent: float = float("nan")
+    raw_ber: float = float("nan")
+    tx_cycle_rms: float = float("nan")
+    tx_power_contract_id: str = ""
     transient: bool = False
 
 
@@ -104,13 +135,21 @@ class WindowAggregate:
     fec_k: float
     fec_n: int
     evm_mean: float
+    decision_evm_mean: float
+    raw_ber: float
     alpha_mean: float
     beta_mean: float
+    wilson_low: float = float("nan")
+    wilson_high: float = float("nan")
+    tx_cycle_rms_mean: float = float("nan")
+    tx_power_contract_id: str = ""
     grade: str = INSUFFICIENT
     estimated_k: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
-        return dict(self.__dict__)
+        out = dict(self.__dict__)
+        out["estimated_counts"] = bool(self.estimated_k)
+        return _sanitize(out)
 
 
 @dataclass
@@ -134,7 +173,7 @@ class ObservationWindow:
             "mode": self.mode,
             "start_t": self.start_t,
             "end_t": self.end_t,
-            "context": dict(self.context),
+            "context": _sanitize(dict(self.context)),
             "anomalies": list(self.anomalies),
             "valid_samples": self.valid_samples,
             "dropped_samples": self.dropped_samples,
@@ -169,12 +208,20 @@ class PairComparison:
     crc_delta: float
     comparable: bool = True
     comparability_note: str = ""
+    outcome: str = "inconclusive"
+    validation_reason: str = ""
 
 
 def _sanitize(value: Any) -> Any:
     """NaN/inf 转 None，便于 JSON 导出。"""
+    if isinstance(value, np.generic):
+        value = value.item()
     if isinstance(value, float) and not np.isfinite(value):
         return None
+    if isinstance(value, dict):
+        return {str(key): _sanitize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(item) for item in value]
     return value
 
 
@@ -196,6 +243,8 @@ class AdvantageObservationSession:
         self._last_status_frames = 0
         self._last_status_ok = 0
         self._last_status_overflow = 0
+        self._last_ser_errors_total = 0
+        self._last_ser_symbols_total = 0
         self._context: Dict[str, Any] = {}
         self._anomaly_drops: List[Any] = []
         self._symbols_per_frame = float("nan")
@@ -212,9 +261,14 @@ class AdvantageObservationSession:
         self._current = None
         self._context = dict(context or {})
         self._anomaly_drops = []
-        self._last_status_frames = 0
-        self._last_status_ok = 0
-        self._last_status_overflow = 0
+        initial = dict(context or {})
+        self._last_status_frames = _i(initial.get("frames_processed"))
+        self._last_status_ok = _i(initial.get("frames_decode_ok"))
+        self._last_status_overflow = _i(initial.get("rx_overflow_count"))
+        self._last_ser_errors_total = _i(initial.get("ser_errors_total"))
+        self._last_ser_symbols_total = _i(initial.get("ser_symbols_total"))
+        if initial:
+            self._update_symbol_counts(initial)
         self._open_window(bool(enabled))
 
     def now(self) -> float:
@@ -233,6 +287,8 @@ class AdvantageObservationSession:
     def on_toggle(self, enabled: bool, alpha: float, beta: float) -> Optional[ToggleEvent]:
         if not self.active:
             return None
+        if bool(enabled) == bool(self._current_enabled):
+            return None
         event = ToggleEvent(t=float(self._clock()), enabled=bool(enabled),
                             alpha=_f(alpha), beta=_f(beta))
         self._events.append(event)
@@ -244,7 +300,8 @@ class AdvantageObservationSession:
     def on_sample(self, status: Dict[str, Any]) -> None:
         if not self.active or self._current is None:
             return
-        self._context = {key: status.get(key) for key in CONTEXT_KEYS if key in status}
+        context_keys = CONTEXT_KEYS + EVIDENCE_CONTEXT_KEYS
+        self._context = {key: status.get(key) for key in context_keys if key in status}
         self._current.context = dict(self._context)
 
         frames = _i(status.get("frames_processed"))
@@ -256,7 +313,24 @@ class AdvantageObservationSession:
         self._last_status_frames, self._last_status_ok = frames, ok
         self._last_status_overflow = overflow
 
-        config = (_f(status.get("tx_uncoded_bits_len")), _f(status.get("mod_order")))
+        exact_counts = "ser_errors_total" in status and "ser_symbols_total" in status
+        ser_errors_delta = 0
+        ser_symbols_delta = 0
+        if exact_counts:
+            errors_total = _i(status.get("ser_errors_total"))
+            symbols_total = _i(status.get("ser_symbols_total"))
+            if errors_total >= self._last_ser_errors_total and symbols_total >= self._last_ser_symbols_total:
+                ser_errors_delta = errors_total - self._last_ser_errors_total
+                ser_symbols_delta = symbols_total - self._last_ser_symbols_total
+            else:
+                # A backend run restarted while the observation session stayed
+                # alive.  Treat the new totals as a fresh monotonic epoch.
+                ser_errors_delta = max(0, errors_total)
+                ser_symbols_delta = max(0, symbols_total)
+            self._last_ser_errors_total = errors_total
+            self._last_ser_symbols_total = symbols_total
+
+        config = (_f(status.get("tx_uncoded_bits_len")), float(self._modulation_size(status.get("mod_order"))))
         # 字段缺失（NaN）不视为配置变化，保持上次口径
         if np.isfinite(config[0]) and np.isfinite(config[1]) and config != self._last_config:
             if np.isfinite(self._last_config[0]) and self._current is not None and self._current.valid_samples > 0:
@@ -292,9 +366,18 @@ class AdvantageObservationSession:
                 ok_delta=ok_delta,
                 ser=ser,
                 fec_ber=_f(status.get("fec_bit_ber", status.get("ber"))),
-                evm_percent=_f(status.get("evm_average_percent", status.get("evm_percent"))),
+                evm_percent=_f(status.get("data_aided_evm_percent",
+                                          status.get("evm_average_percent", status.get("evm_percent")))),
                 alpha=_f(status.get("alpha")),
                 beta=_f(status.get("beta")),
+                ser_errors_delta=int(ser_errors_delta),
+                ser_symbols_delta=int(ser_symbols_delta),
+                estimated_counts=not bool(exact_counts and ser_symbols_delta > 0),
+                decision_evm_percent=_f(status.get("decision_directed_evm_percent",
+                                                   status.get("evm_average_percent", status.get("evm_percent")))),
+                raw_ber=_f(status.get("raw_bit_ber")),
+                tx_cycle_rms=_f(status.get("tx_cycle_rms")),
+                tx_power_contract_id=str(status.get("tx_power_contract_id", "") or ""),
                 transient=transient,
             )
         )
@@ -326,6 +409,37 @@ class AdvantageObservationSession:
         if before_win is None or after_agg is None:
             return None
         comparable, note = self._comparability(before_win.context, after_ctx)
+        if comparable and (
+            before_win.aggregate.tx_power_contract_id
+            or after_agg.tx_power_contract_id
+            or np.isfinite(before_win.aggregate.tx_cycle_rms_mean)
+            or np.isfinite(after_agg.tx_cycle_rms_mean)
+        ):
+            comparable, note, _ = assess_power_comparability(
+                before_win.aggregate.tx_power_contract_id,
+                before_win.aggregate.tx_cycle_rms_mean,
+                after_agg.tx_power_contract_id,
+                after_agg.tx_cycle_rms_mean,
+            )
+            if not comparable:
+                note = "功率不可比: " + note
+        backend_outcome = str((after_ctx or {}).get("adaptive_validation_state", ""))
+        backend_reason = str((after_ctx or {}).get("adaptive_validation_reason", "") or "")
+        if backend_outcome in {"improved", "inconclusive", "regressed"}:
+            outcome = backend_outcome
+            validation_reason = backend_reason
+        elif not comparable:
+            outcome = "inconclusive"
+            validation_reason = note
+        elif before_win.aggregate.estimated_k or after_agg.estimated_k:
+            outcome = "inconclusive"
+            validation_reason = "旧后端错误计数为估算值，不能形成实测优势结论"
+        else:
+            evidence_before = self._aggregate_as_evidence(before_win.aggregate)
+            evidence_after = self._aggregate_as_evidence(after_agg)
+            decision = classify_validation(evidence_before, evidence_after, comparable=True)
+            outcome = decision.outcome
+            validation_reason = decision.reason
         return PairComparison(
             before=before_win.aggregate,
             after=after_agg,
@@ -334,6 +448,8 @@ class AdvantageObservationSession:
             crc_delta=after_agg.crc_ok_ratio - before_win.aggregate.crc_ok_ratio,
             comparable=comparable,
             comparability_note=note,
+            outcome=outcome,
+            validation_reason=validation_reason,
         )
 
     def to_export_dict(self) -> Dict[str, Any]:
@@ -342,7 +458,7 @@ class AdvantageObservationSession:
             "schema_version": SCHEMA_VERSION,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "session_started_at": self._started_wall,
-            "context": dict(self._context),
+            "context": _sanitize(dict(self._context)),
             "windows": [w.as_dict() for w in self._windows],
             "toggle_events": [e.as_dict() for e in self._events],
             "anomaly_drops": [{"t": t, "kind": kind} for t, kind in self._anomaly_drops],
@@ -394,17 +510,31 @@ class AdvantageObservationSession:
             return None
         ok = sum(s.ok_delta for s in samples)
         weight = float(frames)
-        ser_n = int(round(weight * self._symbols_per_frame)) if np.isfinite(self._symbols_per_frame) and self._symbols_per_frame > 0 else 0
+        all_exact = all(not s.estimated_counts and s.ser_symbols_delta > 0 for s in samples)
+        if all_exact:
+            ser_n = int(sum(s.ser_symbols_delta for s in samples))
+            ser_k = float(sum(s.ser_errors_delta for s in samples))
+        else:
+            ser_n = int(round(weight * self._symbols_per_frame)) if np.isfinite(self._symbols_per_frame) and self._symbols_per_frame > 0 else 0
+            ser_k = sum(s.ser * s.frames_delta for s in samples) * self._symbols_per_frame if ser_n > 0 else float("nan")
         fec_n = int(round(weight * self._coded_bits_per_frame)) if np.isfinite(self._coded_bits_per_frame) and self._coded_bits_per_frame > 0 else 0
-        ser_k = sum(s.ser * s.frames_delta for s in samples) * self._symbols_per_frame if ser_n > 0 else float("nan")
         fec_k = sum(s.fec_ber * s.frames_delta for s in samples) * self._coded_bits_per_frame if fec_n > 0 else float("nan")
         ser = (ser_k / ser_n) if ser_n > 0 else float(np.mean([s.ser for s in samples]))
         fec_valid = [s.fec_ber for s in samples if np.isfinite(s.fec_ber)]
         fec_ber = (fec_k / fec_n) if fec_n > 0 else (float(np.mean(fec_valid)) if fec_valid else float("nan"))
         evm_values = [(s.evm_percent, s.frames_delta) for s in samples if np.isfinite(s.evm_percent)]
         evm_mean = float(np.average([v for v, _ in evm_values], weights=[w for _, w in evm_values])) if evm_values else float("nan")
+        decision_evm_values = [(s.decision_evm_percent, s.frames_delta) for s in samples if np.isfinite(s.decision_evm_percent)]
+        decision_evm_mean = float(np.average([v for v, _ in decision_evm_values], weights=[w for _, w in decision_evm_values])) if decision_evm_values else float("nan")
+        raw_ber_values = [(s.raw_ber, s.frames_delta) for s in samples if np.isfinite(s.raw_ber)]
+        raw_ber = float(np.average([v for v, _ in raw_ber_values], weights=[w for _, w in raw_ber_values])) if raw_ber_values else float("nan")
+        power_values = [(s.tx_cycle_rms, s.frames_delta) for s in samples if np.isfinite(s.tx_cycle_rms)]
+        power_mean = float(np.average([v for v, _ in power_values], weights=[w for _, w in power_values])) if power_values else float("nan")
+        contract_ids = {s.tx_power_contract_id for s in samples if s.tx_power_contract_id}
+        contract_id = next(iter(contract_ids)) if len(contract_ids) == 1 else ("mixed" if contract_ids else "")
         alpha_values = [(s.alpha, s.frames_delta) for s in samples if np.isfinite(s.alpha)]
         beta_values = [(s.beta, s.frames_delta) for s in samples if np.isfinite(s.beta)]
+        wilson_low, wilson_high = wilson_interval(int(round(ser_k)), ser_n) if ser_n > 0 and np.isfinite(ser_k) else (float("nan"), float("nan"))
         return WindowAggregate(
             frames=frames,
             crc_ok_ratio=(ok / frames) if frames > 0 else float("nan"),
@@ -415,20 +545,61 @@ class AdvantageObservationSession:
             fec_k=float(np.round(fec_k, 1)) if np.isfinite(fec_k) else float("nan"),
             fec_n=fec_n,
             evm_mean=evm_mean,
+            decision_evm_mean=decision_evm_mean,
+            raw_ber=raw_ber,
             alpha_mean=float(np.average([v for v, _ in alpha_values], weights=[w for _, w in alpha_values])) if alpha_values else float("nan"),
             beta_mean=float(np.average([v for v, _ in beta_values], weights=[w for _, w in beta_values])) if beta_values else float("nan"),
+            wilson_low=wilson_low,
+            wilson_high=wilson_high,
+            tx_cycle_rms_mean=power_mean,
+            tx_power_contract_id=contract_id,
             grade=grade_from_k(ser_k) if ser_n > 0 else INSUFFICIENT,
-            estimated_k=any(s.frames_delta > 1 for s in samples),
+            estimated_k=not all_exact,
         )
 
     def _update_symbol_counts(self, status: Dict[str, Any]) -> None:
         uncoded_bits = _f(status.get("tx_uncoded_bits_len"))
-        mod_order = _f(status.get("mod_order"))
+        mod_order = float(self._modulation_size(status.get("mod_order")))
         if np.isfinite(uncoded_bits) and np.isfinite(mod_order) and mod_order > 1:
             self._symbols_per_frame = uncoded_bits / math.log2(mod_order)
         coded_bits = _f(status.get("tx_coded_bits_len"))
         if np.isfinite(coded_bits) and coded_bits > 0:
             self._coded_bits_per_frame = coded_bits
+
+    @staticmethod
+    def _modulation_size(value: Any) -> int:
+        text = str(value or "").upper().replace("-", "")
+        if text == "QPSK":
+            return 4
+        if text.endswith("QAM"):
+            try:
+                return int(text[:-3])
+            except ValueError:
+                return 0
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _aggregate_as_evidence(aggregate: WindowAggregate) -> EvidenceWindow:
+        window = EvidenceWindow(
+            valid_frames=int(aggregate.frames),
+            ser_errors=max(0, int(round(aggregate.ser_k))) if np.isfinite(aggregate.ser_k) else 0,
+            ser_symbols=max(0, int(aggregate.ser_n)),
+            crc_ok_frames=max(0, int(round(aggregate.crc_ok_ratio * aggregate.frames)))
+            if np.isfinite(aggregate.crc_ok_ratio) else 0,
+            contract_id=str(aggregate.tx_power_contract_id or ""),
+        )
+        if np.isfinite(aggregate.evm_mean):
+            window.data_aided_evm_values.append(float(aggregate.evm_mean))
+        if np.isfinite(aggregate.raw_ber):
+            window.raw_ber_values.append(float(aggregate.raw_ber))
+        if np.isfinite(aggregate.fec_ber):
+            window.fec_ber_values.append(float(aggregate.fec_ber))
+        if np.isfinite(aggregate.tx_cycle_rms_mean):
+            window.power_rms_values.append(float(aggregate.tx_cycle_rms_mean))
+        return window
 
     @staticmethod
     def _comparability(before_ctx: Dict[str, Any], after_ctx: Dict[str, Any]):
@@ -459,4 +630,6 @@ class AdvantageObservationSession:
             "crc_delta": _sanitize(pair.crc_delta),
             "comparable": pair.comparable,
             "comparability_note": pair.comparability_note,
+            "outcome": pair.outcome,
+            "validation_reason": pair.validation_reason,
         }

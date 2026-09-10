@@ -201,12 +201,133 @@ def test_export_dict_is_json_serializable():
     session = run_pair()
     data = session.to_export_dict()
     text = json.dumps(data, ensure_ascii=False)
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert len(data["toggle_events"]) == 1
     assert data["toggle_events"][0]["enabled"] is True
     assert any(w["mode"] == MODE_OFF for w in data["windows"])
     assert data["latest_pair"]["before"]["ser"] is not None
     assert "excluded_window_count" in data
+
+
+def feed_exact(session, clock, n, ser, *, state="", power_rms=0.2,
+               contract_id="power-1", frames_per_sample=2, **overrides):
+    frames = int(session._last_status_frames)
+    ok = int(session._last_status_ok)
+    errors_total = int(session._last_ser_errors_total)
+    symbols_total = int(session._last_ser_symbols_total)
+    symbols_step = 600 * frames_per_sample
+    errors_step = int(round(ser * symbols_step))
+    for _ in range(n):
+        clock.advance()
+        frames += frames_per_sample
+        ok += frames_per_sample
+        errors_total += errors_step
+        symbols_total += symbols_step
+        session.on_sample(make_status(
+            frames,
+            ok=ok,
+            ser=ser,
+            evm=overrides.get("data_aided_evm_percent", 8.0),
+            ser_errors_total=errors_total,
+            ser_symbols_total=symbols_total,
+            data_aided_evm_percent=overrides.get("data_aided_evm_percent", 8.0),
+            decision_directed_evm_percent=overrides.get("decision_directed_evm_percent", 6.0),
+            raw_bit_ber=overrides.get("raw_bit_ber", ser / 2.0),
+            tx_cycle_rms=power_rms,
+            tx_power_contract_id=contract_id,
+            adaptive_validation_state=state,
+            adaptive_validation_reason=overrides.get("adaptive_validation_reason", ""),
+            frame_structure=overrides.get("frame_structure", {"data_samples": 320, "pilot_samples": 320}),
+            pilot_residual_sinr_db=overrides.get("pilot_residual_sinr_db", 12.0),
+            pilot_fit_nmse=overrides.get("pilot_fit_nmse", 0.05),
+            alpha=overrides.get("alpha", 0.5),
+            beta=overrides.get("beta", 1.0),
+        ))
+
+
+def test_exact_cumulative_counts_drive_aggregate_and_improved_outcome():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed_exact(session, clock, 40, 0.05, data_aided_evm_percent=10.0)
+    assert session.on_toggle(True, 0.75, 0.8) is not None
+    feed_exact(session, clock, 40, 0.01, state="improved", data_aided_evm_percent=7.0,
+               alpha=0.75, beta=0.8)
+    pair = session.latest_pair()
+    assert pair is not None
+    assert not pair.before.estimated_k and not pair.after.estimated_k
+    assert pair.before.ser_k == 1860
+    assert pair.before.ser_n == 37200
+    assert pair.after.ser_k == 372
+    assert pair.outcome == "improved"
+    assert pair.before.decision_evm_mean == pytest.approx(6.0)
+    assert pair.before.raw_ber == pytest.approx(0.025)
+    assert pair.before.wilson_low < pair.before.ser < pair.before.wilson_high
+
+
+def test_legacy_counts_remain_compatible_but_cannot_claim_improved():
+    pair = run_pair().latest_pair()
+    assert pair.before.estimated_k and pair.after.estimated_k
+    assert pair.outcome == "inconclusive"
+    assert "估算" in pair.validation_reason
+
+
+def test_power_contract_mismatch_marks_pair_inconclusive():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed_exact(session, clock, 40, 0.05, power_rms=0.2, contract_id="p1")
+    session.on_toggle(True, 0.75, 0.8)
+    feed_exact(session, clock, 40, 0.01, power_rms=0.18, contract_id="p1",
+               alpha=0.75, beta=0.8)
+    pair = session.latest_pair()
+    assert not pair.comparable
+    assert pair.outcome == "inconclusive"
+    assert "功率不可比" in pair.comparability_note
+
+
+def test_backend_validation_outcome_and_reason_are_preserved():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed_exact(session, clock, 40, 0.05)
+    session.on_toggle(True, 0.75, 0.8)
+    feed_exact(session, clock, 40, 0.01, state="regressed",
+               adaptive_validation_reason="CRC success ratio regressed",
+               alpha=0.75, beta=0.8)
+    pair = session.latest_pair()
+    assert pair.outcome == "regressed"
+    assert pair.validation_reason == "CRC success ratio regressed"
+
+
+def test_toggle_only_records_a_real_mode_change():
+    session = AdvantageObservationSession(clock=FakeClock())
+    assert session.on_toggle(True, 0.75, 0.8) is None
+    session.start(False, {})
+    assert session.on_toggle(False, 0.5, 1.0) is None
+    assert session.events() == []
+    assert session.on_toggle(True, 0.75, 0.8) is not None
+    assert len(session.events()) == 1
+
+
+def test_export_contains_exact_power_evm_validation_and_diagnostics():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed_exact(session, clock, 40, 0.05, data_aided_evm_percent=10.0)
+    session.on_toggle(True, 0.75, 0.8)
+    feed_exact(session, clock, 40, 0.01, state="improved",
+               data_aided_evm_percent=7.0, alpha=0.75, beta=0.8)
+    data = session.to_export_dict()
+    pair = data["latest_pair"]
+    assert pair["outcome"] == "improved"
+    assert pair["before"]["estimated_counts"] is False
+    assert pair["before"]["tx_power_contract_id"] == "power-1"
+    assert pair["before"]["decision_evm_mean"] == pytest.approx(6.0)
+    assert pair["before"]["wilson_low"] is not None
+    assert data["context"]["frame_structure"]["pilot_samples"] == 320
+    assert data["context"]["pilot_residual_sinr_db"] == 12.0
+    json.dumps(data, ensure_ascii=False, allow_nan=False)
 
 
 def test_stop_keeps_results_and_pair_usable():
