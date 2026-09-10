@@ -8,6 +8,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .evidence import (
+    EvidenceWindow,
+    TxPowerContract,
+    ValidationDecision,
+    assess_power_comparability,
+    classify_validation,
+)
+
 
 class FDIDMAdaptiveMixin:
     # =========================================================
@@ -35,6 +43,15 @@ class FDIDMAdaptiveMixin:
         if lock is None:
             return
         with lock:
+            validation = getattr(self, "_adaptive_ab_validation", None)
+            if isinstance(validation, dict) and str(validation.get("state", "")) in {
+                "baseline_applying", "baseline_settling", "baseline_collecting",
+                "candidate_applying", "candidate_settling", "candidate_collecting",
+            }:
+                validation["state"] = "inconclusive"
+                validation["outcome"] = "inconclusive"
+                validation["result_reason"] = f"validation invalidated: {reason}"
+                validation["apply_generation"] = int(validation.get("apply_generation", 0)) + 1
             self._adaptive_ab_snapshot_seq = int(getattr(self, "_adaptive_ab_snapshot_seq", 0)) + 1
             self._adaptive_ab_snapshot = None
             # A snapshot from the previous channel/configuration is not valid
@@ -70,83 +87,279 @@ class FDIDMAdaptiveMixin:
     def apply_alpha_beta_candidate(self, alpha: float, beta: float,
                                    predicted_improvement_db: float = float("nan"),
                                    recommendation_seq: int = 0) -> Dict[str, Any]:
-        """Apply a candidate and arm real-link validation.
+        """Start a power-comparable, multi-frame real-link validation."""
+        old_alpha = float(getattr(self, "alpha", 0.0))
+        old_beta = float(getattr(self, "beta", 0.0))
+        candidate_alpha = float(alpha)
+        candidate_beta = float(beta)
+        try:
+            contract = self._prepare_power_contract(candidate_alpha, candidate_beta)
+        except Exception as exc:
+            with self._adaptive_ab_lock:
+                self._adaptive_ab_validation = {
+                    "state": "inconclusive",
+                    "outcome": "inconclusive",
+                    "old_alpha": old_alpha,
+                    "old_beta": old_beta,
+                    "candidate_alpha": candidate_alpha,
+                    "candidate_beta": candidate_beta,
+                    "predicted_improvement_db": float(predicted_improvement_db),
+                    "recommendation_seq": int(recommendation_seq),
+                    "result_reason": f"power contract preparation failed: {type(exc).__name__}: {exc}",
+                }
+                self._adaptive_ab_state = "inconclusive"
+            return self._validation_public_state(self._adaptive_ab_validation)
 
-        The optimizer's SER is only a hypothesis.  This method snapshots the
-        pre-change metrics, performs the normal live waveform update, then
-        enters ``validating`` so subsequent decoded frames can accept or roll
-        back the candidate.
-        """
-        old_alpha = float(getattr(self, "alpha", 0.0)); old_beta = float(getattr(self, "beta", 0.0))
-        baseline = {
-            "evm_average_percent": float(getattr(self, "last_evm_average_percent", float("nan"))),
-            "measured_ser": float(getattr(self, "_last_measured_ser", float("nan"))),
-            "fec_bit_ber": float(getattr(self, "_last_fec_bit_ber", float("nan"))),
-            "crc_success_ratio": (float(getattr(self, "_frames_decode_ok", 0)) /
-                                   max(float(getattr(self, "_frames_processed", 0)), 1.0)),
-        }
-        self.configure(alpha=float(alpha), beta=float(beta))
+        context_key = self._alpha_beta_adaptation_context_key()
+        baseline_window = EvidenceWindow(contract_id=contract.contract_id, context_key=context_key)
+        candidate_window = EvidenceWindow(contract_id=contract.contract_id, context_key=context_key)
         with self._adaptive_ab_lock:
             self._adaptive_ab_validation = {
-                "state": "validating", "old_alpha": old_alpha, "old_beta": old_beta,
-                "candidate_alpha": float(alpha), "candidate_beta": float(beta),
+                "state": "prepare_contract",
+                "outcome": "",
+                "old_alpha": old_alpha,
+                "old_beta": old_beta,
+                "candidate_alpha": candidate_alpha,
+                "candidate_beta": candidate_beta,
                 "predicted_improvement_db": float(predicted_improvement_db),
                 "recommendation_seq": int(recommendation_seq),
                 "start_frame": int(getattr(self, "_frames_processed", 0)),
-                "settle_remaining": 3, "target_frames": 5, "samples": [],
-                "baseline": baseline, "result_reason": "",
+                "settle_frames": 3,
+                "settle_remaining": 0,
+                "min_frames": 24,
+                "max_frames": 64,
+                "min_errors_for_improvement": 100,
+                "contract": contract,
+                "context_key": context_key,
+                "baseline_window": baseline_window,
+                "candidate_window": candidate_window,
+                "apply_generation": 0,
+                "rollback_pending": False,
+                "rollback_complete": False,
+                "result_reason": "",
             }
-            self._adaptive_ab_state = "validating"
-        self._debug("INFO", f"alpha/beta candidate validating: old=({old_alpha:.2f},{old_beta:.2f}) "
-                             f"candidate=({float(alpha):.2f},{float(beta):.2f})")
-        return dict(self._adaptive_ab_validation)
+            self._adaptive_ab_state = "prepare_contract"
+        self._debug(
+            "INFO",
+            f"alpha/beta validation prepared: old=({old_alpha:.2f},{old_beta:.2f}), "
+            f"candidate=({candidate_alpha:.2f},{candidate_beta:.2f}), "
+            f"contract={contract.contract_id}, locked_rms={contract.locked_rms:.6f}",
+        )
+        if not contract.comparable:
+            decision = ValidationDecision("inconclusive", reason=contract.reason or "invalid power contract")
+            self._finish_alpha_beta_validation(decision)
+        else:
+            self._queue_validation_waveform("baseline")
+        return self._validation_public_state(self._adaptive_ab_validation)
+
+    @staticmethod
+    def _validation_active_state(state: str) -> bool:
+        return str(state) in {
+            "prepare_contract", "baseline_applying", "baseline_settling", "baseline_collecting",
+            "candidate_applying", "candidate_settling", "candidate_collecting",
+        }
+
+    @staticmethod
+    def _validation_public_state(validation: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in dict(validation or {}).items():
+            if isinstance(value, EvidenceWindow):
+                result[key] = value.as_dict()
+            elif isinstance(value, (TxPowerContract, ValidationDecision)):
+                result[key] = value.as_dict()
+            elif key != "context_key":
+                result[key] = value
+            else:
+                result[key] = repr(value)
+        return result
+
+    def _publish_validation_waveform(self, side: str, generation: int) -> None:
+        with self._adaptive_ab_lock:
+            validation = getattr(self, "_adaptive_ab_validation", {})
+            if generation != int(validation.get("apply_generation", -1)):
+                return
+            contract = validation.get("contract")
+            if not isinstance(contract, TxPowerContract):
+                return
+            if side == "baseline":
+                alpha = float(validation["old_alpha"])
+                beta = float(validation["old_beta"])
+                forced_rms: Optional[float] = float(contract.locked_rms)
+                contract_id = contract.contract_id
+            elif side == "candidate":
+                alpha = float(validation["candidate_alpha"])
+                beta = float(validation["candidate_beta"])
+                forced_rms = float(contract.locked_rms)
+                contract_id = contract.contract_id
+            else:
+                alpha = float(validation["old_alpha"])
+                beta = float(validation["old_beta"])
+                forced_rms = None
+                contract_id = ""
+        try:
+            self._commit_waveform_build(alpha, beta, forced_rms=forced_rms, contract_id=contract_id)
+            tx_buffer = getattr(self, "_tx_buffer", None)
+            if tx_buffer is not None and hasattr(tx_buffer, "write"):
+                tx_buffer.write(np.asarray(self._tx_waveform, dtype=np.complex64))
+            if hasattr(self, "_sync_waveform_to_top_block"):
+                self._sync_waveform_to_top_block()
+            if bool(getattr(self, "_running", False)) and hasattr(self, "_arm_live_transition"):
+                self._arm_live_transition()
+        except Exception as exc:
+            self._debug("ERROR", f"alpha/beta validation {side} waveform failed: {type(exc).__name__}: {exc}")
+            if side == "rollback":
+                with self._adaptive_ab_lock:
+                    validation = getattr(self, "_adaptive_ab_validation", {})
+                    validation["rollback_pending"] = False
+                    validation["rollback_complete"] = False
+                    validation["rollback_error"] = f"{type(exc).__name__}: {exc}"
+                return
+            self._finish_alpha_beta_validation(
+                ValidationDecision("inconclusive", reason=f"{side} waveform apply failed: {type(exc).__name__}: {exc}")
+            )
+            return
+        with self._adaptive_ab_lock:
+            validation = getattr(self, "_adaptive_ab_validation", {})
+            if generation != int(validation.get("apply_generation", -1)):
+                return
+            if side in {"baseline", "candidate"}:
+                validation["state"] = f"{side}_settling"
+                validation["settle_remaining"] = int(validation.get("settle_frames", 3))
+                self._adaptive_ab_state = str(validation["state"])
+            else:
+                validation["rollback_pending"] = False
+                validation["rollback_complete"] = True
+        self._debug("INFO", f"alpha/beta validation waveform applied: side={side}, alpha={alpha:.2f}, beta={beta:.2f}")
+
+    def _queue_validation_waveform(self, side: str) -> None:
+        with self._adaptive_ab_lock:
+            validation = getattr(self, "_adaptive_ab_validation", {})
+            if not isinstance(validation, dict):
+                return
+            validation["apply_generation"] = int(validation.get("apply_generation", 0)) + 1
+            generation = int(validation["apply_generation"])
+            if side in {"baseline", "candidate"}:
+                validation["state"] = f"{side}_applying"
+                self._adaptive_ab_state = str(validation["state"])
+            else:
+                validation["rollback_pending"] = True
+        if bool(getattr(self, "_validation_synchronous", False)):
+            self._publish_validation_waveform(side, generation)
+            return
+        threading.Thread(
+            target=self._publish_validation_waveform,
+            args=(side, generation),
+            name=f"fdidm-ab-{side}-{id(self):x}",
+            daemon=True,
+        ).start()
+
+    def _finish_alpha_beta_validation(self, decision: ValidationDecision) -> None:
+        rollback = False
+        with self._adaptive_ab_lock:
+            validation = getattr(self, "_adaptive_ab_validation", {})
+            if not isinstance(validation, dict):
+                return
+            validation["decision"] = decision
+            validation["outcome"] = decision.outcome
+            validation["state"] = decision.outcome
+            validation["measured"] = decision.as_dict()
+            validation["result_reason"] = decision.reason
+            self._adaptive_ab_state = decision.outcome
+            rollback = decision.outcome != "improved" and isinstance(validation.get("contract"), TxPowerContract)
+        self._debug(
+            "INFO",
+            f"alpha/beta validation {decision.outcome}: measured_SER_gain={decision.measured_ser_gain_db:.3f}dB, "
+            f"EVM_delta={decision.evm_delta_pp:.3f}pp, reason={decision.reason}",
+        )
+        if rollback:
+            self._queue_validation_waveform("rollback")
 
     def _record_alpha_beta_validation_sample_locked(self, metrics: Dict[str, Any]):
-        v = getattr(self, "_adaptive_ab_validation", None)
-        if not isinstance(v, dict) or v.get("state") != "validating":
+        validation = getattr(self, "_adaptive_ab_validation", None)
+        if not isinstance(validation, dict):
             return
-        if int(v.get("settle_remaining", 0)) > 0:
-            v["settle_remaining"] = int(v.get("settle_remaining", 0)) - 1
+        state = str(validation.get("state", ""))
+        if state in {"baseline_settling", "candidate_settling"}:
+            remaining = max(0, int(validation.get("settle_remaining", 0)) - 1)
+            validation["settle_remaining"] = remaining
+            if remaining == 0:
+                side = "baseline" if state.startswith("baseline") else "candidate"
+                validation["state"] = f"{side}_collecting"
+                self._adaptive_ab_state = str(validation["state"])
             return
-        sample = {k: float(metrics.get(k, float("nan"))) for k in
-                  ("evm_average_percent", "measured_ser", "fec_bit_ber", "crc_success_ratio")}
-        sample["decode_ok"] = bool(metrics.get("decode_ok", False))
-        if not any(np.isfinite(x) for x in sample.values() if isinstance(x, float)):
+        if state not in {"baseline_collecting", "candidate_collecting"}:
             return
-        v.setdefault("samples", []).append(sample)
-        if len(v["samples"]) < int(v.get("target_frames", 5)):
+
+        side = "baseline" if state.startswith("baseline") else "candidate"
+        window = validation.get(f"{side}_window")
+        contract = validation.get("contract")
+        if not isinstance(window, EvidenceWindow) or not isinstance(contract, TxPowerContract):
+            self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason="validation state is incomplete"))
             return
-        baseline = dict(v.get("baseline", {})); samples = list(v["samples"])
-        def avg(key):
-            vals = [float(s.get(key, float("nan"))) for s in samples]
-            vals = [x for x in vals if np.isfinite(x)]
-            return float(np.mean(vals)) if vals else float("nan")
-        measured = {k: avg(k) for k in ("evm_average_percent", "measured_ser", "fec_bit_ber", "crc_success_ratio")}
-        evm_bad = np.isfinite(baseline.get("evm_average_percent", np.nan)) and np.isfinite(measured["evm_average_percent"]) and measured["evm_average_percent"] > baseline["evm_average_percent"] * 1.10
-        ser_bad = np.isfinite(baseline.get("measured_ser", np.nan)) and np.isfinite(measured["measured_ser"]) and measured["measured_ser"] > baseline["measured_ser"] * 1.10
-        crc_bad = np.isfinite(baseline.get("crc_success_ratio", np.nan)) and np.isfinite(measured["crc_success_ratio"]) and measured["crc_success_ratio"] + 0.05 < baseline["crc_success_ratio"]
-        accepted = not (evm_bad or ser_bad or crc_bad)
-        v["measured"] = measured
-        v["state"] = "accepted" if accepted else "rollback"
-        v["result_reason"] = "validated_real_metrics" if accepted else "real_metrics_regressed"
-        rollback_params = None
-        if not accepted:
-            rollback_params = (float(v["old_alpha"]), float(v["old_beta"]))
-        self._adaptive_ab_state = str(v["state"])
-        if rollback_params is not None:
-            # Caller holds the RX lock; perform the live waveform swap after
-            # returning to avoid re-entering the non-reentrant lock.
-            v["rollback_pending"] = True
-        self._debug("INFO", f"alpha/beta validation {v['state']}: "
-                             f"EVM={measured['evm_average_percent']:.3g}, SER={measured['measured_ser']:.3g}, "
-                             f"CRC={measured['crc_success_ratio']:.3f}, reason={v['result_reason']}")
-        if rollback_params is not None:
-            def _rollback():
-                try:
-                    self.configure(alpha=rollback_params[0], beta=rollback_params[1])
-                except Exception as exc:
-                    self._debug("ERROR", f"alpha/beta rollback failed: {type(exc).__name__}: {exc}")
-            threading.Thread(target=_rollback, name=f"fdidm-ab-rollback-{id(self):x}", daemon=True).start()
+        if bool(metrics.get("overflow", False)):
+            window.drop("overflow")
+            return
+        if not bool(metrics.get("sync_valid", True)):
+            window.drop("sync")
+            return
+        if metrics.get("context_key") != validation.get("context_key"):
+            window.drop("context")
+            self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason="channel context changed"))
+            return
+        contract_id = str(metrics.get("tx_power_contract_id", ""))
+        tx_rms = metrics.get("tx_cycle_rms", float("nan"))
+        power_ok, power_reason, _ = assess_power_comparability(
+            contract.contract_id, contract.locked_rms,
+            contract_id, tx_rms,
+            tolerance_db=contract.tolerance_db,
+        )
+        if not power_ok:
+            window.drop("power")
+            self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason=power_reason))
+            return
+        ser_symbols = int(metrics.get("ser_symbols", 0) or 0)
+        ser_errors = int(metrics.get("ser_errors", 0) or 0)
+        if ser_symbols <= 0:
+            return
+        window.add_sample(
+            ser_errors=ser_errors,
+            ser_symbols=ser_symbols,
+            data_aided_evm_percent=metrics.get("data_aided_evm_percent"),
+            crc_ok=bool(metrics.get("decode_ok", False)),
+            raw_ber=metrics.get("raw_bit_ber"),
+            fec_ber=metrics.get("fec_bit_ber"),
+            power_rms=tx_rms,
+        )
+        min_frames = int(validation.get("min_frames", 24))
+        max_frames = int(validation.get("max_frames", 64))
+        min_errors = int(validation.get("min_errors_for_improvement", 100))
+        if side == "baseline":
+            if window.valid_frames >= min_frames and (window.ser_errors >= min_errors or window.valid_frames >= max_frames):
+                self._queue_validation_waveform("candidate")
+            return
+
+        baseline = validation.get("baseline_window")
+        if not isinstance(baseline, EvidenceWindow) or window.valid_frames < min_frames:
+            return
+        mean_baseline_rms = float(np.mean(baseline.power_rms_values)) if baseline.power_rms_values else float("nan")
+        mean_candidate_rms = float(np.mean(window.power_rms_values)) if window.power_rms_values else float("nan")
+        comparable, reason, _ = assess_power_comparability(
+            baseline.contract_id, mean_baseline_rms,
+            window.contract_id, mean_candidate_rms,
+            tolerance_db=contract.tolerance_db,
+        )
+        decision = classify_validation(
+            baseline,
+            window,
+            comparable=comparable,
+            comparability_reason=reason,
+            min_frames=min_frames,
+            max_frames=max_frames,
+            min_errors_for_improvement=min_errors,
+            min_ser_gain_db=float(getattr(self, "adaptive_alpha_beta_min_improvement_db", 0.5)),
+        )
+        if decision.outcome != "inconclusive" or window.valid_frames >= max_frames:
+            self._finish_alpha_beta_validation(decision)
 
     def _ensure_alpha_beta_adaptation_worker(self):
         if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
@@ -603,6 +816,9 @@ class FDIDMAdaptiveMixin:
             return {"enabled": False, "state": "uninitialized", "ready": False, "pending": False}
         with lock:
             rec = dict(getattr(self, "_adaptive_ab_recommendation", {}) or {})
+            validation = self._validation_public_state(
+                dict(getattr(self, "_adaptive_ab_validation", {}) or {})
+            )
             return {
                 "enabled": bool(getattr(self, "adaptive_alpha_beta_enable", False)),
                 "state": str(getattr(self, "_adaptive_ab_state", "disabled")),
@@ -639,10 +855,10 @@ class FDIDMAdaptiveMixin:
                 "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "signaling_mode": str(getattr(self, "ALPHA_BETA_SIGNALING_MODE", "shared_memory")),
-                "validation": dict(getattr(self, "_adaptive_ab_validation", {}) or {}),
-                "validation_state": str((getattr(self, "_adaptive_ab_validation", {}) or {}).get("state", "idle")),
-                "validation_measured": dict((getattr(self, "_adaptive_ab_validation", {}) or {}).get("measured", {}) or {}),
-                "validation_reason": str((getattr(self, "_adaptive_ab_validation", {}) or {}).get("result_reason", "")),
+                "validation": validation,
+                "validation_state": str(validation.get("state", "idle")),
+                "validation_measured": dict(validation.get("measured", {}) or {}),
+                "validation_reason": str(validation.get("result_reason", "")),
             }
 
     # =========================================================

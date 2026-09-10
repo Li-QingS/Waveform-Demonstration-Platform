@@ -471,8 +471,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "state": "idle", "old_alpha": float(self.alpha), "old_beta": float(self.beta),
             "candidate_alpha": float(self.alpha), "candidate_beta": float(self.beta),
             "predicted_improvement_db": float("nan"), "recommendation_seq": 0,
-            "start_frame": 0, "settle_remaining": 0, "target_frames": 5,
-            "samples": [], "baseline": {}, "result_reason": "",
+            "start_frame": 0, "settle_frames": 3, "settle_remaining": 0,
+            "min_frames": 24, "max_frames": 64,
+            "result_reason": "", "outcome": "",
         }
 
         self._set_tx_text_internal(tx_text)
@@ -3452,6 +3453,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._debug("INFO",
                     f"stop(): tearing down, frames_processed={self._frames_processed}, "
                     f"frames_decode_ok={self._frames_decode_ok}, rx_samples_seen={self._rx_samples_seen}")
+        self._invalidate_alpha_beta_adaptation(reason="hardware_stop", cooldown=False)
         # Order is important: stop the monitor before tearing down the GR sinks,
         # otherwise the monitor can call .data() on a half-destructed vector sink.
         self._monitor_stop.set()
