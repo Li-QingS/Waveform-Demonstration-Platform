@@ -37,11 +37,9 @@ BORDER_COLOR = (225, 225, 225)
 
 from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas
 from .hardware_advantage_observer import (
-    CONTEXT_KEYS,
     MODE_OFF,
     MODE_ON,
     AdvantageObservationSession,
-    grade_from_k,
 )
 
 class FDIDMHardwareTestTab(QWidget):
@@ -60,6 +58,7 @@ class FDIDMHardwareTestTab(QWidget):
         self._pending_apply = False
         self._suppress_param_signals = False
         self._last_adaptive_recommendation_seq = 0
+        self._adaptive_toggle_pending = False
         self.observer = AdvantageObservationSession()
         self._adaptive_toggle_markers = []
         self._timeline_event_items = []
@@ -205,7 +204,7 @@ class FDIDMHardwareTestTab(QWidget):
         fd.addWidget(QLabel("RMS-DS"), 10, 0); fd.addWidget(self.tdl_ds_spin, 10, 1)
         fd.addWidget(QLabel("Doppler"), 10, 2); fd.addWidget(self.tdl_fd_spin, 10, 3)
         fd.addWidget(QLabel("扩展"), 11, 0); fd.addWidget(self.tdl_spread_spin, 11, 1)
-        fd.addWidget(QLabel("SNR"), 11, 2); fd.addWidget(self.tdl_snr_spin, 11, 3)
+        fd.addWidget(QLabel("TDL注入设定SNR"), 11, 2); fd.addWidget(self.tdl_snr_spin, 11, 3)
         fd.addWidget(self.prerender_tdl_check, 12, 0, 1, 4)
         self.btn_ofdm = QPushButton("OFDM\n0/0")
         self.btn_otfs = QPushButton("OTFS\n1/1")
@@ -334,12 +333,12 @@ class FDIDMHardwareTestTab(QWidget):
         # 右栏四层：①优势观测横条（固定紧凑）②诊断图页签（主伸展，单幅满幅）
         # ③时间轴（左右并排）④文本区。页签替代旧 2×2 网格：每次只呈现一幅诊断图，
         # 幅面约为原四宫格单格的 4 倍，且彻底避免 OpenGL sizeHint 把网格挤变形。
-        self.comparison_result_group = QGroupBox("优势观测（手动开关自适应 · 自动配对统计）")
+        self.comparison_result_group = QGroupBox("优势观测（测试启动即记录 · 在线切换自动配对）")
         self.comparison_result_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         result_grid = QGridLayout(self.comparison_result_group)
         result_grid.setVerticalSpacing(2)
         result_grid.setHorizontalSpacing(12)
-        self.btn_start_observation = QPushButton("开始观测")
+        self.btn_start_observation = QPushButton("重新开始观测")
         self.btn_stop_observation = QPushButton("结束观测")
         self.btn_export_observation = QPushButton("导出报告")
         for btn in (self.btn_start_observation, self.btn_stop_observation, self.btn_export_observation):
@@ -347,7 +346,8 @@ class FDIDMHardwareTestTab(QWidget):
             btn.setMinimumHeight(28)
         self.btn_stop_observation.setEnabled(False)
         self.btn_export_observation.setEnabled(False)
-        self.observation_state_label = QLabel("观测：未开始 | 开始观测后手动开关自适应即可积累前后窗口")
+        self.btn_start_observation.setEnabled(False)
+        self.observation_state_label = QLabel("观测：等待硬件测试启动（启动后自动记录）")
         ctrl_row = QHBoxLayout()
         ctrl_row.setSpacing(8)
         ctrl_row.addWidget(self.btn_start_observation)
@@ -388,12 +388,11 @@ class FDIDMHardwareTestTab(QWidget):
         state_row.addWidget(self.adaptive_state_label, 3)
         state_row.addWidget(self.observation_note_label, 2)
         result_grid.addLayout(state_row, 3, 0, 1, 3)
-        result_grid.addWidget(self.adaptive_state_label, 3, 0, 1, 3)
         layout.addWidget(self.comparison_result_group, 0)
 
         # 观测页签的时间轴三图（SER / EVM / αβ 轨迹）与统计表；x 轴联动对齐。
         self.timeline_ser_plot = pg.PlotWidget(title="实测 SER（log10）")
-        self.timeline_evm_plot = pg.PlotWidget(title="EVM%（信道代理）")
+        self.timeline_evm_plot = pg.PlotWidget(title="已知数据辅助 EVM%")
         self.timeline_ab_plot = pg.PlotWidget(title="α/β 轨迹（▲=参数应用）")
         self.timeline_ab_plot.setXLink(self.timeline_ser_plot)
         self.timeline_evm_plot.setXLink(self.timeline_ser_plot)
@@ -408,8 +407,11 @@ class FDIDMHardwareTestTab(QWidget):
         stats_layout = QVBoxLayout(self.observation_stats_group)
         self.observation_stats_label = QLabel("开始观测后此处显示各窗口汇总")
         self.observation_stats_label.setWordWrap(True)
+        self.observation_stats_label.setMinimumSize(0, 0)
+        self.observation_stats_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.observation_stats_label.setStyleSheet("color:#555555; font-size: 12px;")
-        stats_layout.addWidget(self.observation_stats_label)
+        stats_layout.setContentsMargins(6, 6, 6, 6)
+        stats_layout.addWidget(self.observation_stats_label, 1)
 
         self.ab_surface_panel = self._create_ab_surface_panel()
         self.rx_spectrum_plot = pg.PlotWidget(title="RX 频谱")
@@ -467,10 +469,11 @@ class FDIDMHardwareTestTab(QWidget):
         self.timeline_ser_cell = _Cell(self.timeline_ser_plot)
         self.timeline_evm_cell = _Cell(self.timeline_evm_plot)
         self.timeline_ab_cell = _Cell(self.timeline_ab_plot)
+        self.observation_stats_cell = _Cell(self.observation_stats_group)
         og.addWidget(self.timeline_ser_cell, 0, 0)
         og.addWidget(self.timeline_evm_cell, 0, 1)
         og.addWidget(self.timeline_ab_cell, 1, 0)
-        og.addWidget(self.observation_stats_group, 1, 1)
+        og.addWidget(self.observation_stats_cell, 1, 1)
 
         self.plot_tabs = QTabWidget()
         self.plot_tabs.addTab(diag_grid, "链路诊断")
@@ -749,6 +752,8 @@ class FDIDMHardwareTestTab(QWidget):
                 self._create_backend()
             else:
                 self._configure_backend(self.tx_text_edit.toPlainText())
+            initial_status = self.backend.get_status()
+            self._log_frame_structure_warning(initial_status)
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
             self.decode_status_label.setText("解调状态：运行中，等待接收帧…")
@@ -759,6 +764,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
+            self._begin_observation(automatic=True)
             self._log("v35 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
@@ -783,10 +789,10 @@ class FDIDMHardwareTestTab(QWidget):
         self._clear_plots()
         if self.observer.active:
             self.observer.stop()
-            self.btn_start_observation.setEnabled(True)
-            self.btn_stop_observation.setEnabled(False)
-            self.btn_export_observation.setEnabled(self.observer.windows() or self.observer.events())
-            self._update_observation_display()
+        self.btn_start_observation.setEnabled(False)
+        self.btn_stop_observation.setEnabled(False)
+        self.btn_export_observation.setEnabled(bool(self.observer.windows() or self.observer.events()))
+        self._update_observation_display()
         self.decode_status_label.setText("解调状态：已停止")
         self._log("停止 FDIDM 测试。")
 
@@ -852,36 +858,42 @@ class FDIDMHardwareTestTab(QWidget):
 
     # ---------------- 优势观测（手动开关 + 自动配对统计） ----------------
     def _observation_context(self):
-        ctx = {}
         if self.backend is not None:
             try:
-                st = self.backend.get_status()
-                for key in CONTEXT_KEYS:
-                    if key in st:
-                        ctx[key] = st[key]
+                # start() also uses cumulative counters as its baseline, so the
+                # complete snapshot is intentional here.  The observer itself
+                # narrows exported context to the evidence allow-list.
+                return dict(self.backend.get_status())
             except Exception:
                 pass
-        return ctx
+        return {}
 
-    def _start_observation_clicked(self):
-        if self.backend is None or not self.test_running:
-            self._log("请先连接并启动测试，再开始优势观测。")
-            return
+    def _begin_observation(self, *, automatic: bool) -> None:
         enabled = bool(self.adaptive_enable_check.isChecked())
         self.observer.start(enabled, self._observation_context())
         self._obs_t0 = self.observer.started_at()
         self._clear_timeline()
-        self.btn_start_observation.setEnabled(False)
+        self.btn_start_observation.setEnabled(bool(self.test_running))
         self.btn_stop_observation.setEnabled(True)
         self.btn_export_observation.setEnabled(False)
-        self._log(f"开始优势观测（自适应初始：{'开启' if enabled else '关闭'}）；开关自适应时自动记录前后窗口。")
+        origin = "硬件测试启动，已自动开始" if automatic else "已重新开始"
+        self._log(
+            f"{origin}优势观测（自适应初始：{'开启' if enabled else '关闭'}）；"
+            "在线切换时自动分段并以精确错误计数配对。"
+        )
         self._update_observation_display()
+
+    def _start_observation_clicked(self):
+        if self.backend is None or not self.test_running:
+            self._log("请先启动硬件测试；观测会在测试启动时自动开始。")
+            return
+        self._begin_observation(automatic=False)
 
     def _stop_observation_clicked(self):
         self.observer.stop()
-        self.btn_start_observation.setEnabled(True)
+        self.btn_start_observation.setEnabled(bool(self.test_running))
         self.btn_stop_observation.setEnabled(False)
-        self.btn_export_observation.setEnabled(True)
+        self.btn_export_observation.setEnabled(bool(self.observer.windows() or self.observer.events()))
         self._log("结束优势观测；结果保留，可导出报告。")
         self._update_observation_display()
 
@@ -921,7 +933,8 @@ class FDIDMHardwareTestTab(QWidget):
         # 时间轴与观测会话共用引擎时钟，保证事件线/异常区与曲线同一时基
         now = self.observer.now()
         ser = float(status.get("measured_ser", np.nan))
-        evm = float(status.get("evm_average_percent", status.get("evm_percent", np.nan)))
+        evm = float(status.get("data_aided_evm_percent",
+                               status.get("evm_average_percent", status.get("evm_percent", np.nan))))
         self._obs_t.append(now - self._obs_t0)
         self._obs_ser.append(math.log10(ser) if np.isfinite(ser) and ser > 0 else np.nan)
         self._obs_evm.append(evm)
@@ -1014,10 +1027,11 @@ class FDIDMHardwareTestTab(QWidget):
             self.observation_before_label.setText("开启前：—")
             self.observation_after_label.setText("开启后：—")
             self.observation_improvement_label.setText("SER 改善：—")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#167c3a;")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#555555;")
             self.observation_badge_label.setText("可信度：—")
             self.observation_badge_label.setStyleSheet("")
-            self.observation_note_label.setText("开始观测后，手动关闭/开启自适应各积累一段窗口即可得到结论")
+            self.observation_note_label.setText("测试启动后自动观测；在线切换自适应以形成前后窗口")
+            self._update_observation_stats()
             return
         b, a = pair.before, pair.after
         def fmt(v, suffix=""):
@@ -1025,24 +1039,34 @@ class FDIDMHardwareTestTab(QWidget):
             return "—" if not np.isfinite(v) else f"{v:.3g}{suffix}"
         self.observation_before_label.setText(f"开启前 SER {fmt(b.ser)}")
         self.observation_after_label.setText(f"开启后 SER {fmt(a.ser)}")
-        self.observation_evm_label.setText(f"EVM {fmt(b.evm_mean, '%')} → {fmt(a.evm_mean, '%')}")
+        self.observation_evm_label.setText(
+            f"数据辅助EVM {fmt(b.evm_mean, '%')} → {fmt(a.evm_mean, '%')}"
+            f"（判决EVM {fmt(b.decision_evm_mean, '%')} → {fmt(a.decision_evm_mean, '%')}）")
         # 样本不足的窗口不产生改善结论（F3/AC3）
         insufficient = a.grade == "insufficient" or b.grade == "insufficient"
         if insufficient:
             self.observation_improvement_label.setText("SER 改善：样本不足")
             self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b8860b;")
+        elif pair.outcome == "improved" and pair.comparable and np.isfinite(pair.ser_improvement_db):
+            self.observation_improvement_label.setText(f"实测优势：{pair.ser_improvement_db:+.2f} dB")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#167c3a;")
+        elif pair.outcome == "regressed":
+            delta = "—" if not np.isfinite(pair.ser_improvement_db) else f"{pair.ser_improvement_db:+.2f} dB"
+            self.observation_improvement_label.setText(f"实测退化：{delta}（候选已回滚）")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#a33b3b;")
         elif np.isfinite(pair.ser_improvement_db):
-            color = "#167c3a" if pair.ser_improvement_db >= 0 else "#a33b3b"
-            self.observation_improvement_label.setText(f"SER 改善：{pair.ser_improvement_db:+.2f} dB")
-            self.observation_improvement_label.setStyleSheet(f"font-size: 15px; font-weight: 600; color:{color};")
+            self.observation_improvement_label.setText(f"无结论（SER变化 {pair.ser_improvement_db:+.2f} dB）")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
         else:
-            self.observation_improvement_label.setText("SER 改善：—")
+            self.observation_improvement_label.setText("无结论")
+            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
         badge_map = {"trusted": ("可信", "#167c3a"), "reference": ("参考", "#777777"),
                      "insufficient": ("样本不足", "#b8860b")}
         name, color = badge_map.get(a.grade, ("—", "#333333"))
+        count_mark = "估算" if a.estimated_k else "精确"
         k_mark = "≈" if a.estimated_k else ""
         self.observation_badge_label.setText(
-            f"{name}（{k_mark}{a.ser_k:.0f}/{a.ser_n} 符号错误 · {a.frames} 帧）")
+            f"{name} · {count_mark}计数（{k_mark}{a.ser_k:.0f}/{a.ser_n} 符号错误 · {a.frames} 帧）")
         self.observation_badge_label.setStyleSheet(f"color:{color}; font-weight:600;")
         notes = []
         if insufficient:
@@ -1051,6 +1075,8 @@ class FDIDMHardwareTestTab(QWidget):
             notes.append(f"已剔除异常窗口 {self.observer.excluded_window_count()} 个")
         if not pair.comparable:
             notes.append(f"{pair.comparability_note}（可比性受限，结论仅供参考）")
+        if pair.validation_reason:
+            notes.append(pair.validation_reason)
         self.observation_note_label.setText("；".join(notes))
         self._update_observation_stats()
 
@@ -1068,17 +1094,35 @@ class FDIDMHardwareTestTab(QWidget):
             if agg is None:
                 lines.append(f"{label}  已剔除（{w.exclusion_reason}）")
             else:
+                ctx = dict(w.context or {})
+                def ctx_num(key, pattern):
+                    try:
+                        value = float(ctx.get(key, np.nan))
+                    except (TypeError, ValueError):
+                        value = np.nan
+                    return "不可用" if not np.isfinite(value) else format(value, pattern)
                 lines.append(
-                    f"{label}  {agg.frames}帧  SER {agg.ser:.3g}"
-                    f"（k={agg.ser_k:.0f}/{agg.ser_n}）  {agg.grade}  EVM {agg.evm_mean:.3g}%")
+                    f"{label}｜{agg.frames}帧｜SER {agg.ser:.3g} "
+                    f"k/n={agg.ser_k:.0f}/{agg.ser_n}（{'估算' if agg.estimated_k else '精确'}）\n"
+                    f"95%区间 [{agg.wilson_low:.3g}, {agg.wilson_high:.3g}]｜"
+                    f"数据EVM {agg.evm_mean:.3g}%｜判决EVM {agg.decision_evm_mean:.3g}%｜"
+                    f"raw/FEC BER {agg.raw_ber:.3g}/{agg.fec_ber:.3g}｜CRC {100.0 * agg.crc_ok_ratio:.1f}%\n"
+                    f"周期/数据RMS {agg.tx_cycle_rms_mean:.4g}/{ctx_num('tx_data_rms', '.4g')}｜"
+                    f"peak {ctx_num('tx_peak', '.4g')}｜PAPR {ctx_num('tx_papr_db', '.2f')} dB｜"
+                    f"回退 {ctx_num('tx_power_backoff_db', '.2f')} dB｜合同 {agg.tx_power_contract_id or '不可用'}")
         pair = self.observer.latest_pair()
-        if pair is not None and np.isfinite(pair.ser_improvement_db):
-            lines.append(f"SER 改善 {pair.ser_improvement_db:+.2f} dB · 剔除窗口 {self.observer.excluded_window_count()}")
+        if pair is not None:
+            gain = "—" if not np.isfinite(pair.ser_improvement_db) else f"{pair.ser_improvement_db:+.2f} dB"
+            lines.append(
+                f"结论 {pair.outcome}｜SER变化 {gain}｜"
+                f"{'功率/上下文可比' if pair.comparable else pair.comparability_note}｜"
+                f"剔除窗口 {self.observer.excluded_window_count()}")
         self.observation_stats_label.setText("\n".join(lines))
 
     def _on_adaptive_enable_changed(self, state):
         enabled = bool(state)
         if self.backend is not None and self.test_running:
+            self._adaptive_toggle_pending = True
             event = self.observer.on_toggle(enabled, self.alpha_spin.value(), self.beta_spin.value())
             if event is not None:
                 self._add_timeline_event_line(enabled, event.t)
@@ -1089,7 +1133,13 @@ class FDIDMHardwareTestTab(QWidget):
                     self._adaptive_toggle_markers.append(marker)
                 except Exception:
                     pass
-            self._log(f"手动{'开启' if enabled else '关闭'} α/β 自适应，观测窗口已切换")
+                self._log(f"手动{'开启' if enabled else '关闭'} α/β 自适应，观测窗口已切换。")
+            elif self.observer.active:
+                self._log(f"自适应已保持{'开启' if enabled else '关闭'}；状态未变化，未新建观测窗口。")
+            else:
+                self._log(
+                    f"已{'开启' if enabled else '关闭'} α/β 自适应；当前观测已停止，"
+                    "可点击“重新开始观测”后再切换形成配对。")
         self._on_adaptive_config_changed()
 
 
@@ -1545,6 +1595,8 @@ class FDIDMHardwareTestTab(QWidget):
         rec_b = float(status.get("adaptive_recommended_beta", np.nan))
         gain = float(status.get("adaptive_predicted_improvement_db", np.nan))
         snr = float(status.get("adaptive_predicted_snr_db", np.nan))
+        predicted_current = float(status.get("adaptive_predicted_ser_current", np.nan))
+        predicted_best = float(status.get("adaptive_predicted_ser_best", np.nan))
         step = float(status.get("adaptive_active_step", np.nan))
         direction = str(status.get("adaptive_selected_direction", "none"))
         stable = int(status.get("adaptive_stable_count", 0))
@@ -1561,9 +1613,12 @@ class FDIDMHardwareTestTab(QWidget):
             elif np.isfinite(rec_a) and np.isfinite(rec_b):
                 gain_txt = "nan" if not np.isfinite(gain) else f"{gain:.2f}dB"
                 snr_txt = "nan" if not np.isfinite(snr) else f"{snr:.1f}dB"
+                ser_txt = ("不可用" if not (np.isfinite(predicted_current) and np.isfinite(predicted_best))
+                           else f"{predicted_current:.3g}→{predicted_best:.3g}")
                 label.setText(
                     f"自适应：{state}；推荐 α/β={rec_a:.2f}/{rec_b:.2f}；"
-                    f"预测增益={gain_txt}；SNR≈{snr_txt}；稳定={stable}/{required}；CSI={source}"
+                    f"预测SER={ser_txt}；预测增益={gain_txt}；预测模型SNR={snr_txt}；"
+                    f"稳定={stable}/{required}；CSI={source}"
                 )
             else:
                 label.setText(f"自适应：{state}，等待有效 H_TF")
@@ -1592,19 +1647,54 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _update_decode_status(self, stats, status):
         ok = bool(stats.get("decode_ok", False))
-        evm = float(status.get("evm_average_percent", np.nan))
-        evm_txt = "nan" if not np.isfinite(evm) else f"{evm:.2f}%"
-        self.decode_status_label.setText(
+        def readable(value, pattern):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = np.nan
+            return "不可用" if not np.isfinite(value) else format(value, pattern)
+
+        data_evm = readable(status.get("data_aided_evm_percent"), ".2f")
+        decision_evm = readable(status.get("decision_directed_evm_percent",
+                                           status.get("evm_average_percent")), ".2f")
+        tx_cycle_rms = readable(status.get("tx_cycle_rms"), ".4g")
+        tx_peak = readable(status.get("tx_peak"), ".4g")
+        tx_papr = readable(status.get("tx_papr_db"), ".2f")
+        tx_backoff = readable(status.get("tx_power_backoff_db"), ".2f")
+        residual_sinr = readable(status.get("pilot_residual_sinr_db"), ".2f")
+        pilot_nmse = readable(status.get("pilot_fit_nmse"), ".2e")
+        injected_snr = readable(status.get("tdl_injected_snr_db", status.get("tdl_snr_db")), ".1f")
+        frame = dict(status.get("frame_structure", {}) or {})
+        frame_text = "不可用"
+        useful_text = "不可用"
+        if frame:
+            frame_text = (f"{int(frame.get('data_samples', 0) or 0)}/"
+                          f"{int(frame.get('pilot_samples', 0) or 0)}/"
+                          f"{int(frame.get('guard_samples', 0) or 0)}")
+            useful_text = readable(
+                100.0 * float(frame.get("useful_data_ratio"))
+                if frame.get("useful_data_ratio") is not None else None, ".1f")
+        ser_k = int(status.get("ser_errors_total", 0) or 0)
+        ser_n = int(status.get("ser_symbols_total", 0) or 0)
+        detail = (
             f"{'CRC通过' if ok else '未恢复'} | frames={int(status.get('frames_decode_ok',0))}/{int(status.get('frames_processed',0))}, "
             f"Sync={float(status.get('sync_metric',0.0)):.3f}, CFO={float(status.get('cfo_est_hz',0.0)):.1f}Hz/"
             f"{status.get('cfo_source','')}, raw={float(status.get('cfo_preamble_hz',0.0)):.1f}, "
             f"alias={float(status.get('cfo_alias_hz',np.nan)):.1f}, scan={float(status.get('cfo_scan_score',np.nan)):.2f}, "
             f"BER(FEC)={float(status.get('fec_bit_ber', status.get('ber',np.nan))):.3g}, "
-            f"raw={float(status.get('raw_bit_ber',np.nan)):.3g}, SER={float(status.get('measured_ser',np.nan)):.3g}, EVM={evm_txt}, cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
+            f"raw={float(status.get('raw_bit_ber',np.nan)):.3g}, "
+            f"SER={float(status.get('measured_ser',np.nan)):.3g} (k/n={ser_k}/{ser_n}), "
+            f"数据EVM={data_evm}%, 判决EVM={decision_evm}%, "
+            f"TX RMS={tx_cycle_rms}, peak={tx_peak}, PAPR={tx_papr}dB, backoff={tx_backoff}dB, "
+            f"残差SINR={residual_sinr}dB, fitNMSE={pilot_nmse}（含噪声/残余频偏/RF失真/模型失配）, "
+            f"数据/导频/保护={frame_text}, 有效占比={useful_text}%, cond={float(status.get('cond_h_cross',np.nan)):.2e}, "
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, code={status.get('coding_scheme','')}, "
-            f"TDLfit={float(status.get('tdl_param_fit_nmse',np.nan)):.2e}, const={status.get('constellation_source','none')}, "
+            f"TDL注入设定SNR={injected_snr}dB, "
+            f"const={status.get('constellation_source','none')}, "
             f"ABauto={status.get('adaptive_alpha_beta_state','off')}, RXoverflow={int(status.get('rx_overflow_count',0))}"
         )
+        self.decode_status_label.setText(detail)
+        self.decode_status_label.setToolTip(detail)
 
     def _maybe_log_runtime(self, status, stats):
         now = time.monotonic()
@@ -1618,9 +1708,16 @@ class FDIDMHardwareTestTab(QWidget):
             f"Sync={float(status.get('sync_metric',0.0)):.3f}, CFO={float(status.get('cfo_est_hz',0.0)):.1f}/{status.get('cfo_source','')}, "
             f"alias={float(status.get('cfo_alias_hz',np.nan)):.1f}, scan={float(status.get('cfo_scan_score',np.nan)):.2f}, "
             f"BERfec={float(status.get('fec_bit_ber',status.get('ber',np.nan))):.3g}, raw={float(status.get('raw_bit_ber',np.nan)):.3g}, "
-            f"EVM={float(status.get('evm_average_percent',np.nan)):.2f}%, "
+            f"dataEVM={float(status.get('data_aided_evm_percent',np.nan)):.2f}%, "
+            f"decisionEVM={float(status.get('decision_directed_evm_percent',status.get('evm_average_percent',np.nan))):.2f}%, "
+            f"SERk/n={int(status.get('ser_errors_total',0))}/{int(status.get('ser_symbols_total',0))}, "
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, fd={float(status.get('tdl_doppler_hz',0.0)):.1f}, "
-            f"spread={float(status.get('tdl_doppler_spread_hz',0.0)):.1f}, TDLfit={float(status.get('tdl_param_fit_nmse',np.nan)):.2e}, "
+            f"spread={float(status.get('tdl_doppler_spread_hz',0.0)):.1f}, "
+            f"TDL_injected_SNR={float(status.get('tdl_injected_snr_db',status.get('tdl_snr_db',np.nan))):.1f}dB, "
+            f"pilot_residual_SINR={float(status.get('pilot_residual_sinr_db',np.nan)):.2f}dB, "
+            f"pilot_fit_NMSE={float(status.get('pilot_fit_nmse',np.nan)):.2e}, "
+            f"TXrms={float(status.get('tx_cycle_rms',np.nan)):.4g}, peak={float(status.get('tx_peak',np.nan)):.4g}, "
+            f"PAPR={float(status.get('tx_papr_db',np.nan)):.2f}dB, backoff={float(status.get('tx_power_backoff_db',np.nan)):.2f}dB, "
             f"code={status.get('coding_scheme','')}, txvec={int(status.get('tx_waveform_samples',0))}, "
             f"prerender={bool(status.get('tx_tdl_prerendered',False))}, decode_ok={bool(stats.get('decode_ok',False))}, "
             f"ABauto={status.get('adaptive_alpha_beta_state','off')}, "
@@ -1705,18 +1802,41 @@ class FDIDMHardwareTestTab(QWidget):
         if self.backend is None:
             return "未创建后端"
         st = self.backend.get_status()
+        frame = dict(st.get("frame_structure", {}) or {})
+        ratio = frame.get("training_data_ratio")
+        useful = frame.get("useful_data_ratio")
+        ratio_text = "—" if ratio is None else f"{float(ratio):.2f}"
+        useful_text = "—" if useful is None else f"{100.0 * float(useful):.1f}%"
         return (
             f"链路={st.get('chain')}, mode={st.get('channel_estimator')}, ch={st.get('channel_mode')}, "
             f"MxN={st.get('fdidm_m')}x{st.get('fdidm_n')}, CP={st.get('cp_len')}, "
-            f"训练块={st.get('htf_training_blocks')}, Fs={st.get('samp_rate'):.0f}Hz, "
+            f"训练块={st.get('htf_training_blocks')}, Fs={float(st.get('samp_rate', np.nan)):.0f}Hz, "
             f"调制={st.get('mod_order')}, EQ={st.get('equalizer')}, 编码={st.get('coding_summary')}, "
             f"α/β={st.get('alpha'):.2f}/{st.get('beta'):.2f}, frame={st.get('frame_len')} samples, "
             f"TX向量={st.get('tx_waveform_samples')} samples, UHD帧={st.get('usrp_buffer_frames')}, "
+            f"数据/导频/保护={frame.get('data_samples','—')}/{frame.get('pilot_samples','—')}/{frame.get('guard_samples','—')}, "
+            f"训练/数据={ratio_text}, 有效占比={useful_text}, "
+            f"TX RMS={float(st.get('tx_cycle_rms',np.nan)):.4g}, peak={float(st.get('tx_peak',np.nan)):.4g}, "
+            f"PAPR={float(st.get('tx_papr_db',np.nan)):.2f}dB, backoff={float(st.get('tx_power_backoff_db',np.nan)):.2f}dB, "
             f"CFO无歧义±{float(st.get('cfo_unambiguous_hz', np.nan)):.0f}Hz, "
             f"CFO扫描±{float(st.get('cfo_search_max_hz', np.nan)):.0f}Hz, "
-            f"TDL预渲染={st.get('tx_tdl_prerendered')}, "
+            f"TDL预渲染={st.get('tx_tdl_prerendered')}, TDL注入SNR={float(st.get('tdl_injected_snr_db',st.get('tdl_snr_db',np.nan))):.1f}dB, "
             f"αβ自适应={st.get('adaptive_alpha_beta_state','off')}"
         )
+
+    def _log_frame_structure_warning(self, status):
+        frame = dict((status or {}).get("frame_structure", {}) or {})
+        ratio = frame.get("training_data_ratio")
+        if ratio is None:
+            return
+        ratio = float(ratio)
+        if ratio >= 1.0:
+            self._log(
+                "开销提示：当前导频长度不小于数据长度，"
+                f"训练/数据={ratio:.2f}，有效数据占比="
+                f"{100.0 * float(frame.get('useful_data_ratio') or 0.0):.1f}%。"
+                "这是信道估计开销，不应把长导频本身当作解调优势。"
+            )
 
     def _log(self, message):
         from datetime import datetime
