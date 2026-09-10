@@ -242,6 +242,10 @@ def test_observation_pair_updates_panel_and_timeline(app):
     assert "可信" in tab.observation_badge_label.text()
     assert "精确计数" in tab.observation_badge_label.text()
     assert "数据辅助EVM" in tab.observation_evm_label.text()
+    stats_text = tab.observation_stats_label.text()
+    assert "raw/FEC BER" in stats_text and "CRC" in stats_text
+    assert "周期/数据RMS" in stats_text and "PAPR" in stats_text
+    assert "合同 common-rms" in stats_text
     assert "SER" in tab.observation_before_label.text()
     # 时间轴：曲线有数据 + 一条开关事件竖线（AC4）
     assert tab.timeline_ser_curve.xData is not None and len(tab.timeline_ser_curve.xData) > 0
@@ -374,6 +378,32 @@ def test_injected_snr_and_frame_overhead_are_labeled_truthfully(app):
     tab._log_frame_structure_warning(status)
     assert "训练/数据=1.00" in tab._ui_log_entries[-1]
     assert "长导频本身" in tab._ui_log_entries[-1]
+
+
+def test_predicted_metrics_are_visibly_separate_from_measured_metrics(app):
+    tab = FDIDMHardwareTestTab()
+    status = make_status(10, 8)
+    status.update({
+        "adaptive_alpha_beta_enabled": True,
+        "adaptive_recommended_alpha": 0.75,
+        "adaptive_recommended_beta": 0.8,
+        "adaptive_predicted_ser_current": 0.08,
+        "adaptive_predicted_ser_best": 0.04,
+        "adaptive_predicted_improvement_db": 3.01,
+        "adaptive_predicted_snr_db": 17.0,
+        "adaptive_stable_count": 2,
+        "adaptive_stable_required": 2,
+        "adaptive_htf_source": "diag_tf",
+    })
+    tab._handle_alpha_beta_adaptation(status)
+    adaptive = tab.adaptive_status_label.text()
+    assert "预测SER=0.08→0.04" in adaptive
+    assert "预测模型SNR=17.0dB" in adaptive
+    tab._update_decode_status({"decode_ok": False}, status)
+    measured = tab.decode_status_label.toolTip()
+    assert "SER=0.05" in measured
+    assert "TDL注入设定SNR=20.0dB" in measured
+    assert "残差SINR=18.00dB" in measured
 
 
 @pytest.mark.parametrize("width,height", [(1400, 800), (1400, 900), (1200, 780)])

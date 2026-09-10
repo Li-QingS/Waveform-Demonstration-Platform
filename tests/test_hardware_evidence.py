@@ -171,6 +171,18 @@ def test_frame_efficiency_for_current_diag_tf_layout():
     assert metrics["useful_data_ratio"] == pytest_approx(320 / 820)
 
 
+def test_frame_efficiency_is_recomputed_from_each_actual_structure():
+    compact = frame_structure_metrics(
+        data_samples=320, pilot_samples=80, sync_samples=64, guard_samples=32)
+    training_heavy = frame_structure_metrics(
+        data_samples=320, pilot_samples=640, sync_samples=64, guard_samples=32)
+    assert compact["training_data_ratio"] == pytest_approx(0.25)
+    assert training_heavy["training_data_ratio"] == pytest_approx(2.0)
+    assert compact["useful_data_ratio"] > training_heavy["useful_data_ratio"]
+    assert compact["total_samples"] == 496
+    assert training_heavy["total_samples"] == 1056
+
+
 def _window(errors, symbols, frames=32, evm=10.0, crc_ratio=1.0, contract="p1", context=(1,)):
     window = EvidenceWindow(contract_id=contract, context_key=context)
     per_frame_symbols = symbols // frames

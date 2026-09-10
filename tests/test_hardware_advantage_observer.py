@@ -330,6 +330,29 @@ def test_export_contains_exact_power_evm_validation_and_diagnostics():
     json.dumps(data, ensure_ascii=False, allow_nan=False)
 
 
+def test_exported_counts_and_power_are_sufficient_to_recompute_claim():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed_exact(session, clock, 40, 0.05, power_rms=0.2)
+    session.on_toggle(True, 0.75, 0.8)
+    feed_exact(session, clock, 40, 0.01, power_rms=0.2, state="improved",
+               alpha=0.75, beta=0.8)
+    report = session.to_export_dict()
+    pair = report["latest_pair"]
+    before, after = pair["before"], pair["after"]
+    before_ser = before["ser_k"] / before["ser_n"]
+    after_ser = after["ser_k"] / after["ser_n"]
+    gain_db = 10.0 * math.log10(before_ser / after_ser)
+    power_db = 20.0 * math.log10(
+        before["tx_cycle_rms_mean"] / after["tx_cycle_rms_mean"])
+    assert before_ser == pytest.approx(before["ser"])
+    assert after_ser == pytest.approx(after["ser"])
+    assert gain_db == pytest.approx(pair["ser_improvement_db"])
+    assert power_db == pytest.approx(0.0)
+    assert pair["outcome"] == "improved"
+
+
 def test_stop_keeps_results_and_pair_usable():
     clock = FakeClock()
     session = AdvantageObservationSession(clock=clock)
