@@ -53,6 +53,16 @@ def _run_frames(backend, frames, sleep=0.015):
         time.sleep(sleep)
 
 
+def _wait_for(predicate, timeout=3.0):
+    """The optimizer runs off the frame thread; wait for its bounded result."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return bool(predicate())
+
+
 # ---------------------------------------------------------------- kernel units
 def test_kernel_qfunc_and_ser():
     obj = object.__new__(FDIDMSimAdaptiveMixin)
@@ -64,6 +74,14 @@ def test_kernel_qfunc_and_ser():
     grid = FDIDMSimAdaptiveMixin._adaptive_grid_values(0.25)
     assert 0.0 in grid and 1.0 in grid and 2.0 in grid
     assert abs(FDIDMSimAdaptiveMixin._adaptive_canonical_index(1.7) - 1.7) < 1e-9
+
+
+def test_stability_vote_tolerates_local_drift_but_not_axis_flip_or_large_jump():
+    same = FDIDMSimAdaptiveMixin._adaptive_same_search_region
+    assert same((1.4, 0.0), (1.1, 0.0), (0.0, 0.0), 0.5)
+    assert not same((1.4, 0.0), (0.7, 0.0), (0.0, 0.0), 0.5)
+    assert not same((0.2, 0.0), (0.0, 0.2), (0.0, 0.0), 0.5)
+    assert not same(None, (1.0, 0.0), (0.0, 0.0), 0.5)
 
 
 def test_kernel_optimize_snapshot_fields_full():
@@ -127,6 +145,8 @@ def test_closed_loop_dynamic_channel_apply_and_cooldown():
                              min_improvement_db=0.0, auto_apply=True,
                              cooldown_frames=5, max_order=512)
     _run_frames(tb, 60)
+    assert _wait_for(lambda: sum(h["kind"] == "eval" for h in tb.get_adaptive_history()) >= 2
+                     and any(h["kind"] == "switch" for h in tb.get_adaptive_history()))
     history = tb.get_adaptive_history()
     evals = [h for h in history if h["kind"] == "eval"]
     switches = [h for h in history if h["kind"] == "switch"]
@@ -175,6 +195,8 @@ def test_slow_search_does_not_starve_evals(monkeypatch):
                              min_improvement_db=0.0, auto_apply=True,
                              cooldown_frames=5, max_order=512)
     _run_frames(tb, 60)
+    assert _wait_for(lambda: sum(h["kind"] == "eval" for h in tb.get_adaptive_history()) >= 2
+                     and any(h["kind"] == "switch" for h in tb.get_adaptive_history()))
     history = tb.get_adaptive_history()
     evals = [h for h in history if h["kind"] == "eval"]
     switches = [h for h in history if h["kind"] == "switch"]
@@ -381,6 +403,7 @@ def test_engine_passthrough():
                               min_improvement_db=0.0, auto_apply=False,
                               window_frames=2, ensemble_snapshots=2)
     _run_frames(sim, 8)
+    assert _wait_for(lambda: sim.get_adaptive_status()["recommendation_seq"] >= 1)
     assert sim.get_adaptive_status()["recommendation_seq"] >= 1
     assert len(sim.get_adaptive_history()) >= 1
     sim.stop_adaptive_tuning()

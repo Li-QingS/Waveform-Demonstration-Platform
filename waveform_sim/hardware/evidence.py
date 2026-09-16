@@ -105,6 +105,8 @@ class EvidenceWindow(_Serializable):
     raw_ber_values: list[float] = field(default_factory=list)
     fec_ber_values: list[float] = field(default_factory=list)
     power_rms_values: list[float] = field(default_factory=list)
+    pilot_fit_nmse_values: list[float] = field(default_factory=list)
+    pilot_fitted_power_values: list[float] = field(default_factory=list)
     contract_id: str = ""
     context_key: Any = None
     dropped_overflow: int = 0
@@ -122,6 +124,8 @@ class EvidenceWindow(_Serializable):
         raw_ber: Any = None,
         fec_ber: Any = None,
         power_rms: Any = None,
+        pilot_fit_nmse: Any = None,
+        pilot_fitted_power: Any = None,
     ) -> None:
         self.valid_frames += 1
         self.ser_errors += max(0, int(ser_errors))
@@ -132,6 +136,8 @@ class EvidenceWindow(_Serializable):
             (self.raw_ber_values, raw_ber),
             (self.fec_ber_values, fec_ber),
             (self.power_rms_values, power_rms),
+            (self.pilot_fit_nmse_values, pilot_fit_nmse),
+            (self.pilot_fitted_power_values, pilot_fitted_power),
         ):
             finite = _finite_or_none(value)
             if finite is not None:
@@ -195,6 +201,7 @@ class EvidenceWindow(_Serializable):
 class ValidationDecision(_Serializable):
     outcome: str
     measured_ser_gain_db: float = float("nan")
+    ser_gain_lower_bound_db: float = float("nan")
     baseline_ser_interval: Tuple[float, float] = (float("nan"), float("nan"))
     candidate_ser_interval: Tuple[float, float] = (float("nan"), float("nan"))
     evm_delta_pp: float = float("nan")
@@ -539,10 +546,11 @@ def wilson_interval(errors: int, symbols: int, z: float = 1.959963984540054) -> 
 def measured_ser_gain_db(baseline_ser: Any, candidate_ser: Any) -> float:
     baseline = _finite_or_none(baseline_ser)
     candidate = _finite_or_none(candidate_ser)
-    if baseline is None or candidate is None or baseline < 0.0 or candidate < 0.0:
+    # Zero observed errors does not identify a finite rate ratio.  Using an
+    # arbitrary 1e-15 floor made clean candidates appear to gain >100 dB.
+    if baseline is None or candidate is None or baseline <= 0.0 or candidate <= 0.0:
         return float("nan")
-    floor = 1e-15
-    return 10.0 * math.log10(max(baseline, floor) / max(candidate, floor))
+    return 10.0 * math.log10(baseline / candidate)
 
 
 def classify_validation(
@@ -555,12 +563,20 @@ def classify_validation(
     max_frames: int = 64,
     min_errors_for_improvement: int = 100,
     min_ser_gain_db: float = 0.25,
+    min_evm_improvement_pp: float = 1.0,
     evm_regression_tolerance_pp: float = 2.0,
     crc_regression_tolerance: float = 0.05,
 ) -> ValidationDecision:
     baseline_interval = baseline.wilson_interval
     candidate_interval = candidate.wilson_interval
     gain_db = measured_ser_gain_db(baseline.ser, candidate.ser)
+    b_low, b_high = baseline_interval
+    c_low, c_high = candidate_interval
+    gain_lower_bound_db = (
+        10.0 * math.log10(b_low / c_high)
+        if math.isfinite(b_low) and math.isfinite(c_high) and b_low > 0.0 and c_high > 0.0
+        else float("nan")
+    )
     baseline_evm = baseline.data_aided_evm_mean
     candidate_evm = candidate.data_aided_evm_mean
     evm_delta = candidate_evm - baseline_evm if math.isfinite(baseline_evm) and math.isfinite(candidate_evm) else float("nan")
@@ -569,6 +585,7 @@ def classify_validation(
         return ValidationDecision(
             outcome=outcome,
             measured_ser_gain_db=gain_db,
+            ser_gain_lower_bound_db=gain_lower_bound_db,
             baseline_ser_interval=baseline_interval,
             candidate_ser_interval=candidate_interval,
             evm_delta_pp=evm_delta,
@@ -586,6 +603,28 @@ def classify_validation(
     if baseline.ser_symbols <= 0 or candidate.ser_symbols <= 0:
         return decision("inconclusive", "missing exact SER counts")
 
+    # The pilot waveform is identical on both alpha/beta sides.  A large
+    # change in its fit or received power indicates that sequential A/B
+    # windows saw different RF conditions; data EVM/SER cannot be attributed
+    # to the waveform in that case.  Older/offline evidence without pilot
+    # diagnostics remains usable.
+    min_pilot_samples = max(4, int(min_frames) // 2)
+    if (len(baseline.pilot_fit_nmse_values) >= min_pilot_samples
+            and len(candidate.pilot_fit_nmse_values) >= min_pilot_samples):
+        b_pilot = float(np.median(_finite_array(baseline.pilot_fit_nmse_values)))
+        c_pilot = float(np.median(_finite_array(candidate.pilot_fit_nmse_values)))
+        if (abs(c_pilot - b_pilot) > 0.02
+                and max(c_pilot, b_pilot) > 1.8 * max(min(c_pilot, b_pilot), 0.005)):
+            return decision("inconclusive", "pilot fit changed between A/B windows; RF channel is not stationary")
+    if (len(baseline.pilot_fitted_power_values) >= min_pilot_samples
+            and len(candidate.pilot_fitted_power_values) >= min_pilot_samples):
+        b_power = float(np.median(_finite_array(baseline.pilot_fitted_power_values)))
+        c_power = float(np.median(_finite_array(candidate.pilot_fitted_power_values)))
+        if b_power > 0.0 and c_power > 0.0:
+            pilot_power_shift_db = abs(10.0 * math.log10(c_power / b_power))
+            if pilot_power_shift_db > 3.0:
+                return decision("inconclusive", f"pilot received power shifted by {pilot_power_shift_db:.2f} dB between A/B windows")
+
     baseline_crc = baseline.crc_success_ratio
     candidate_crc = candidate.crc_success_ratio
     if math.isfinite(evm_delta) and evm_delta > float(evm_regression_tolerance_pp):
@@ -596,26 +635,48 @@ def classify_validation(
         and candidate_crc < baseline_crc - float(crc_regression_tolerance)
     ):
         return decision("regressed", "CRC success ratio regressed")
-    b_low, b_high = baseline_interval
-    c_low, c_high = candidate_interval
     if math.isfinite(b_high) and math.isfinite(c_low) and b_high < c_low:
         return decision("regressed", "candidate SER is significantly worse")
 
-    enough_errors = (
-        baseline.ser_errors >= int(min_errors_for_improvement)
-        and candidate.ser_errors >= int(min_errors_for_improvement)
-    )
+    # A genuinely better candidate may have zero errors. Requiring an error
+    # quota on *both* sides made the best possible result impossible to accept.
+    # The baseline still needs enough events for a SER-gain claim, while the
+    # Wilson interval provides the candidate-side uncertainty bound.
+    enough_errors = baseline.ser_errors >= int(min_errors_for_improvement)
     intervals_show_improvement = math.isfinite(c_high) and math.isfinite(b_low) and c_high < b_low
     evm_guard_ok = not math.isfinite(evm_delta) or evm_delta <= float(evm_regression_tolerance_pp)
-    if enough_errors and intervals_show_improvement and math.isfinite(gain_db) and gain_db >= float(min_ser_gain_db) and evm_guard_ok:
+    supported_gain_db = gain_db if math.isfinite(gain_db) else gain_lower_bound_db
+    if enough_errors and intervals_show_improvement and math.isfinite(supported_gain_db) and supported_gain_db >= float(min_ser_gain_db) and evm_guard_ok:
         return decision("improved", "candidate SER improvement is statistically supported")
+
+    # On an already healthy link both windows can be error-free, so SER cannot
+    # distinguish candidates. In that regime accept a lower-EVM candidate only
+    # when the 95% confidence bands are separated, CRC is non-regressing, and
+    # SER has not shown a statistically significant regression above.
+    baseline_sem = baseline.data_aided_evm_sem
+    candidate_sem = candidate.data_aided_evm_sem
+    evm_improvement_supported = bool(
+        math.isfinite(evm_delta)
+        and evm_delta <= -abs(float(min_evm_improvement_pp))
+        and math.isfinite(baseline_sem)
+        and math.isfinite(candidate_sem)
+        and candidate_evm + 1.959963984540054 * candidate_sem
+            < baseline_evm - 1.959963984540054 * baseline_sem
+    )
+    crc_guard_ok = not (
+        math.isfinite(baseline_crc)
+        and math.isfinite(candidate_crc)
+        and candidate_crc < baseline_crc - float(crc_regression_tolerance)
+    )
+    if evm_improvement_supported and crc_guard_ok:
+        return decision("improved", "candidate EVM improvement is statistically supported without SER regression")
 
     reached_limit = baseline.valid_frames >= int(max_frames) and candidate.valid_frames >= int(max_frames)
     if not enough_errors:
-        reason = "insufficient SER errors for an improvement claim"
+        reason = "insufficient SER errors in baseline and no statistically supported EVM improvement"
     elif not intervals_show_improvement:
         reason = "SER confidence intervals overlap"
-    elif not math.isfinite(gain_db) or gain_db < float(min_ser_gain_db):
+    elif not math.isfinite(supported_gain_db) or supported_gain_db < float(min_ser_gain_db):
         reason = "measured SER gain is below the configured threshold"
     elif reached_limit:
         reason = "maximum validation window reached without sufficient evidence"

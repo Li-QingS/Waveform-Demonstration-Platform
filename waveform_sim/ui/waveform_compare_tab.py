@@ -17,8 +17,6 @@
   不读取当前实时后端的 BER。
 """
 
-import os
-import sys
 import threading
 import traceback
 import numpy as np
@@ -30,9 +28,6 @@ from PyQt5.QtWidgets import (
     QPushButton, QGroupBox, QGridLayout, QDoubleSpinBox,
     QSplitter, QTabWidget
 )
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-
 
 MATLAB_BLUE = (0, 114, 189)
 MATLAB_ORANGE = (217, 83, 25)

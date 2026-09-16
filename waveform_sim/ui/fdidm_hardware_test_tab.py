@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -17,15 +15,14 @@ try:
 except Exception:
     gl = None
     _PG_OPENGL_AVAILABLE = False
-from PyQt5.QtCore import Qt, QTimer, QSignalBlocker, pyqtSignal, QEvent, QSize
+from PyQt5.QtCore import Qt, QTimer, QSignalBlocker
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton, QTabWidget,
     QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QSplitter,
-    QScrollArea, QSizePolicy, QCheckBox, QFileDialog, QDialog, QStackedLayout,
+    QScrollArea, QSizePolicy, QCheckBox, QFileDialog, QDialog,
 )
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from hardware.fdidm_hardtest import FDIDMHardwareTest
+from ..hardware.fdidm_hardtest import FDIDMHardwareTest, FDIDM_GAIN_MAX_DB
 
 MATLAB_BLUE = (0, 114, 189)
 MATLAB_ORANGE = (217, 83, 25)
@@ -52,24 +49,34 @@ class FDIDMHardwareTestTab(QWidget):
         self._evm_index = 0
         self._last_plot_samp_rate = None
         self._last_runtime_log_time = 0.0
+        self._last_surface_refresh_wall = 0.0
         self._last_debug_seq = 0
         self._auto_debug_level = "INFO"
         self._applying_params = False
         self._pending_apply = False
         self._suppress_param_signals = False
         self._last_adaptive_recommendation_seq = 0
+        self._last_backend_alpha_beta = None
         self._adaptive_toggle_pending = False
         self.observer = AdvantageObservationSession()
-        self._adaptive_toggle_markers = []
         self._timeline_event_items = []
         self._timeline_anomaly_items = []
         self._timeline_apply_points = []
         self._obs_t = deque(maxlen=1800)
         self._obs_ser = deque(maxlen=1800)
         self._obs_evm = deque(maxlen=1800)
+        self._obs_ser_trend = deque(maxlen=1800)
+        self._obs_evm_trend = deque(maxlen=1800)
         self._obs_alpha = deque(maxlen=1800)
         self._obs_beta = deque(maxlen=1800)
         self._obs_t0 = 0.0
+        self._last_timeline_frame = -1
+        # The effect chart has a fixed categorical x-axis.  Keep track of a
+        # deliberate operator zoom so a newly arriving frame cannot silently
+        # undo it by calling setYRange on every refresh.
+        self._timeline_effect_user_y_zoom = False
+        self._timeline_effect_range_initialized = False
+        self._timeline_effect_setting_range = False
         self._surface_metric_items = [
             ("EVM平均(%)", "evm_average_percent", "lower"),
             ("BER(FEC)", "fec_bit_ber", "lower"),
@@ -121,9 +128,14 @@ class FDIDMHardwareTestTab(QWidget):
         scroll.setMaximumWidth(470)
 
         panel = QWidget()
+        self.controls_panel = panel
+        self.controls_scroll = scroll
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        # The collapsed operator rail should fit the smallest supported
+        # window without a vertical scrollbar.  Detailed controls are kept in
+        # the advanced drawer, so a compact outer rhythm remains readable.
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(3)
 
         hw_group = QGroupBox("链路配置")
         hw = QGridLayout(hw_group)
@@ -133,16 +145,26 @@ class FDIDMHardwareTestTab(QWidget):
         self.samp_rate_spin = self._dspin(1e5, 100e6, 500_000, 0, " Hz")
         self.fc_spin = self._dspin(70e6, 6e9, 2.4e9, 0, " Hz")
         hw.addWidget(QLabel("设备"), 0, 0); hw.addWidget(self.device_combo, 0, 1)
-        hw.addWidget(QLabel("采样率"), 1, 0); hw.addWidget(self.samp_rate_spin, 1, 1)
+        self.samp_rate_label = QLabel("采样率")
+        hw.addWidget(self.samp_rate_label, 1, 0); hw.addWidget(self.samp_rate_spin, 1, 1)
         hw.addWidget(QLabel("中心频率"), 2, 0); hw.addWidget(self.fc_spin, 2, 1)
+        self.rf_port_note = QLabel("B210 端口建议：A:TX/RX，A:RX2；增益上限 45 dB")
+        self.rf_port_note.setWordWrap(True)
+        hw.addWidget(self.rf_port_note, 3, 0, 1, 2)
+        self.btn_antenna_preset = QPushButton("B210 天线/增益预设")
+        self.btn_antenna_preset.setToolTip("选择 B210 A:TX/RX + A:RX2，并将 TX/RX 增益设为 25/45 dB；45 dB 是硬件安全上限，外接衰减器仍不可省略")
+        self.btn_antenna_preset.clicked.connect(self._on_antenna_preset)
+        hw.addWidget(self.btn_antenna_preset, 4, 0, 1, 2)
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        self.hw_group = hw_group
         layout.addWidget(hw_group)
 
         fd_group = QGroupBox("FDIDM 参数")
         fd = QGridLayout(fd_group)
         fd.setHorizontalSpacing(6)
         fd.setVerticalSpacing(6)
-        self.alpha_spin = self._dspin(-2.0, 2.0, 0.5, 2, "", 0.05)
-        self.beta_spin = self._dspin(-2.0, 2.0, 1.0, 2, "", 0.05)
+        self.alpha_spin = self._dspin(0.0, 2.0, 0.5, 2, "", 0.05)
+        self.beta_spin = self._dspin(0.0, 2.0, 1.0, 2, "", 0.05)
         self.m_spin = self._spin(4, 64, 16)
         # 默认 N=16：给 rate-1/2 卷积码留出容量，同时把物理帧拉长，
         # 减少超短 TX 向量反复 wrap 对 UHD 调度的压力。
@@ -192,7 +214,8 @@ class FDIDMHardwareTestTab(QWidget):
         fd.addWidget(QLabel("保护"), 3, 2); fd.addWidget(self.guard_spin, 3, 3)
         fd.addWidget(QLabel("EVM均"), 4, 0); fd.addWidget(self.evm_avg_spin, 4, 1)
         fd.addWidget(QLabel("Pilot"), 4, 2); fd.addWidget(self.train_amp_spin, 4, 3)
-        fd.addWidget(QLabel("估计"), 5, 0); fd.addWidget(self.channel_estimator_combo, 5, 1)
+        self.channel_estimator_label = QLabel("估计")
+        fd.addWidget(self.channel_estimator_label, 5, 0); fd.addWidget(self.channel_estimator_combo, 5, 1)
         fd.addWidget(QLabel("H间隔"), 5, 2); fd.addWidget(self.htf_update_spin, 5, 3)
         fd.addWidget(QLabel("处理ms"), 6, 0); fd.addWidget(self.process_interval_spin, 6, 1)
         fd.addWidget(self.htf_once_check, 6, 2, 1, 2)
@@ -201,10 +224,14 @@ class FDIDMHardwareTestTab(QWidget):
         fd.addWidget(QLabel("UHD帧"), 8, 0); fd.addWidget(self.uhd_buf_spin, 8, 1)
         fd.addWidget(QLabel("TX向量ms"), 8, 2); fd.addWidget(self.tx_vec_ms_spin, 8, 3)
         fd.addWidget(QLabel("链路"), 9, 0); fd.addWidget(self.channel_mode_combo, 9, 1, 1, 3)
-        fd.addWidget(QLabel("RMS-DS"), 10, 0); fd.addWidget(self.tdl_ds_spin, 10, 1)
-        fd.addWidget(QLabel("Doppler"), 10, 2); fd.addWidget(self.tdl_fd_spin, 10, 3)
-        fd.addWidget(QLabel("扩展"), 11, 0); fd.addWidget(self.tdl_spread_spin, 11, 1)
-        fd.addWidget(QLabel("TDL注入设定SNR"), 11, 2); fd.addWidget(self.tdl_snr_spin, 11, 3)
+        self.tdl_ds_label = QLabel("RMS-DS")
+        self.tdl_fd_label = QLabel("Doppler")
+        self.tdl_spread_label = QLabel("扩展")
+        self.tdl_snr_label = QLabel("TDL注入设定SNR")
+        fd.addWidget(self.tdl_ds_label, 10, 0); fd.addWidget(self.tdl_ds_spin, 10, 1)
+        fd.addWidget(self.tdl_fd_label, 10, 2); fd.addWidget(self.tdl_fd_spin, 10, 3)
+        fd.addWidget(self.tdl_spread_label, 11, 0); fd.addWidget(self.tdl_spread_spin, 11, 1)
+        fd.addWidget(self.tdl_snr_label, 11, 2); fd.addWidget(self.tdl_snr_spin, 11, 3)
         fd.addWidget(self.prerender_tdl_check, 12, 0, 1, 4)
         self.btn_ofdm = QPushButton("OFDM\n0/0")
         self.btn_otfs = QPushButton("OTFS\n1/1")
@@ -224,7 +251,19 @@ class FDIDMHardwareTestTab(QWidget):
         note = QLabel("v35：所有模式都经过真实RF；TDL→RF固定离线预渲染。α/β性能面按同一链路上下文记录，测够平均窗口后冻结该点。")
         note.setWordWrap(True)
         fd.addWidget(note, 17, 0, 1, 4)
+        # Keep a handle so the optional rows can be moved into the collapsible
+        # advanced section below.  The alpha/beta row and link selector remain
+        # in this compact group; the rest is still available on demand.
+        self.fd_group = fd_group
         layout.addWidget(fd_group)
+        # A lightweight visibility handle is kept separate from the always
+        # visible FDIDM essentials (alpha/beta and channel path).  The actual
+        # advanced widgets are toggled below so the operator never loses the
+        # two parameters that explain the adaptive result.
+        self.advanced_group = QGroupBox("高级参数")
+        self.advanced_group.setMinimumHeight(0)
+        self.advanced_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.advanced_group)
 
 
         adapt_group = QGroupBox("α/β 信道自适应（论文SER）")
@@ -261,14 +300,27 @@ class FDIDMHardwareTestTab(QWidget):
         adapt_note = QLabel("基于实测 H_TF 与噪声方差计算论文 Eq.(40)/(44)/(46) 的预测SER，在 [0,2] 内粗到细搜索；同一进程同时更新收发端 α/β。")
         adapt_note.setWordWrap(True)
         adapt.addWidget(adapt_note, 6, 0, 1, 4)
+        self.adapt_group = adapt_group
         layout.addWidget(adapt_group)
 
         modem_group = QGroupBox("收发/显示")
         modem = QGridLayout(modem_group)
         modem.setHorizontalSpacing(6)
         modem.setVerticalSpacing(6)
-        self.tx_gain_spin = self._dspin(0, 80, 10, 1, " dB")
-        self.rx_gain_spin = self._dspin(0, 80, 20, 1, " dB")
+        self.tx_gain_spin = self._dspin(0, FDIDM_GAIN_MAX_DB, 10, 1, " dB")
+        self.rx_gain_spin = self._dspin(0, FDIDM_GAIN_MAX_DB, 20, 1, " dB")
+        # TX/RX gain is part of normal RF bring-up and stays visible when
+        # optional diagnostics are collapsed.
+        self.tx_gain_label = QLabel("TX gain")
+        self.rx_gain_label = QLabel("RX gain")
+        gain_group = QGroupBox("RF gain")
+        gain = QGridLayout(gain_group)
+        gain.setHorizontalSpacing(6)
+        gain.setVerticalSpacing(6)
+        gain.addWidget(self.tx_gain_label, 0, 0); gain.addWidget(self.tx_gain_spin, 0, 1)
+        gain.addWidget(self.rx_gain_label, 1, 0); gain.addWidget(self.rx_gain_spin, 1, 1)
+        layout.addWidget(gain_group)
+        self.gain_group = gain_group
         self.mod_order_combo = self._combo([("QPSK", "QPSK"), ("16QAM", "16QAM"), ("64QAM", "64QAM")])
         self.equalizer_combo = self._combo([("MMSE", "MMSE"), ("ZF", "ZF")])
         self._const_mode_items = [
@@ -281,14 +333,14 @@ class FDIDMHardwareTestTab(QWidget):
         self.ab_z_metric_combo = self._combo([(label, key) for label, key, _direction in self._surface_metric_items], chars=12)
         self._rx_plot_items = [("RX原始", "raw"), ("整帧", "frame"), ("pilot", "pilot"), ("data", "data")]
         self.rx_plot_combo = self._combo(self._rx_plot_items)
-        modem.addWidget(QLabel("TX增益"), 0, 0); modem.addWidget(self.tx_gain_spin, 0, 1)
-        modem.addWidget(QLabel("RX增益"), 1, 0); modem.addWidget(self.rx_gain_spin, 1, 1)
+        # TX/RX gains are placed in the always-visible RF gain group above.
         modem.addWidget(QLabel("调制"), 2, 0); modem.addWidget(self.mod_order_combo, 2, 1)
         modem.addWidget(QLabel("均衡"), 3, 0); modem.addWidget(self.equalizer_combo, 3, 1)
         modem.addWidget(QLabel("星座"), 4, 0); modem.addWidget(self.const_mode_combo, 4, 1)
         modem.addWidget(QLabel("3D Z轴"), 5, 0); modem.addWidget(self.ab_z_metric_combo, 5, 1)
         modem.addWidget(QLabel("RX源"), 6, 0); modem.addWidget(self.rx_plot_combo, 6, 1)
         layout.addWidget(modem_group)
+        self.modem_group = modem_group
 
         text_group = QGroupBox("发送文本")
         text_l = QVBoxLayout(text_group)
@@ -298,9 +350,78 @@ class FDIDMHardwareTestTab(QWidget):
         text_l.addWidget(QLabel("待发送文本"))
         text_l.addWidget(self.tx_text_edit)
         layout.addWidget(text_group)
+        self.text_group = text_group
+
+        # The default operator view should expose only the controls needed to
+        # bring up the link and explain an adaptive result.  Keep the complete
+        # lab configuration, including the modem/display and text editors,
+        # inside one genuinely collapsed container.  Merely hiding children
+        # leaves their size hints in QLayouts on some Qt versions and makes the
+        # left panel needlessly tall.
+        self._advanced_layout = QVBoxLayout(self.advanced_group)
+        self._advanced_layout.setContentsMargins(6, 8, 6, 6)
+        self._advanced_layout.setSpacing(6)
+
+        def _move_grid_rows(source_group, rows, title):
+            source_layout = source_group.layout()
+            moved_group = QGroupBox(title)
+            moved_layout = QGridLayout(moved_group)
+            moved_layout.setHorizontalSpacing(6)
+            moved_layout.setVerticalSpacing(4)
+            destination_row = 0
+            for source_row in rows:
+                row_had_widget = False
+                for column in range(4):
+                    item = source_layout.itemAtPosition(source_row, column)
+                    widget = item.widget() if item is not None else None
+                    if widget is None:
+                        continue
+                    source_layout.removeWidget(widget)
+                    moved_layout.addWidget(widget, destination_row, column)
+                    row_had_widget = True
+                if row_had_widget:
+                    destination_row += 1
+            self._advanced_layout.addWidget(moved_group)
+            return moved_group
+
+        # Essential rows retained in the compact groups:
+        #   hardware: device/frequency/antenna; FDIDM: α/β + link; adaptive:
+        #   enable/evaluate/status.  All tuning knobs stay one click away.
+        self._advanced_hw_group = _move_grid_rows(self.hw_group, [1], "采样率")
+        self._advanced_fd_group = _move_grid_rows(
+            self.fd_group,
+            [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17],
+            "FDIDM/信道高级参数")
+        self._advanced_adapt_group = _move_grid_rows(
+            self.adapt_group, [1, 2, 3, 6], "自适应搜索高级参数")
+
+        # Remove optional editor groups from the main layout before parenting
+        # them under the collapsed group.  They are reinserted automatically
+        # when the operator checks “显示高级参数”.
+        layout.removeWidget(self.modem_group)
+        layout.removeWidget(self.text_group)
+        self._advanced_layout.addWidget(self.modem_group)
+        self._advanced_layout.addWidget(self.text_group)
+        layout.removeWidget(self.advanced_group)
+
+        self.btn_toggle_advanced = QCheckBox("显示高级参数")
+        layout.insertWidget(1, self.btn_toggle_advanced)
+        self.btn_toggle_advanced.toggled.connect(self._toggle_advanced_controls)
+        self.advanced_group.setVisible(False)
+        self.modem_group.setVisible(False)
+        self.text_group.setVisible(False)
+        self.samp_rate_spin.setVisible(False)
+        self.channel_estimator_combo.setVisible(False)
+        self._toggle_advanced_controls(False)
 
         btn_group = QGroupBox("控制")
-        btn_l = QVBoxLayout(btn_group)
+        # A two-column command pad keeps the always-visible controls compact;
+        # the previous vertical stack consumed an entire screen on the narrow
+        # side panel even though each action is only one click.
+        btn_l = QGridLayout(btn_group)
+        btn_l.setContentsMargins(5, 5, 5, 5)
+        btn_l.setHorizontalSpacing(4)
+        btn_l.setVerticalSpacing(3)
         self.btn_connect = QPushButton("连接/配置")
         self.btn_start_test = QPushButton("开始测试")
         self.btn_stop_test = QPushButton("停止测试")
@@ -311,14 +432,16 @@ class FDIDMHardwareTestTab(QWidget):
         self.log_status_label.setWordWrap(True)
         self.log_status_label.setMaximumHeight(44)
         self.log_status_label.setStyleSheet("color: #555555;")
-        btn_l.addWidget(self.btn_connect)
-        btn_l.addWidget(self.btn_start_test)
-        btn_l.addWidget(self.btn_stop_test)
-        btn_l.addWidget(self.btn_export_log)
-        btn_l.addWidget(self.log_status_label)
+        btn_l.addWidget(self.btn_connect, 0, 0)
+        btn_l.addWidget(self.btn_start_test, 0, 1)
+        btn_l.addWidget(self.btn_stop_test, 1, 0)
+        btn_l.addWidget(self.btn_export_log, 1, 1)
+        btn_l.addWidget(self.log_status_label, 2, 0, 1, 2)
         layout.addWidget(btn_group)
         layout.addStretch()
         self._compact_left_controls(panel)
+        self._on_channel_mode_changed()
+        self._on_device_changed()
         scroll.setWidget(panel)
         self._apply_control_style(scroll)
         return scroll
@@ -334,7 +457,9 @@ class FDIDMHardwareTestTab(QWidget):
         # ③时间轴（左右并排）④文本区。页签替代旧 2×2 网格：每次只呈现一幅诊断图，
         # 幅面约为原四宫格单格的 4 倍，且彻底避免 OpenGL sizeHint 把网格挤变形。
         self.comparison_result_group = QGroupBox("优势观测（测试启动即记录 · 在线切换自动配对）")
-        self.comparison_result_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.comparison_result_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.comparison_result_group.setMinimumHeight(190)
+        self.comparison_result_group.setMaximumHeight(2000)
         result_grid = QGridLayout(self.comparison_result_group)
         result_grid.setVerticalSpacing(2)
         result_grid.setHorizontalSpacing(12)
@@ -390,16 +515,31 @@ class FDIDMHardwareTestTab(QWidget):
         result_grid.addLayout(state_row, 3, 0, 1, 3)
         layout.addWidget(self.comparison_result_group, 0)
 
-        # 观测页签的时间轴三图（SER / EVM / αβ 轨迹）与统计表；x 轴联动对齐。
-        self.timeline_ser_plot = pg.PlotWidget(title="实测 SER（log10）")
-        self.timeline_evm_plot = pg.PlotWidget(title="已知数据辅助 EVM%")
-        self.timeline_ab_plot = pg.PlotWidget(title="α/β 轨迹（▲=参数应用）")
-        self.timeline_ab_plot.setXLink(self.timeline_ser_plot)
-        self.timeline_evm_plot.setXLink(self.timeline_ser_plot)
-        self.timeline_ser_plot.setLabel("left", "log10(SER)")
-        self.timeline_evm_plot.setLabel("left", "EVM %")
-        self.timeline_ab_plot.setLabel("left", "α / β")
-        self.timeline_ser_plot.setLabel("bottom", "观测时间 (s)")
+        # 观测页签的三张图各自回答一个问题：
+        # 1) 效果图：同一局部信道窗口内，FDIDM ON 相对 OFF 的变化；
+        # 2) 质量图：EVM 随时间是否稳定；
+        # 3) 动作图：α/β 何时改变、是否真的应用。
+        # 三个 ViewBox 独立缩放，避免操作一张图改变其它图的坐标。
+        self.timeline_effect_plot = pg.PlotWidget(
+            title="FDIDM 效果：相邻 OFF→ON 局部窗口")
+        # Compatibility alias for callers/tests written before the effect
+        # chart was given its explicit name.
+        self.timeline_ser_plot = self.timeline_effect_plot
+        self.timeline_evm_plot = pg.PlotWidget(title="解调误差趋势：数据辅助 EVM")
+        self.timeline_ab_plot = pg.PlotWidget(title="自适应动作：α/β（标记=已应用）")
+        # Each observation plot owns its ViewBox and interaction range.
+        for _plot in (self.timeline_effect_plot, self.timeline_evm_plot, self.timeline_ab_plot):
+            _plot.setMouseEnabled(x=True, y=True)
+            # Never inherit a link left by a previous plot layout.  Each
+            # observation chart owns its horizontal and vertical range so a
+            # wheel/drag operation cannot unexpectedly rescale its neighbours.
+            _view_box = _plot.getPlotItem().getViewBox()
+            _view_box.setXLink(None)
+            _view_box.setYLink(None)
+        self.timeline_effect_plot.setLabel("left", "相对 OFF 基线", units="%")
+        self.timeline_evm_plot.setLabel("left", "数据辅助 EVM", units="%")
+        self.timeline_ab_plot.setLabel("left", "参数值")
+        self.timeline_effect_plot.setLabel("bottom", "指标（EVM / SER）")
         self.timeline_evm_plot.setLabel("bottom", "观测时间 (s)")
         self.timeline_ab_plot.setLabel("bottom", "观测时间 (s)")
 
@@ -408,10 +548,16 @@ class FDIDMHardwareTestTab(QWidget):
         self.observation_stats_label = QLabel("开始观测后此处显示各窗口汇总")
         self.observation_stats_label.setWordWrap(True)
         self.observation_stats_label.setMinimumSize(0, 0)
-        self.observation_stats_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        # Long validation explanations belong in the tooltip/export.  Bound
+        # the inline card so it cannot claim an entire grid row and squeeze
+        # the three plots; the label itself remains fully readable via its
+        # tooltip when text exceeds the compact card height.
+        self.observation_stats_label.setMaximumHeight(120)
+        self.observation_stats_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.observation_stats_label.setStyleSheet("color:#555555; font-size: 12px;")
         stats_layout.setContentsMargins(6, 6, 6, 6)
         stats_layout.addWidget(self.observation_stats_label, 1)
+        self.observation_stats_group.setMaximumHeight(170)
 
         self.ab_surface_panel = self._create_ab_surface_panel()
         self.rx_spectrum_plot = pg.PlotWidget(title="RX 频谱")
@@ -466,7 +612,7 @@ class FDIDMHardwareTestTab(QWidget):
             og.setRowStretch(r, 1)
         for c in (0, 1):
             og.setColumnStretch(c, 1)
-        self.timeline_ser_cell = _Cell(self.timeline_ser_plot)
+        self.timeline_ser_cell = _Cell(self.timeline_effect_plot)
         self.timeline_evm_cell = _Cell(self.timeline_evm_plot)
         self.timeline_ab_cell = _Cell(self.timeline_ab_plot)
         self.observation_stats_cell = _Cell(self.observation_stats_group)
@@ -478,7 +624,9 @@ class FDIDMHardwareTestTab(QWidget):
         self.plot_tabs = QTabWidget()
         self.plot_tabs.addTab(diag_grid, "链路诊断")
         self.plot_tabs.addTab(obs_grid, "优势观测")
-        self.plot_tabs.setCurrentIndex(0)
+        # The operator-facing observation result is the default landing page;
+        # raw diagnostics remain one click away in the first tab.
+        self.plot_tabs.setCurrentIndex(1)
         layout.addWidget(self.plot_tabs, 1)
 
         text_panel = QWidget()
@@ -503,8 +651,63 @@ class FDIDMHardwareTestTab(QWidget):
 
         self.rx_curve = self.rx_spectrum_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2))
         self.evm_curve = self.evm_plot.plot(pen=pg.mkPen(MATLAB_PURPLE, width=2), name="current EVM")
-        self.timeline_ser_curve = self.timeline_ser_plot.plot(
-            pen=pg.mkPen(MATLAB_BLUE, width=2), name="log10(SER)", connect="finite")
+        # Keep the raw SER trend as a hidden compatibility/export trace on the
+        # quality plot.  The first chart is deliberately an effect-only view:
+        # it must contain only the OFF baseline and the ON candidate bars, so
+        # an old hidden curve cannot be mistaken for a yellow event marker (or
+        # affect its auto-range).
+        # Keep the SER trend as a data-only compatibility trace.  It is no
+        # longer attached to the EVM plot: log10(SER) and EVM have different
+        # units and putting them on one axis made the quality chart misleading.
+        self.timeline_ser_curve = pg.PlotDataItem(name="SER trend (data only)")
+        # Effect-first bars (OFF baseline = 100%, ON candidate = local ratio).
+        self.timeline_baseline_bars = pg.BarGraphItem(x=[0.0, 1.0], height=[0.0, 0.0], width=0.30,
+                                                       brush=pg.mkBrush(150, 150, 150, 205),
+                                                       pen=pg.mkPen((90, 90, 90), width=1))
+        self.timeline_candidate_bars = pg.BarGraphItem(x=[0.38, 1.38], height=[0.0, 0.0], width=0.30,
+                                                        brush=pg.mkBrush(35, 150, 85, 225),
+                                                        pen=pg.mkPen((35, 150, 85), width=1))
+        self.timeline_effect_plot.addItem(self.timeline_baseline_bars)
+        self.timeline_effect_plot.addItem(self.timeline_candidate_bars)
+        # The two groups are categorical (EVM and SER), not time samples.
+        # Explicit ticks make the meaning obvious even when the chart has no
+        # valid OFF→ON pair yet.  Keep a small horizontal margin around the
+        # bars so labels never touch the plot frame.
+        self.timeline_effect_plot.getAxis("bottom").setTicks([[
+            (0.19, "EVM"), (1.19, "SER")
+        ]])
+        effect_view = self.timeline_effect_plot.getPlotItem().getViewBox()
+        effect_view.disableAutoRange()
+        effect_view.setXRange(-0.30, 1.70, padding=0)
+        effect_view.setYRange(0.0, 120.0, padding=0)
+        effect_view.sigRangeChangedManually.connect(self._on_effect_range_manually_changed)
+        self.timeline_effect_labels = [
+            pg.TextItem("", anchor=(0.5, 1), color=(55, 55, 55)),
+            pg.TextItem("", anchor=(0.5, 1), color=(55, 55, 55)),
+        ]
+        for _item in self.timeline_effect_labels:
+            # Labels are shown only while a valid pair exists.  In particular,
+            # do not leave an old number on screen after a channel-context
+            # change invalidates the local baseline.
+            _item.setVisible(False)
+            self.timeline_effect_plot.addItem(_item)
+        # A real legend (rather than relying on bar colour alone) keeps the
+        # comparison self-explanatory when the chart is exported or viewed in
+        # grayscale.  It is anchored to the plot canvas and ignored by the
+        # data bounds, so it cannot alter either the categorical range or the
+        # operator's zoom.
+        self.timeline_effect_legend = pg.LegendItem(
+            offset=(8, 8),
+            verSpacing=1,
+            labelTextColor=(55, 55, 55),
+            labelTextSize="8pt",
+            brush=pg.mkBrush(250, 250, 250, 215),
+            pen=pg.mkPen((190, 190, 190), width=1),
+        )
+        self.timeline_effect_legend.setParentItem(self.timeline_effect_plot.getPlotItem())
+        self.timeline_effect_legend.addItem(self.timeline_baseline_bars, "OFF 局部基线（100%）")
+        self.timeline_effect_legend.addItem(self.timeline_candidate_bars, "ON FDIDM（低于100%更好）")
+        self.timeline_ser_curve.setVisible(False)
         self.timeline_evm_curve = self.timeline_evm_plot.plot(
             pen=pg.mkPen(MATLAB_ORANGE, width=2), name="EVM%", connect="finite")
         self.timeline_alpha_curve = self.timeline_ab_plot.plot(
@@ -512,7 +715,11 @@ class FDIDMHardwareTestTab(QWidget):
         self.timeline_beta_curve = self.timeline_ab_plot.plot(
             pen=pg.mkPen(MATLAB_PURPLE, width=1, style=Qt.DashLine), name="β", connect="finite")
         self.timeline_apply_scatter = pg.ScatterPlotItem(
-            size=12, symbol="t", pen=pg.mkPen(None), brush=pg.mkBrush(237, 177, 32, 220))
+            # Blue marker is reserved for an applied action.  Yellow is not
+            # used anywhere in the observation page, avoiding confusion with
+            # the old (removed) vertical toggle marker in the first chart.
+            size=12, symbol="t", pen=pg.mkPen(MATLAB_BLUE, width=1),
+            brush=pg.mkBrush(0, 114, 189, 220))
         self.timeline_ab_plot.addItem(self.timeline_apply_scatter)
         self.constellation_scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(237, 177, 32, 160))
         self.constellation_plot.addItem(self.constellation_scatter)
@@ -541,11 +748,8 @@ class FDIDMHardwareTestTab(QWidget):
     def _sync_combo_to_key(self, combo: QComboBox, key: str):
         idx = self._metric_combo_index_for_key(combo, key)
         if idx >= 0 and combo.currentIndex() != idx:
-            blocker = QSignalBlocker(combo)
-            try:
+            with QSignalBlocker(combo):
                 combo.setCurrentIndex(idx)
-            finally:
-                del blocker
 
     def _on_popup_metric_changed(self):
         popup_combo = getattr(self, "_ab_surface_window_metric_combo", None)
@@ -633,9 +837,19 @@ class FDIDMHardwareTestTab(QWidget):
     def _compact_left_controls(self, panel):
         for combo in panel.findChildren(QComboBox):
             self._compact_combo(combo, 8)
+            combo.setMaximumHeight(28)
         for edit in panel.findChildren((QSpinBox, QDoubleSpinBox)):
             edit.setMinimumWidth(80)
             edit.setMaximumWidth(140)
+            edit.setMaximumHeight(28)
+        for button in panel.findChildren(QPushButton):
+            # Keep the command pad and presets dense while retaining a clear
+            # hit target; advanced controls can still be expanded when needed.
+            button.setMaximumHeight(30)
+        for note_name in ("rf_port_note", "log_status_label"):
+            note = getattr(self, note_name, None)
+            if note is not None:
+                note.setMaximumHeight(32)
 
     def _dspin(self, lo, hi, val, dec, suffix="", step=None):
         s = QDoubleSpinBox()
@@ -668,7 +882,7 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _init_plot_style(self):
         plot_widgets = [self.rx_spectrum_plot, self.evm_plot, self.constellation_plot,
-                        self.timeline_ser_plot, self.timeline_evm_plot, self.timeline_ab_plot]
+                        self.timeline_effect_plot, self.timeline_evm_plot, self.timeline_ab_plot]
         if getattr(self, "ab_surface_fallback_plot", None) is not None:
             plot_widgets.insert(0, self.ab_surface_fallback_plot)
         for p in plot_widgets:
@@ -728,6 +942,72 @@ class FDIDMHardwareTestTab(QWidget):
         self.ab_z_metric_combo.currentIndexChanged.connect(lambda _: self._refresh_ab_surface_only())
         self.rx_plot_combo.currentIndexChanged.connect(lambda _: self._refresh_plots())
 
+    def _toggle_advanced_controls(self, checked: bool):
+        """Keep the operator path compact while exposing the full lab controls on demand."""
+        checked = bool(checked)
+        panel_layout = self.controls_panel.layout()
+        advanced_index = panel_layout.indexOf(self.advanced_group)
+        if checked and advanced_index < 0:
+            # Insert immediately after the toggle checkbox.  Keeping this
+            # widget out of the collapsed layout is important: Qt otherwise
+            # includes a hidden group's child sizeHint in the scroll area's
+            # preferred height.
+            panel_layout.insertWidget(2, self.advanced_group)
+        elif not checked and advanced_index >= 0:
+            panel_layout.removeWidget(self.advanced_group)
+        self.advanced_group.setVisible(checked)
+        self.modem_group.setVisible(checked)
+        self.text_group.setVisible(checked)
+        self.samp_rate_spin.setVisible(bool(checked))
+        self.channel_estimator_combo.setVisible(bool(checked))
+        self.btn_toggle_advanced.setText("收起高级参数" if checked else "显示高级参数")
+        panel_layout.invalidate()
+        panel_layout.activate()
+
+    def _on_antenna_preset(self):
+        if self._current_data(self.device_combo, "USRP B210") != "USRP B210":
+            return
+        self._suppress_param_signals = True
+        try:
+            self.tx_gain_spin.setValue(25.0)
+            self.rx_gain_spin.setValue(45.0)
+        finally:
+            self._suppress_param_signals = False
+        self._log("已应用 B210 A:TX/RX + A:RX2 天线/衰减器预设：TX=25 dB，RX=45 dB")
+        self._schedule_param_apply(0)
+
+    def _on_device_changed(self, *_args):
+        is_b210 = self._current_data(self.device_combo, "USRP B210") == "USRP B210"
+        self.btn_antenna_preset.setEnabled(is_b210)
+        self.rf_port_note.setVisible(is_b210)
+
+    def _sync_alpha_beta_controls_from_status(self, status):
+        """Reflect backend alpha/beta changes without overwriting an unsaved edit."""
+        if not isinstance(status, dict):
+            return
+        try:
+            current = (float(status.get("alpha")), float(status.get("beta")))
+        except (TypeError, ValueError):
+            return
+        if not all(np.isfinite(v) for v in current):
+            return
+        previous = self._last_backend_alpha_beta
+        # A user edit is preserved while the backend still reports the same
+        # pair.  Once the backend pair itself changes (for example after a
+        # validated candidate or rollback), it is authoritative and must be
+        # reflected in the controls.
+        backend_changed = previous is None or any(
+            abs(current[i] - previous[i]) > 1e-9 for i in (0, 1)
+        )
+        if backend_changed:
+            with QSignalBlocker(self.alpha_spin), QSignalBlocker(self.beta_spin):
+                self.alpha_spin.setValue(current[0])
+                self.beta_spin.setValue(current[1])
+        self._last_backend_alpha_beta = current
+
+    def _toggle_advanced_controls_from_mode(self):
+        self._toggle_advanced_controls(self.btn_toggle_advanced.isChecked())
+
     # ---------------- button handlers ----------------
     def _on_connect_clicked(self):
         try:
@@ -768,7 +1048,17 @@ class FDIDMHardwareTestTab(QWidget):
             self._log("v35 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
+            if self.backend is not None:
+                try:
+                    self.backend.stop()
+                    if hasattr(self.backend, "wait"):
+                        self.backend.wait()
+                except Exception:
+                    pass
             self.test_running = False
+            self.btn_start_test.setEnabled(True)
+            self.btn_stop_test.setEnabled(False)
+            self.btn_connect.setEnabled(True)
             self._log(f"开始测试失败: {type(e).__name__}: {e}")
 
     def _on_stop_test_clicked(self):
@@ -917,38 +1207,265 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _clear_timeline(self):
         self._obs_t.clear(); self._obs_ser.clear(); self._obs_evm.clear()
+        self._obs_ser_trend.clear(); self._obs_evm_trend.clear(); self._last_timeline_frame = -1
         self._obs_alpha.clear(); self._obs_beta.clear()
+        # A new observation session starts with a clean effect view.  This is
+        # the one deliberate place where an operator's previous zoom is reset;
+        # subsequent live refreshes preserve any manual y-axis adjustment.
+        self._timeline_effect_user_y_zoom = False
+        self._timeline_effect_range_initialized = False
         self._timeline_apply_points = []
         self.timeline_apply_scatter.setData(x=[], y=[])
-        for item in self._timeline_event_items + self._timeline_anomaly_items:
-            try:
-                self.timeline_ser_plot.removeItem(item)
-            except Exception:
-                pass
+        for item in self._timeline_event_items:
+            for plot in (self.timeline_effect_plot, self.timeline_ab_plot):
+                try: plot.removeItem(item)
+                except Exception: pass
+        for item in self._timeline_anomaly_items:
+            for plot in (self.timeline_effect_plot, self.timeline_evm_plot):
+                try: plot.removeItem(item)
+                except Exception: pass
         self._timeline_event_items = []
         self._timeline_anomaly_items = []
+        self._set_effect_y_range(120.0, force=True)
         self._refresh_timeline_plot()
 
+    def _purge_effect_plot_overlays(self):
+        """Keep the effect chart strictly categorical and overlay-free.
+
+        Older builds put the adaptive-toggle ``InfiniteLine`` on the first
+        chart.  A running Qt process can retain that item until the widget is
+        rebuilt, and a stale line is especially confusing once the chart no
+        longer has a time axis.  The effect view is deliberately limited to
+        its two bar items and their value labels; event lines and anomaly
+        regions belong to the parameter/quality charts only.  Removing any
+        unexpected item here also makes hot-reload and restored UI states safe.
+        """
+        plot_item = self.timeline_effect_plot.getPlotItem()
+        allowed = [self.timeline_baseline_bars, self.timeline_candidate_bars]
+        allowed.extend(getattr(self, "timeline_effect_labels", ()))
+        legend = getattr(self, "timeline_effect_legend", None)
+        if legend is not None:
+            allowed.append(legend)
+        for item in list(getattr(plot_item, "items", ())):
+            if any(item is keep for keep in allowed):
+                continue
+            try:
+                plot_item.removeItem(item)
+            except Exception:
+                # A third-party pyqtgraph item may already have detached while
+                # a queued refresh is running; it is harmless to ignore it.
+                pass
+
+    def _on_effect_range_manually_changed(self, axes):
+        """Remember a user y-axis zoom on the categorical effect chart.
+
+        ``ViewBox.sigRangeChangedManually`` emits the x/y mouse-enabled mask
+        (rather than a single axis index).  Only suppress automatic y-range
+        updates when y was actually part of the gesture; an x-only pan should
+        not prevent the chart from expanding to show a large future ratio.
+        """
+        if self._timeline_effect_setting_range:
+            return
+        try:
+            y_changed = bool(axes[1])
+        except Exception:
+            # Older pyqtgraph releases emitted no mask.  Treat the gesture as
+            # affecting both axes, which is the safe choice for preserving it.
+            y_changed = True
+        if y_changed:
+            self._timeline_effect_user_y_zoom = True
+
+    def _set_effect_y_range(self, ymax: float, *, force: bool = False):
+        """Set a sensible effect-chart range without fighting manual zoom."""
+        try:
+            target = max(120.0, float(ymax))
+        except (TypeError, ValueError):
+            target = 120.0
+        if self._timeline_effect_user_y_zoom and not force:
+            return
+        view = self.timeline_effect_plot.getPlotItem().getViewBox()
+        current = view.viewRange()[1]
+        # Do not issue a range change for every 100 ms frame.  Besides being
+        # expensive, that visibly jitters the chart and erases a user's zoom.
+        if (self._timeline_effect_range_initialized and len(current) == 2
+                and abs(float(current[1]) - target) <= max(1.0, target * 0.02)):
+            return
+        self._timeline_effect_setting_range = True
+        try:
+            self.timeline_effect_plot.setYRange(0.0, target, padding=0)
+            self._timeline_effect_range_initialized = True
+        finally:
+            self._timeline_effect_setting_range = False
+
     def _append_timeline_sample(self, status):
+        frame = int(status.get("frames_processed", 0) or 0)
+        if frame <= 0 or frame == self._last_timeline_frame:
+            return
+        self._last_timeline_frame = frame
         # 时间轴与观测会话共用引擎时钟，保证事件线/异常区与曲线同一时基
         now = self.observer.now()
         ser = float(status.get("measured_ser", np.nan))
         evm = float(status.get("data_aided_evm_percent",
                                status.get("evm_average_percent", status.get("evm_percent", np.nan))))
+        if not bool(status.get("evm_valid", True)):
+            evm = float("nan")
         self._obs_t.append(now - self._obs_t0)
         self._obs_ser.append(math.log10(ser) if np.isfinite(ser) and ser > 0 else np.nan)
         self._obs_evm.append(evm)
+        self._obs_ser_trend.append(self._robust_trend(self._obs_ser))
+        self._obs_evm_trend.append(self._robust_trend(self._obs_evm))
         self._obs_alpha.append(float(status.get("alpha", np.nan)))
         self._obs_beta.append(float(status.get("beta", np.nan)))
         self._refresh_timeline_plot()
         self._refresh_timeline_anomalies()
 
     def _refresh_timeline_plot(self):
+        # Defensive cleanup for sessions created by an older UI build.  It is
+        # intentionally first so no stale yellow/event overlay survives even
+        # when there is not yet a valid local OFF→ON pair.
+        self._purge_effect_plot_overlays()
         ts = list(self._obs_t)
-        self.timeline_ser_curve.setData(ts, list(self._obs_ser))
-        self.timeline_evm_curve.setData(ts, list(self._obs_evm))
-        self.timeline_alpha_curve.setData(ts, list(self._obs_alpha))
-        self.timeline_beta_curve.setData(ts, list(self._obs_beta))
+        pair = self.observer.latest_pair()
+        if pair is not None and pair.comparable:
+            b, a = pair.before, pair.after
+            def ratio(x, y, metric):
+                """Return ON/OFF percentage and a reason when it is unavailable.
+
+                EVM and SER are intentionally evaluated independently.  In a
+                clean link the exact SER count is often zero in both windows;
+                treating ``0/0`` as an invalid *whole pair* used to hide a
+                perfectly valid EVM comparison.  For SER we define the
+                equal-zero case as 100% (no error regression), while a zero
+                baseline with non-zero candidate errors remains explicitly
+                unnormalisable.
+                """
+                try:
+                    x, y = float(x), float(y)
+                except (TypeError, ValueError):
+                    return float("nan"), "unavailable"
+                if not (np.isfinite(x) and np.isfinite(y)) or y < 0.0:
+                    return float("nan"), "unavailable"
+                if metric == "SER" and x == 0.0:
+                    if y == 0.0:
+                        return 100.0, "both_zero"
+                    return float("nan"), "baseline_zero"
+                if x <= 0.0:
+                    return float("nan"), "unavailable"
+                value = y / x * 100.0
+                return (value, "valid") if np.isfinite(value) and value >= 0.0 else (float("nan"), "unavailable")
+
+            metric_values = [
+                ratio(b.evm_mean, a.evm_mean, "EVM"),
+                ratio(b.ser, a.ser, "SER"),
+            ]
+            rel = [value for value, _reason in metric_values]
+            valid = [np.isfinite(value) and value >= 0.0 for value in rel]
+            if any(valid):
+                color = ((35, 150, 85, 225) if pair.outcome == "improved"
+                         else ((190, 70, 70, 225) if pair.outcome == "regressed"
+                               else (145, 145, 145, 210)))
+                # Set both brush and pen on every refresh.  A scalar brush is
+                # required for BarGraphItem to keep a recoloured candidate
+                # filled (per-bar ``brushes`` arrays otherwise retain stale
+                # grey interiors on some pyqtgraph versions).
+                self.timeline_baseline_bars.setOpts(
+                    height=[100.0 if ok else 0.0 for ok in valid],
+                    brush=pg.mkBrush(150, 150, 150, 205),
+                    pen=pg.mkPen((90, 90, 90), width=1))
+                self.timeline_candidate_bars.setOpts(
+                    # Always provide one scalar brush and pen.  This keeps
+                    # every visible candidate bar filled, including when the
+                    # other metric is unavailable (rather than retaining a
+                    # stale grey interior from a previous refresh).
+                    height=[float(value) if ok else 0.0 for value, ok in zip(rel, valid)],
+                    brush=pg.mkBrush(color),
+                    pen=pg.mkPen(color[:3], width=1))
+                for i, (item, (value, reason), ok) in enumerate(
+                        zip(self.timeline_effect_labels, metric_values, valid)):
+                    metric = "EVM" if i == 0 else "SER"
+                    if not ok:
+                        if reason == "baseline_zero":
+                            text = f"{metric}: 基线为0，无法归一化"
+                        else:
+                            text = f"{metric}: 数据不可用"
+                        # Keep an explicit reason visible below the 100% line;
+                        # hiding the label made a valid EVM result look like a
+                        # missing comparison whenever SER was exactly zero.
+                        item.setText(text)
+                        item.setPos(i + 0.19, 14.0)
+                        item.setVisible(True)
+                        continue
+                    change = 100.0 - float(value)
+                    if reason == "both_zero":
+                        change_text = "双方0错误"
+                    elif change > 0.05:
+                        change_text = f"↓{change:.1f}%"
+                    elif change < -0.05:
+                        change_text = f"↑{abs(change):.1f}%"
+                    else:
+                        change_text = "≈0%"
+                    # One compact label per metric states the complete
+                    # comparison; the category ticks below identify the two
+                    # metric groups.  Keep labels centred over the candidate
+                    # bar so they remain readable at narrow window widths.
+                    item.setText(f"{metric}: 100 → {value:.1f}% ({change_text})")
+                    item.setPos(i + 0.19, max(100.0, value) + 4.0)
+                    item.setVisible(True)
+                valid_values = [float(value) for value, ok in zip(rel, valid) if ok]
+                self._set_effect_y_range(max([100.0] + valid_values) * 1.18)
+            else:
+                # Neither metric can be normalised.  Keep an explicit status
+                # label for each one (especially SER baseline=0) while leaving
+                # the bars at zero; silently hiding the labels makes the chart
+                # look as if the refresh failed.
+                self.timeline_baseline_bars.setOpts(
+                    height=[0.0, 0.0],
+                    brush=pg.mkBrush(150, 150, 150, 205),
+                    pen=pg.mkPen((90, 90, 90), width=1))
+                self.timeline_candidate_bars.setOpts(
+                    height=[0.0, 0.0],
+                    brush=pg.mkBrush(145, 145, 145, 180),
+                    pen=pg.mkPen((105, 105, 105), width=1))
+                for i, (item, (_value, reason)) in enumerate(
+                        zip(self.timeline_effect_labels, metric_values)):
+                    metric = "EVM" if i == 0 else "SER"
+                    text = (f"{metric}: 基线为0，无法归一化"
+                            if reason == "baseline_zero"
+                            else f"{metric}: 数据不可用")
+                    item.setText(text)
+                    item.setPos(i + 0.19, 14.0)
+                    item.setVisible(True)
+                self._set_effect_y_range(120.0)
+        elif ts:
+            # A changing RF channel makes a session-start sample an invalid
+            # reference.  Wait for an adjacent local OFF window and do not
+            # leave the previous pair's values on screen.
+            self.timeline_baseline_bars.setOpts(height=[0.0, 0.0])
+            self.timeline_candidate_bars.setOpts(
+                height=[0.0, 0.0],
+                brush=pg.mkBrush(145, 145, 145, 180),
+                pen=pg.mkPen((105, 105, 105), width=1))
+            for item in self.timeline_effect_labels:
+                item.setVisible(False)
+            self._set_effect_y_range(120.0)
+        else:
+            self.timeline_baseline_bars.setOpts(height=[0.0, 0.0])
+            self.timeline_candidate_bars.setOpts(height=[0.0, 0.0])
+            for item in self.timeline_effect_labels:
+                item.setVisible(False)
+        self.timeline_ser_curve.setData(ts, list(self._obs_ser_trend))
+        self.timeline_evm_curve.setData(ts, list(self._obs_evm_trend))
+        self.timeline_alpha_curve.setData(ts, list(self._obs_alpha), stepMode="left")
+        self.timeline_beta_curve.setData(ts, list(self._obs_beta), stepMode="left")
+
+    @staticmethod
+    def _robust_trend(values, window=5):
+        vals = list(values)
+        if not vals or not np.isfinite(vals[-1]):
+            return float("nan")
+        recent = np.asarray(vals[-int(window):], dtype=float)
+        recent = recent[np.isfinite(recent)]
+        return float(np.median(recent)) if recent.size else float("nan")
 
     def _refresh_timeline_anomalies(self):
         drops = self.observer.anomaly_drops()
@@ -956,10 +1473,9 @@ class FDIDMHardwareTestTab(QWidget):
             return
         self._timeline_anomaly_count = len(drops)
         for item in self._timeline_anomaly_items:
-            try:
-                self.timeline_ser_plot.removeItem(item)
-            except Exception:
-                pass
+            for plot in (self.timeline_evm_plot, self.timeline_effect_plot):
+                try: plot.removeItem(item)
+                except Exception: pass
         self._timeline_anomaly_items = []
         t0 = getattr(self, "_obs_t0", 0.0)
         spans = []
@@ -973,7 +1489,7 @@ class FDIDMHardwareTestTab(QWidget):
             region = pg.LinearRegionItem([lo - 0.15, hi + 0.15], movable=False,
                                          brush=pg.mkBrush(255, 0, 0, 35))
             region.setZValue(-10)
-            self.timeline_ser_plot.addItem(region)
+            self.timeline_evm_plot.addItem(region)
             self._timeline_anomaly_items.append(region)
 
     def _add_timeline_event_line(self, enabled, t_abs):
@@ -982,7 +1498,7 @@ class FDIDMHardwareTestTab(QWidget):
         line = pg.InfiniteLine(pos=t_abs - self._obs_t0, angle=90,
                                pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE,
                                             style=Qt.DashLine, width=2))
-        self.timeline_ser_plot.addItem(line)
+        self.timeline_ab_plot.addItem(line)
         self._timeline_event_items.append(line)
 
     def _mark_observation_apply(self, alpha, beta):
@@ -1010,64 +1526,228 @@ class FDIDMHardwareTestTab(QWidget):
                 pass
         def yn(v):
             return "—" if v is None else ("是" if bool(v) else "否")
-        txt = f"α/β={a:.2f}/{b:.2f} | 搜索:{search} | 验证:{valid} | α可观测:{yn(alpha_obs)} | β可观测:{yn(beta_obs)}"
+        search_name = {
+            "disabled": "关闭", "idle": "等待有效信道", "monitoring": "监测中",
+            "optimizing": "搜索中", "waiting_channel": "等待可信信道",
+            "ready": "候选已就绪", "error": "异常",
+        }.get(search, search)
+        valid_name = {
+            "idle": "未验证", "baseline_collecting": "采集 OFF 基线",
+            "candidate_collecting": "采集 ON 候选", "rollback_applying": "回滚基线",
+            "improved": "已确认改善", "regressed": "已确认退化",
+            "inconclusive": "暂不可归因", "rollback_failed": "回滚失败",
+            "aborted": "验证中断",
+        }.get(valid, valid)
+        # Keep the backend enum in parentheses for diagnostics and export
+        # correlation, while making the inline row readable to an operator.
+        search_display = search_name if search_name == search else f"{search_name}（{search}）"
+        valid_display = valid_name if valid_name == valid else f"{valid_name}（{valid}）"
+        txt = (f"自适应过程 | α/β={a:.2f}/{b:.2f} | 搜索:{search_display} | "
+               f"验证:{valid_display} | α可观测:{yn(alpha_obs)} | β可观测:{yn(beta_obs)}")
+        if valid == "aborted":
+            txt += " | 验证中断"
+        elif valid == "rollback_failed":
+            txt += " | 回滚失败"
         reason = str(status.get("adaptive_validation_reason", "") or "")
         if reason:
             txt += f" | {reason[:60]}"
         self.adaptive_state_label.setText(txt)
+        self.adaptive_state_label.setToolTip(
+            f"α可观测={bool(alpha_obs)}；β可观测={bool(beta_obs)}；搜索状态={search}；验证状态={valid}"
+        )
 
-    def _update_observation_display(self):
+    def _update_observation_display(self, *_args):
+        status = _args[0] if _args and isinstance(_args[0], dict) else {}
+
+        def finite_float(value):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return np.nan
+            return number if np.isfinite(number) else np.nan
+
+        def fmt(value, suffix="", precision=".3g"):
+            number = finite_float(value)
+            return "—" if not np.isfinite(number) else f"{format(number, precision)}{suffix}"
+
+        def fmt_count(value):
+            number = finite_float(value)
+            return "—" if not np.isfinite(number) else f"{number:.0f}"
+
         started = bool(self.observer.windows() or self.observer.events())
         state_txt = "进行中" if self.observer.active else ("已结束" if started else "未开始")
         self.observation_state_label.setText(
             f"观测：{state_txt} | 窗口 {len(self.observer.windows())} | 开关事件 {len(self.observer.events())}"
             f" | 剔除 {self.observer.excluded_window_count()} 个异常窗口")
         pair = self.observer.latest_pair()
+        validation = dict(status.get("adaptive_validation", {}) or {})
+        validation_state = str(validation.get("state", "") or status.get("adaptive_validation_state", ""))
+        validation_reason = str(validation.get("result_reason", "") or "")
+        validation_display_applied = False
+        exact_windows_applied = False
+        self.observation_improvement_label.setToolTip("")
+        if validation_state in {"rollback_failed", "aborted", "inconclusive", "improved", "regressed", "candidate_collecting", "baseline_collecting", "rollback_applying"} and validation:
+            measured = dict(validation.get("measured", {}) or {})
+            if validation_state == "rollback_failed":
+                self.observation_improvement_label.setText("回滚失败：请立即停止测试")
+                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#a33b3b;")
+                validation_display_applied = True
+            elif validation_state == "aborted":
+                self.observation_improvement_label.setText("验证中断：未确认回滚")
+                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#a33b3b;")
+                validation_display_applied = True
+            elif validation_state == "inconclusive" and ("pilot" in validation_reason.lower() or "channel" in validation_reason.lower() or "导频" in validation_reason):
+                self.observation_improvement_label.setText("导频条件变化：无法归因")
+                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
+                validation_display_applied = True
+            elif validation_state == "improved":
+                evm_delta = float(measured.get("evm_delta_pp", np.nan))
+                lower = float(measured.get("ser_gain_lower_bound_db", np.nan))
+                if np.isfinite(lower):
+                    self.observation_improvement_label.setText(f"SER ≥{lower:.2f} dB")
+                    self.observation_improvement_label.setToolTip(f"SER 置信区间下界：{lower:.2f} dB")
+                    validation_display_applied = True
+                elif np.isfinite(evm_delta) and evm_delta < 0 and abs(float(measured.get("measured_ser_gain_db", 0.0) or 0.0)) < 1e-9:
+                    self.observation_improvement_label.setText(f"EVM 改善 {abs(evm_delta):.2f} pp")
+                    self.observation_improvement_label.setToolTip(f"解调误差 EVM 改善 {abs(evm_delta):.2f} 个百分点")
+                    validation_display_applied = True
+            elif validation_state in {"candidate_collecting", "baseline_collecting", "rollback_applying"}:
+                # Backend validation is authoritative even before the UI observer
+                # has accumulated a local OFF→ON pair.  Keep the cards useful by
+                # showing the exact windows and an explicit in-progress state.
+                labels = {
+                    "baseline_collecting": "真实链路验证：采集关闭基线",
+                    "candidate_collecting": "真实链路验证：采集候选窗口",
+                    "rollback_applying": "真实链路验证：正在回滚基线",
+                }
+                self.observation_improvement_label.setText(labels[validation_state])
+                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
+                validation_display_applied = True
+            elif validation_state == "inconclusive":
+                self.observation_improvement_label.setText("无法归因：等待同上下文窗口")
+                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
+                validation_display_applied = True
+
+            # The backend may expose exact validation windows before the local
+            # observer has finalized a pair.  Populate the cards/tooltips from
+            # those windows instead of resetting them to placeholders below.
+            baseline = dict(validation.get("baseline_window", {}) or {})
+            candidate = dict(validation.get("candidate_window", {}) or {})
+            if baseline or candidate:
+                exact_windows_applied = True
+                old_a = finite_float(validation.get("old_alpha", 0.0))
+                old_b = finite_float(validation.get("old_beta", 0.0))
+                new_a = finite_float(validation.get("candidate_alpha", 0.0))
+                new_b = finite_float(validation.get("candidate_beta", 0.0))
+                self.observation_before_label.setToolTip(f"局部基线 α/β={old_a:.2f}/{old_b:.2f}")
+                self.observation_after_label.setToolTip(f"候选 α/β={new_a:.2f}/{new_b:.2f}")
+                if baseline:
+                    self.observation_before_label.setText(f"局部 OFF 基线 SER {fmt(baseline.get('ser'))}")
+                if candidate:
+                    self.observation_after_label.setText(f"FDIDM ON 候选 SER {fmt(candidate.get('ser'))}")
+                bevm = baseline.get("data_aided_evm_mean", baseline.get("evm_mean", np.nan))
+                aevm = candidate.get("data_aided_evm_mean", candidate.get("evm_mean", np.nan))
+                self.observation_evm_label.setText(
+                    f"数据辅助EVM {fmt(bevm, '%', '.2f')} → {fmt(aevm, '%', '.2f')}")
+                self.observation_evm_label.setToolTip(
+                    "解调误差 EVM：同一验证周期内，相邻 OFF 基线与 ON 候选的实测值")
+                bk, bn = baseline.get("ser_errors", np.nan), baseline.get("ser_symbols", np.nan)
+                ak, an = candidate.get("ser_errors", np.nan), candidate.get("ser_symbols", np.nan)
+                self.observation_badge_label.setToolTip(
+                    f"基线 SER 错误计数：{fmt_count(bk)}/{fmt_count(bn)}；"
+                    f"候选 SER 错误计数：{fmt_count(ak)}/{fmt_count(an)}")
+                min_frames = fmt_count(validation.get("min_frames"))
+                base_frames = fmt_count(baseline.get("valid_frames"))
+                cand_frames = fmt_count(candidate.get("valid_frames"))
+                self.observation_badge_label.setText(
+                    f"真实 A/B 窗口 · OFF {base_frames} 帧 / ON {cand_frames} 帧 · 最少 {min_frames} 帧")
+                self.observation_badge_label.setStyleSheet("color:#555555; font-weight:600;")
+                if validation_reason:
+                    self.observation_note_label.setText(validation_reason)
         if pair is None:
-            self.observation_before_label.setText("开启前：—")
-            self.observation_after_label.setText("开启后：—")
-            self.observation_improvement_label.setText("SER 改善：—")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#555555;")
-            self.observation_badge_label.setText("可信度：—")
-            self.observation_badge_label.setStyleSheet("")
-            self.observation_note_label.setText("测试启动后自动观测；在线切换自适应以形成前后窗口")
-            self._update_observation_stats()
+            if not validation_display_applied:
+                self.observation_before_label.setText("局部 OFF 基线：—")
+                self.observation_after_label.setText("FDIDM ON 候选：—")
+                self.observation_improvement_label.setText("效果结论：—")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#555555;")
+                self.observation_badge_label.setText("可信度：—")
+                self.observation_badge_label.setStyleSheet("")
+                self.observation_note_label.setText(
+                    "等待同一信道上下文中的相邻 OFF→ON 窗口；不使用启动时固定基线")
+            if not exact_windows_applied:
+                self.observation_before_label.setToolTip("")
+                self.observation_after_label.setToolTip("")
+                self.observation_evm_label.setText("数据辅助EVM：— → —")
+                self.observation_evm_label.setToolTip("解调误差 EVM：等待有效局部配对")
+                self.observation_badge_label.setToolTip("")
+            self._update_observation_stats(validation)
             return
+
         b, a = pair.before, pair.after
-        def fmt(v, suffix=""):
-            v = float(v)
-            return "—" if not np.isfinite(v) else f"{v:.3g}{suffix}"
-        self.observation_before_label.setText(f"开启前 SER {fmt(b.ser)}")
-        self.observation_after_label.setText(f"开启后 SER {fmt(a.ser)}")
-        self.observation_evm_label.setText(
-            f"数据辅助EVM {fmt(b.evm_mean, '%')} → {fmt(a.evm_mean, '%')}"
-            f"（判决EVM {fmt(b.decision_evm_mean, '%')} → {fmt(a.decision_evm_mean, '%')}）")
+        if not exact_windows_applied:
+            self.observation_before_label.setText(f"局部 OFF 基线 SER {fmt(b.ser)}")
+            self.observation_after_label.setText(f"FDIDM ON 候选 SER {fmt(a.ser)}")
+            self.observation_before_label.setToolTip(
+                f"局部基线 α/β={b.alpha_mean:.2f}/{b.beta_mean:.2f}")
+            self.observation_after_label.setToolTip(
+                f"候选 α/β={a.alpha_mean:.2f}/{a.beta_mean:.2f}")
+            self.observation_evm_label.setText(
+                f"数据辅助EVM {fmt(b.evm_mean, '%')} → {fmt(a.evm_mean, '%')}"
+                f"（判决EVM {fmt(b.decision_evm_mean, '%')} → {fmt(a.decision_evm_mean, '%')}）")
+            self.observation_evm_label.setToolTip("解调误差 EVM：数据辅助 EVM 与判决 EVM")
         # 样本不足的窗口不产生改善结论（F3/AC3）
         insufficient = a.grade == "insufficient" or b.grade == "insufficient"
-        if insufficient:
-            self.observation_improvement_label.setText("SER 改善：样本不足")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b8860b;")
-        elif pair.outcome == "improved" and pair.comparable and np.isfinite(pair.ser_improvement_db):
-            self.observation_improvement_label.setText(f"实测优势：{pair.ser_improvement_db:+.2f} dB")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#167c3a;")
-        elif pair.outcome == "regressed":
-            delta = "—" if not np.isfinite(pair.ser_improvement_db) else f"{pair.ser_improvement_db:+.2f} dB"
-            self.observation_improvement_label.setText(f"实测退化：{delta}（候选已回滚）")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#a33b3b;")
-        elif np.isfinite(pair.ser_improvement_db):
-            self.observation_improvement_label.setText(f"无结论（SER变化 {pair.ser_improvement_db:+.2f} dB）")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
-        else:
-            self.observation_improvement_label.setText("无结论")
-            self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
-        badge_map = {"trusted": ("可信", "#167c3a"), "reference": ("参考", "#777777"),
-                     "insufficient": ("样本不足", "#b8860b")}
-        name, color = badge_map.get(a.grade, ("—", "#333333"))
-        count_mark = "估算" if a.estimated_k else "精确"
-        k_mark = "≈" if a.estimated_k else ""
-        self.observation_badge_label.setText(
-            f"{name} · {count_mark}计数（{k_mark}{a.ser_k:.0f}/{a.ser_n} 符号错误 · {a.frames} 帧）")
-        self.observation_badge_label.setStyleSheet(f"color:{color}; font-weight:600;")
+        waveform_changed = not (
+            np.isclose(b.alpha_mean, a.alpha_mean, rtol=0.0, atol=1e-6)
+            and np.isclose(b.beta_mean, a.beta_mean, rtol=0.0, atol=1e-6)
+        )
+        if not validation_display_applied:
+            # A changed SER/EVM is still a valid measured result even when the
+            # operator reused the same alpha/beta values.  Only call out
+            # "未切换候选波形" for an otherwise inconclusive pair; this keeps
+            # the collecting/insufficient state distinct from a real result.
+            if insufficient:
+                self.observation_improvement_label.setText("SER 改善：样本不足")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#b8860b;")
+            elif pair.outcome == "improved" and pair.comparable and np.isfinite(pair.ser_improvement_db):
+                self.observation_improvement_label.setText(
+                    f"实测优势：{pair.ser_improvement_db:+.2f} dB")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#167c3a;")
+            elif pair.outcome == "regressed":
+                delta = ("—" if not np.isfinite(pair.ser_improvement_db)
+                         else f"{pair.ser_improvement_db:+.2f} dB")
+                self.observation_improvement_label.setText(
+                    f"实测退化：{delta}（候选已回滚）")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#a33b3b;")
+            elif not waveform_changed and pair.outcome == "inconclusive":
+                delta = ("—" if not np.isfinite(pair.ser_improvement_db)
+                         else f"{pair.ser_improvement_db:+.2f} dB")
+                self.observation_improvement_label.setText(
+                    f"无结论：未切换候选波形（SER变化 {delta}）")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#b06a00;")
+            elif np.isfinite(pair.ser_improvement_db):
+                self.observation_improvement_label.setText(
+                    f"无结论（SER变化 {pair.ser_improvement_db:+.2f} dB）")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#b06a00;")
+            else:
+                self.observation_improvement_label.setText("无结论")
+                self.observation_improvement_label.setStyleSheet(
+                    "font-size: 15px; font-weight: 600; color:#b06a00;")
+        if not exact_windows_applied:
+            badge_map = {"trusted": ("可信", "#167c3a"), "reference": ("参考", "#777777"),
+                         "insufficient": ("样本不足", "#b8860b")}
+            name, color = badge_map.get(a.grade, ("—", "#333333"))
+            count_mark = "估算" if a.estimated_k else "精确"
+            k_mark = "≈" if a.estimated_k else ""
+            self.observation_badge_label.setText(
+                f"{name} · {count_mark}计数（{k_mark}{a.ser_k:.0f}/{a.ser_n} 符号错误 · {a.frames} 帧）")
+            self.observation_badge_label.setStyleSheet(f"color:{color}; font-weight:600;")
         notes = []
         if insufficient:
             notes.append("每段需累计 ≥10 个错误符号才形成结论，≥100 为可信（继续运行积累）")
@@ -1077,17 +1757,31 @@ class FDIDMHardwareTestTab(QWidget):
             notes.append(f"{pair.comparability_note}（可比性受限，结论仅供参考）")
         if pair.validation_reason:
             notes.append(pair.validation_reason)
+        if validation_reason and validation_reason not in notes:
+            notes.append(validation_reason)
         self.observation_note_label.setText("；".join(notes))
-        self._update_observation_stats()
+        self._update_observation_stats(validation)
 
-    def _update_observation_stats(self):
+    def _update_observation_stats(self, validation=None):
         """观测页签右下角统计表：最近窗口的汇总数字。"""
+        validation = dict(validation or {})
+
+        def finite_float_for_stats(value):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return np.nan
+            return number if np.isfinite(number) else np.nan
+
         name_map = {MODE_ON: "开启后", MODE_OFF: "开启前"}
         wins = self.observer.windows()
-        if not wins:
+        if not wins and not validation:
             self.observation_stats_label.setText("开始观测后此处显示各窗口汇总")
+            self.observation_stats_label.setToolTip(
+                "动态信道采用相邻 OFF→ON 局部基线；raw/FEC BER 与功率合同将在采样后显示")
             return
-        lines = []
+        lines = ["固定基线：否（动态信道采用相邻 OFF→ON 局部基线）"]
+        detail_lines = ["raw/FEC BER 与功率合同明细："]
         for w in wins[-4:]:
             agg = w.aggregate
             label = name_map.get(w.mode, w.mode)
@@ -1106,10 +1800,41 @@ class FDIDMHardwareTestTab(QWidget):
                     f"k/n={agg.ser_k:.0f}/{agg.ser_n}（{'估算' if agg.estimated_k else '精确'}）\n"
                     f"95%区间 [{agg.wilson_low:.3g}, {agg.wilson_high:.3g}]｜"
                     f"数据EVM {agg.evm_mean:.3g}%｜判决EVM {agg.decision_evm_mean:.3g}%｜"
-                    f"raw/FEC BER {agg.raw_ber:.3g}/{agg.fec_ber:.3g}｜CRC {100.0 * agg.crc_ok_ratio:.1f}%\n"
-                    f"周期/数据RMS {agg.tx_cycle_rms_mean:.4g}/{ctx_num('tx_data_rms', '.4g')}｜"
-                    f"peak {ctx_num('tx_peak', '.4g')}｜PAPR {ctx_num('tx_papr_db', '.2f')} dB｜"
-                    f"回退 {ctx_num('tx_power_backoff_db', '.2f')} dB｜合同 {agg.tx_power_contract_id or '不可用'}")
+                    f"CRC {100.0 * agg.crc_ok_ratio:.1f}%")
+                detail_lines.append(
+                    f"{label}: raw/FEC BER={agg.raw_ber:.3g}/{agg.fec_ber:.3g}; "
+                    f"contract={agg.tx_power_contract_id or '不可用'}; "
+                    f"周期/数据RMS={agg.tx_cycle_rms_mean:.4g}/{ctx_num('tx_data_rms', '.4g')}; "
+                    f"peak={ctx_num('tx_peak', '.4g')}; PAPR={ctx_num('tx_papr_db', '.2f')} dB; "
+                    f"回退={ctx_num('tx_power_backoff_db', '.2f')} dB")
+
+        if validation:
+            baseline = dict(validation.get("baseline_window", {}) or {})
+            candidate = dict(validation.get("candidate_window", {}) or {})
+
+            def window_line(label, window):
+                if not window:
+                    return f"{label}｜等待采集"
+                k = finite_float_for_stats(window.get("ser_errors"))
+                n = finite_float_for_stats(window.get("ser_symbols"))
+                count = ("—/—" if not (np.isfinite(k) and np.isfinite(n))
+                         else f"{k:.0f}/{n:.0f}")
+                ser = finite_float_for_stats(window.get("ser"))
+                evm = finite_float_for_stats(
+                    window.get("data_aided_evm_mean", window.get("evm_mean")))
+                frames = finite_float_for_stats(window.get("valid_frames"))
+                return (
+                    f"{label}｜{('—' if not np.isfinite(frames) else f'{frames:.0f}')}帧｜"
+                    f"SER {('—' if not np.isfinite(ser) else f'{ser:.3g}')}｜k/n={count}｜"
+                    f"数据EVM {('—' if not np.isfinite(evm) else f'{evm:.2f}%')}")
+
+            lines.extend((window_line("验证 OFF", baseline), window_line("验证 ON", candidate)))
+            reason = str(validation.get("result_reason", "") or "")
+            if reason:
+                lines.append(f"验证说明｜{reason}")
+            contract_id = dict(validation.get("contract", {}) or {}).get("contract_id", "不可用")
+            detail_lines.append(f"后端真实 A/B 窗口: raw/FEC BER=按帧累计; contract={contract_id}")
+
         pair = self.observer.latest_pair()
         if pair is not None:
             gain = "—" if not np.isfinite(pair.ser_improvement_db) else f"{pair.ser_improvement_db:+.2f} dB"
@@ -1118,6 +1843,7 @@ class FDIDMHardwareTestTab(QWidget):
                 f"{'功率/上下文可比' if pair.comparable else pair.comparability_note}｜"
                 f"剔除窗口 {self.observer.excluded_window_count()}")
         self.observation_stats_label.setText("\n".join(lines))
+        self.observation_stats_label.setToolTip("\n".join(detail_lines))
 
     def _on_adaptive_enable_changed(self, state):
         enabled = bool(state)
@@ -1126,13 +1852,6 @@ class FDIDMHardwareTestTab(QWidget):
             event = self.observer.on_toggle(enabled, self.alpha_spin.value(), self.beta_spin.value())
             if event is not None:
                 self._add_timeline_event_line(enabled, event.t)
-                try:
-                    marker = pg.InfiniteLine(pos=max(0, self._evm_index), angle=90,
-                                             pen=pg.mkPen(MATLAB_BLUE if enabled else MATLAB_ORANGE, style=Qt.DashLine, width=1))
-                    self.evm_plot.addItem(marker)
-                    self._adaptive_toggle_markers.append(marker)
-                except Exception:
-                    pass
                 self._log(f"手动{'开启' if enabled else '关闭'} α/β 自适应，观测窗口已切换。")
             elif self.observer.active:
                 self._log(f"自适应已保持{'开启' if enabled else '关闭'}；状态未变化，未新建观测窗口。")
@@ -1292,6 +2011,14 @@ class FDIDMHardwareTestTab(QWidget):
         except Exception as e:
             self._log(f"应用参数失败: {type(e).__name__}: {e}")
             self.test_running = False
+            try:
+                self.backend.stop()
+                if hasattr(self.backend, "wait"):
+                    self.backend.wait()
+            except Exception:
+                pass
+            self.btn_start_test.setEnabled(True)
+            self.btn_stop_test.setEnabled(False)
         finally:
             self._applying_params = False
             if self._pending_apply:
@@ -1330,11 +2057,21 @@ class FDIDMHardwareTestTab(QWidget):
         if self.backend is not None and not self._suppress_param_signals and self.auto_apply_check.isChecked():
             self._schedule_param_apply(0)
 
-    def _on_channel_mode_changed(self, *_args):
-        # All v33 channel modes traverse the USRP RF path, so diag-TF is the
-        # safe default whenever the path selection changes.  Block the estimator
-        # signal so one channel-mode click cannot produce two stop/config/start cycles.
-        target = "diag_tf"
+    def _update_channel_param_visibility(self):
+        """Show TDL parameters only for a link mode that actually uses TDL."""
+        mode = self._selected_channel_mode()
+        has_tdl = mode != "rf"
+        for widget in (
+            self.tdl_ds_label, self.tdl_ds_spin,
+            self.tdl_fd_label, self.tdl_fd_spin,
+            self.tdl_spread_label, self.tdl_spread_spin,
+            self.tdl_snr_label, self.tdl_snr_spin,
+        ):
+            widget.setVisible(has_tdl)
+
+        # The parametric estimator is the meaningful choice for the software
+        # TDL leg.  RF-only keeps the fast diagonal estimator as its default.
+        target = "tdl_param" if has_tdl else "diag_tf"
         blocker = QSignalBlocker(self.channel_estimator_combo)
         try:
             for i in range(self.channel_estimator_combo.count()):
@@ -1343,6 +2080,12 @@ class FDIDMHardwareTestTab(QWidget):
                     break
         finally:
             del blocker
+
+    def _on_channel_mode_changed(self, *_args):
+        # Keep the controls and the estimator choice synchronized with the
+        # selected RF/TDL path.  Block the estimator signal so one click does
+        # not produce two stop/config/start cycles.
+        self._update_channel_param_visibility()
         if self.backend is not None and self.auto_apply_check.isChecked():
             self._schedule_param_apply(250)
         elif self.backend is not None:
@@ -1372,6 +2115,7 @@ class FDIDMHardwareTestTab(QWidget):
             return
         try:
             status = self.backend.get_status(); stats = self.backend.get_decode_stats()
+            self._sync_alpha_beta_controls_from_status(status)
             self.observer.on_sample(status)
             if self.observer.active:
                 self._append_timeline_sample(status)
@@ -1390,7 +2134,7 @@ class FDIDMHardwareTestTab(QWidget):
             stale = bool(status.get("rx_spectrum_stale", True)); age = float(status.get("rx_spectrum_stale_sec", np.nan))
             self.rx_spectrum_plot.setTitle(f"RX频谱[{self._selected_rx_spectrum_source()}] stale={stale} age={age:.1f}s")
             self._update_evm_plot(float(status.get("evm_percent", np.nan)))
-            self.evm_plot.setTitle("EVM 曲线（虚线标记自适应切换）" if self.observer.active else "EVM 曲线")
+            self.evm_plot.setTitle("EVM 曲线")
             const = self.backend.get_rx_constellation(512, source=self._current_data(self.const_mode_combo, "post_equalized"))
             if const is not None and len(const) > 0:
                 self.constellation_scatter.setData(x=np.real(const), y=np.imag(const))
@@ -1597,32 +2341,51 @@ class FDIDMHardwareTestTab(QWidget):
         snr = float(status.get("adaptive_predicted_snr_db", np.nan))
         predicted_current = float(status.get("adaptive_predicted_ser_current", np.nan))
         predicted_best = float(status.get("adaptive_predicted_ser_best", np.nan))
-        step = float(status.get("adaptive_active_step", np.nan))
-        direction = str(status.get("adaptive_selected_direction", "none"))
         stable = int(status.get("adaptive_stable_count", 0))
         required = int(status.get("adaptive_stable_required", 0))
         source = str(status.get("adaptive_htf_source", ""))
         ready = bool(status.get("adaptive_alpha_beta_ready", False))
         seq = int(status.get("adaptive_recommendation_seq", 0))
+        validation_state = str(status.get("adaptive_validation_state", "") or "")
 
         if label is not None:
             if not enabled:
                 label.setText("自适应：关闭")
+            elif validation_state == "baseline_collecting":
+                label.setText("真实链路验证：采集关闭基线；暂不应用新候选")
+            elif validation_state == "candidate_collecting":
+                label.setText("真实链路验证：采集候选窗口；暂不应用新候选")
+            elif validation_state == "rollback_applying":
+                label.setText("真实链路验证：正在回滚基线；暂不应用新候选")
+            elif validation_state == "rollback_failed":
+                label.setText("真实链路验证：回滚失败；请立即停止测试")
             elif err:
-                label.setText(f"自适应：{state}；{err}")
+                state_name = {
+                    "idle": "等待有效信道", "monitoring": "监测中",
+                    "optimizing": "搜索中", "waiting_channel": "等待可信信道",
+                }.get(state, state)
+                label.setText(f"自适应：{state_name}；{err}")
             elif np.isfinite(rec_a) and np.isfinite(rec_b):
                 gain_txt = "nan" if not np.isfinite(gain) else f"{gain:.2f}dB"
                 snr_txt = "nan" if not np.isfinite(snr) else f"{snr:.1f}dB"
                 ser_txt = ("不可用" if not (np.isfinite(predicted_current) and np.isfinite(predicted_best))
                            else f"{predicted_current:.3g}→{predicted_best:.3g}")
                 label.setText(
-                    f"自适应：{state}；推荐 α/β={rec_a:.2f}/{rec_b:.2f}；"
-                    f"预测SER={ser_txt}；预测增益={gain_txt}；预测模型SNR={snr_txt}；"
+                    f"自适应：{({'idle': '等待有效信道', 'monitoring': '监测中', 'optimizing': '搜索中', 'waiting_channel': '等待可信信道'}.get(state, state))}；"
+                    f"推荐 α/β={rec_a:.2f}/{rec_b:.2f}；"
+                    f"预测SER={ser_txt}；预计改善 {gain_txt}；预测模型SNR={snr_txt}；"
                     f"稳定={stable}/{required}；CSI={source}"
                 )
             else:
-                label.setText(f"自适应：{state}，等待有效 H_TF")
+                state_name = {
+                    "idle": "等待有效信道", "monitoring": "监测中",
+                    "optimizing": "搜索中", "waiting_channel": "等待可信信道",
+                }.get(state, state)
+                label.setText(f"自适应：{state_name}，等待可信信道估计；检查 CRC")
+            label.setToolTip(f"预测SER={predicted_current:.3g}→{predicted_best:.3g}；预测SNR={snr:.1f}dB")
 
+        if validation_state in {"baseline_collecting", "candidate_collecting", "rollback_applying", "rollback_failed"}:
+            return
         if (not enabled or not ready or not self.adaptive_auto_apply_check.isChecked()
                 or seq <= int(self._last_adaptive_recommendation_seq)):
             return
@@ -1693,6 +2456,10 @@ class FDIDMHardwareTestTab(QWidget):
             f"const={status.get('constellation_source','none')}, "
             f"ABauto={status.get('adaptive_alpha_beta_state','off')}, RXoverflow={int(status.get('rx_overflow_count',0))}"
         )
+        if not bool(status.get("preamble_reliable", True)):
+            detail = "未检测到可靠 FDIDM 前导；" + detail
+        if not bool(status.get("evm_valid", True)):
+            detail = detail.replace(f"数据EVM={data_evm}%", "数据EVM=不可用%")
         self.decode_status_label.setText(detail)
         self.decode_status_label.setToolTip(detail)
 

@@ -1,5 +1,6 @@
 import numpy as np
 import threading
+import time
 
 from scripts.validate_alpha_beta_adaptation import AdaptiveKernel
 from waveform_sim.hardware.evidence import TxPowerContract, TxPowerMetrics
@@ -66,6 +67,52 @@ def test_failed_coarse_move_arms_fine_step():
     assert result["next_active_step"] == 0.05
 
 
+def test_ofdm_reset_uses_bounded_global_exploration():
+    kernel = AdaptiveKernel()
+    kernel._adaptive_active_step = 0.25
+    h = np.ones((4, 4), dtype=np.complex128)
+    h[:, 0] *= 0.2
+    h[:, 1] *= 0.8
+    h[:, 2] *= 1.4
+    h[:, 3] *= 2.0
+    result = kernel._optimize_alpha_beta_snapshot(_snapshot(h, alpha=0.0, beta=0.0))
+    assert result["search_mode"] == "diag_global_grid"
+    assert 5 < result["candidate_count"] <= 29
+
+
+def test_real_link_rejection_excludes_predicted_best_from_next_search():
+    kernel = AdaptiveKernel()
+    kernel._adaptive_active_step = 0.25
+    h = np.ones((4, 4), dtype=np.complex128)
+    h[:, 0] *= 0.2
+    h[:, 1] *= 0.8
+    h[:, 2] *= 1.4
+    h[:, 3] *= 2.0
+    snapshot = _snapshot(h, alpha=0.0, beta=0.0)
+    first = kernel._optimize_alpha_beta_snapshot(snapshot)
+    rejected = (first["recommended_alpha"], first["recommended_beta"])
+    assert rejected != (0.0, 0.0)
+
+    snapshot["rejected_pairs"] = (rejected,)
+    second = kernel._optimize_alpha_beta_snapshot(snapshot)
+    assert (second["recommended_alpha"], second["recommended_beta"]) != rejected
+    assert second["rejected_candidate_count"] == 1
+
+
+def test_full_channel_ofdm_reset_explores_bounded_distant_anchors():
+    kernel = AdaptiveKernel()
+    kernel._adaptive_active_step = 0.25
+    h = np.ones((4, 4), dtype=np.complex128)
+    h[:, 0] *= 0.2
+    h[:, 2] *= 1.8
+    snapshot = _snapshot(np.diag(h.reshape(-1, order="F")), alpha=0.0, beta=0.0)
+    snapshot["htf_kind"] = "full"
+    result = kernel._optimize_alpha_beta_snapshot(snapshot)
+    assert result["search_mode"] == "full_global_anchors"
+    assert 5 < result["candidate_count"] <= 13
+    assert np.isfinite(result["predicted_ser_current"])
+
+
 class ValidationHarness(FDIDMAdaptiveMixin):
     ALPHA_BETA_SIGNALING_MODE = "shared_memory"
 
@@ -95,6 +142,7 @@ class ValidationHarness(FDIDMAdaptiveMixin):
         self.adaptive_alpha_beta_integer_margin_db = 0.1
         self.adaptive_alpha_beta_max_order = 512
         self._frames_processed = 0
+        self._lock = threading.RLock()
         self._adaptive_ab_lock = threading.RLock()
         self._adaptive_ab_state = "idle"
         self._adaptive_ab_recommendation = {}
@@ -220,6 +268,8 @@ def test_validation_inconclusive_at_max_frames_rolls_back():
     assert validation["rollback_complete"]
     assert harness.alpha == 0.5 and harness.beta == 1.0
     assert "overlap" in validation["result_reason"]
+    assert (0.75, 0.8) in harness._adaptive_ab_rejected_pairs
+    assert harness._adaptive_ab_failed_until_frame >= harness._frames_processed + 64
 
 
 def test_validation_regressed_rolls_back():
@@ -230,9 +280,47 @@ def test_validation_regressed_rolls_back():
     _settle(harness)
     _collect(harness, 24, errors=40, evm=12.0)
     validation = harness._adaptive_ab_validation
+    assert (0.75, 0.8) in harness._adaptive_ab_rejected_pairs
+    assert harness._adaptive_ab_failed_until_frame >= harness._frames_processed + 64
     assert validation["state"] == "regressed"
     assert validation["rollback_complete"]
     assert harness.alpha == 0.5 and harness.beta == 1.0
+
+
+def test_manual_context_reset_clears_real_link_rejection():
+    harness = ValidationHarness()
+    harness._adaptive_ab_rejected_context = harness._alpha_beta_adaptation_context_key()
+    harness._adaptive_ab_rejected_pairs = {(0.75, 0.8): 42}
+    harness._adaptive_ab_failed_until_frame = 106
+
+    harness._invalidate_alpha_beta_adaptation("configure_alpha_beta_changed")
+
+    assert harness._adaptive_ab_rejected_pairs == {}
+    assert harness._adaptive_ab_failed_until_frame < 0
+
+
+def test_pilot_instability_rolls_back_early_without_blacklisting_candidate():
+    harness = ValidationHarness()
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    _settle(harness)
+    for _ in range(24):
+        _validation_sample(
+            harness, 10, evm=16.0,
+            pilot_fit_nmse=0.047, pilot_fitted_power=0.1,
+        )
+    _settle(harness)
+    for _ in range(24):
+        _validation_sample(
+            harness, 40, evm=30.0,
+            pilot_fit_nmse=0.090, pilot_fitted_power=0.1,
+        )
+
+    validation = harness._adaptive_ab_validation
+    assert validation["state"] == "inconclusive"
+    assert validation["rollback_complete"] is True
+    assert "pilot fit changed" in validation["result_reason"]
+    assert (0.75, 0.8) not in getattr(harness, "_adaptive_ab_rejected_pairs", {})
+    assert harness._adaptive_ab_failed_until_frame >= harness._frames_processed + 64
 
 
 def test_validation_drops_overflow_and_sync_samples():
@@ -268,9 +356,28 @@ def test_validation_invalidation_cancels_old_generation():
     harness.apply_alpha_beta_candidate(0.75, 0.8)
     generation = harness._adaptive_ab_validation["apply_generation"]
     harness._invalidate_alpha_beta_adaptation("hardware_stop")
-    assert harness._adaptive_ab_validation["state"] == "inconclusive"
+    assert harness._adaptive_ab_validation["state"] == "aborted"
+    assert harness._adaptive_ab_validation["outcome"] == "aborted"
+    assert harness._adaptive_ab_validation["rollback_complete"] is False
     assert harness._adaptive_ab_validation["apply_generation"] > generation
     assert "hardware_stop" in harness._adaptive_ab_validation["result_reason"]
+
+
+def test_candidate_phase_invalidation_never_claims_baseline_restored():
+    harness = ValidationHarness()
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    _settle(harness)
+    _collect(harness, 24, errors=20, evm=12.0)
+    assert harness._adaptive_ab_validation["state"] == "candidate_settling"
+    assert harness.alpha == 0.75 and harness.beta == 0.8
+
+    harness._invalidate_alpha_beta_adaptation("adaptive_config_changed")
+    validation = harness._adaptive_ab_validation
+    assert validation["state"] == validation["outcome"] == "aborted"
+    assert validation["aborted_from_state"] == "candidate_settling"
+    assert validation["rollback_complete"] is False
+    assert "baseline was not restored" in validation["result_reason"]
+    assert harness.alpha == 0.75 and harness.beta == 0.8
 
 
 def test_validation_status_is_public_and_contains_window_progress():
@@ -282,3 +389,137 @@ def test_validation_status_is_public_and_contains_window_progress():
     assert status["validation_state"] == "baseline_collecting"
     assert status["validation"]["baseline_window"]["valid_frames"] == 4
     assert status["validation"]["contract"]["contract_id"] == "test-contract"
+
+
+def test_active_validation_cannot_be_replaced_by_a_new_recommendation():
+    harness = ValidationHarness()
+    first = harness.apply_alpha_beta_candidate(0.75, 0.8, recommendation_seq=1)
+    second = harness.apply_alpha_beta_candidate(1.0, 1.0, recommendation_seq=2)
+    assert first["state"] == "baseline_settling"
+    assert second["busy"] is True
+    validation = harness._adaptive_ab_validation
+    assert validation["recommendation_seq"] == 1
+    assert validation["candidate_alpha"] == 0.75
+
+
+def test_manual_evaluate_is_rejected_during_active_validation():
+    harness = ValidationHarness()
+    harness._adaptive_ab_last_snapshot = _snapshot(np.ones((4, 4), complex))
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    assert harness.request_alpha_beta_adaptation() is False
+
+
+def test_validation_watchdog_releases_stalled_baseline_and_rolls_back():
+    harness = ValidationHarness()
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    validation = harness._adaptive_ab_validation
+    validation["phase_started_wall"] = time.monotonic() - 31.0
+    harness._watchdog_alpha_beta_validation(attempted=False)
+
+    assert validation["state"] == "inconclusive"
+    assert validation["rollback_complete"] is True
+    assert "timed out" in validation["result_reason"]
+    assert harness.alpha == 0.5 and harness.beta == 1.0
+
+
+def test_candidate_sync_loss_is_regression_and_arms_cooldown():
+    harness = ValidationHarness()
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    _settle(harness)
+    _collect(harness, 24, errors=20, evm=12.0)
+    _settle(harness)
+    harness._frames_processed = 77
+    validation = harness._adaptive_ab_validation
+    validation["phase_started_wall"] = time.monotonic() - 31.0
+    harness._watchdog_alpha_beta_validation(attempted=True, reason="preamble_score_low")
+
+    assert validation["state"] == "regressed"
+    assert validation["rollback_complete"] is True
+    assert "lost reliable synchronization" in validation["result_reason"]
+    assert harness._adaptive_ab_last_applied_frame == 77
+
+
+def test_rollback_applying_is_a_single_flight_busy_state():
+    assert FDIDMAdaptiveMixin._validation_active_state("rollback_applying") is True
+    assert FDIDMAdaptiveMixin._validation_active_state("rollback_failed") is True
+
+
+def test_live_sync_failure_rolls_back_without_claiming_candidate_applied():
+    harness = ValidationHarness()
+    attempts = []
+
+    def sync_waveform():
+        attempts.append((harness.alpha, harness.beta))
+        if len(attempts) == 1:
+            raise RuntimeError("streaming swap failed")
+
+    harness._sync_waveform_to_top_block = sync_waveform
+    result = harness.apply_alpha_beta_candidate(0.75, 0.8)
+
+    assert attempts == [(0.5, 1.0), (0.5, 1.0)]
+    assert result["state"] == "inconclusive"
+    assert harness._adaptive_ab_validation["rollback_complete"] is True
+    assert harness.alpha == 0.5 and harness.beta == 1.0
+
+
+def test_rollback_sync_failure_remains_busy_and_never_claims_completion():
+    harness = ValidationHarness()
+    harness._sync_waveform_to_top_block = lambda: (_ for _ in ()).throw(RuntimeError("UHD unavailable"))
+
+    result = harness.apply_alpha_beta_candidate(0.75, 0.8)
+    validation = harness._adaptive_ab_validation
+
+    assert result["state"] == "rollback_failed"
+    assert validation["rollback_complete"] is False
+    assert "UHD unavailable" in validation["rollback_error"]
+    assert harness.apply_alpha_beta_candidate(1.0, 1.0)["busy"] is True
+
+
+def test_live_waveform_publish_uses_receiver_then_adaptive_lock_order():
+    harness = ValidationHarness()
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    validation = harness._adaptive_ab_validation
+    validation["state"] = "candidate_applying"
+    validation["apply_generation"] += 1
+    generation = validation["apply_generation"]
+
+    def sync_waveform():
+        with harness._lock:
+            pass
+
+    harness._sync_waveform_to_top_block = sync_waveform
+    with harness._lock:
+        worker = threading.Thread(
+            target=harness._publish_validation_waveform,
+            args=("candidate", generation),
+            daemon=True,
+        )
+        worker.start()
+        time.sleep(0.03)
+        # The worker must not own the adaptive lock while waiting for the RX
+        # lock.  Otherwise the monitor's RX -> adaptive path deadlocks here.
+        acquired = harness._adaptive_ab_lock.acquire(timeout=0.5)
+        if acquired:
+            harness._adaptive_ab_lock.release()
+    worker.join(timeout=1.0)
+    assert acquired is True
+    assert not worker.is_alive()
+
+
+def test_untrusted_csi_never_enters_optimizer_queue():
+    harness = ValidationHarness()
+    harness.adaptive_alpha_beta_min_sync_metric = 0.30
+    harness.adaptive_alpha_beta_require_good_frame = False
+    harness._ensure_alpha_beta_adaptation_worker = lambda: None
+    harness._maybe_queue_alpha_beta_adaptation(
+        h_tf_est=np.ones((16, 16), dtype=np.complex128),
+        htf_kind="diag",
+        htf_source="diag_tf",
+        noise_var=0.1,
+        sync_metric=0.8,
+        good_quality=False,
+        csi_trustworthy=False,
+        csi_quality_reason="pilot fit NMSE 0.998",
+    )
+    assert "csi_quality_gate" in harness._adaptive_ab_last_skip_reason
+    assert harness._adaptive_ab_snapshot is None

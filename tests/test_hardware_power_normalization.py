@@ -101,6 +101,139 @@ def test_known_reference_uses_only_common_coded_prefix(backend_factory):
     assert backend._last_known_symbol_metrics.data_aided_evm_percent == pytest.approx(0.0, abs=1e-8)
 
 
+@pytest.mark.parametrize("alpha,beta", [(0.0, 0.0), (0.5, 1.0), (1.0, 1.0)])
+def test_complete_receiver_chain_decodes_ideal_waveform_with_near_zero_evm(
+    backend_factory, alpha, beta
+):
+    backend = backend_factory(alpha=alpha, beta=beta, tx_text="FDIDM OK")
+    rx = np.tile(backend._tx_waveform, 2).astype(np.complex128)
+    backend._try_process_rx_window(rx, rx.size)
+    status = backend.get_status()
+
+    assert status["preamble_reliable"] is True
+    assert status["frames_processed"] == 1
+    assert status["frames_decode_ok"] == 1
+    assert status["decode_ok"] is True
+    assert status["measured_ser"] == pytest.approx(0.0)
+    assert status["data_aided_evm_percent"] < 1e-3
+
+
+def test_complete_receiver_chain_handles_attenuation_noise_and_cfo(backend_factory):
+    """Exercise the receiver numerics without claiming a real RF measurement."""
+    backend = backend_factory(alpha=0.5, beta=1.0, tx_text="FDIDM OK", samp_rate=500_000)
+    tx = np.tile(backend._tx_waveform.astype(np.complex128), 3)
+    index = np.arange(tx.size, dtype=np.float64)
+    faded = 0.01 * tx * np.exp(1j * (0.3 + 2.0 * np.pi * 120.0 * index / backend.sample_rate))
+    rng = np.random.default_rng(20260913)
+    sigma = signal_rms(faded) / (10.0 ** (25.0 / 20.0))
+    noise = sigma / np.sqrt(2.0) * (rng.standard_normal(tx.size) + 1j * rng.standard_normal(tx.size))
+    rx = faded + noise
+
+    backend._try_process_rx_window(rx, rx.size)
+    status = backend.get_status()
+
+    assert status["preamble_reliable"] is True
+    assert status["decode_ok"] is True
+    assert status["data_aided_evm_percent"] < 20.0
+
+
+def test_failed_candidate_does_not_poison_cfo_tracking(backend_factory, monkeypatch):
+    backend = backend_factory(alpha=0.5, beta=1.0, tx_text="FDIDM OK")
+    rx = np.tile(backend._tx_waveform, 2).astype(np.complex128)
+    recover = backend._recover_payload_from_symbols
+
+    def force_bad_candidate(symbols):
+        _ber, raw, _payload, _text, _match, _ok, cloud, _evm = recover(symbols)
+        return 0.5, raw, b"", "", 0, False, cloud, 500.0
+
+    monkeypatch.setattr(backend, "_recover_payload_from_symbols", force_bad_candidate)
+    backend._try_process_rx_window(rx, rx.size)
+    assert backend._frames_processed == 1
+    assert backend._frames_decode_ok == 0
+    assert not backend._rx_tracking_locked
+    assert math.isnan(backend._cfo_smooth_hz)
+
+    monkeypatch.setattr(backend, "_recover_payload_from_symbols", recover)
+    backend._try_process_rx_window(rx, 2 * rx.size)
+    assert backend._frames_decode_ok == 1
+    assert backend._rx_tracking_locked
+    assert math.isfinite(backend._cfo_smooth_hz)
+
+
+def test_selected_candidate_owns_ber_and_phase_diagnostics(backend_factory, monkeypatch):
+    backend = backend_factory(alpha=0.5, beta=1.0, tx_text="FDIDM OK")
+    rx = np.tile(backend._tx_waveform, 2).astype(np.complex128)
+    attempts = []
+
+    def diagnose(symbols):
+        attempts.append(len(attempts))
+        first = len(attempts) == 1
+        backend._last_fec_bit_ber = 0.01 if first else 0.8
+        backend._last_raw_bit_ber = 0.02 if first else 0.9
+        backend.last_residual_gain_abs = 1.1 if first else 9.9
+        backend.last_residual_phase_deg = 3.0 if first else 93.0
+        return (0.01 if first else 0.8), b"", b"", "", 0, False, symbols, (10.0 if first else 100.0)
+
+    monkeypatch.setattr(backend, "_recover_payload_from_symbols", diagnose)
+    backend._try_process_rx_window(rx, rx.size)
+
+    assert len(attempts) >= 2
+    assert backend._last_fec_bit_ber == pytest.approx(0.01)
+    assert backend._last_raw_bit_ber == pytest.approx(0.02)
+    assert backend.last_residual_gain_abs == pytest.approx(1.1)
+    assert backend.last_residual_phase_deg == pytest.approx(3.0)
+
+
+def test_probe_processing_gap_excludes_validation_and_optimizer_evidence(
+    backend_factory, monkeypatch
+):
+    backend = backend_factory(alpha=0.5, beta=1.0, tx_text="FDIDM OK")
+    rx = np.tile(backend._tx_waveform, 2).astype(np.complex128)
+    validation_samples = []
+    optimizer_inputs = []
+    monkeypatch.setattr(
+        backend, "_record_alpha_beta_validation_sample_locked",
+        lambda sample: validation_samples.append(sample),
+    )
+    monkeypatch.setattr(
+        backend, "_maybe_queue_alpha_beta_adaptation",
+        lambda **kwargs: optimizer_inputs.append(kwargs),
+    )
+
+    backend._try_process_rx_window(rx, rx.size, processing_gap=True)
+
+    assert backend._frames_decode_ok == 1  # A contiguous latest vector is decodable.
+    assert len(validation_samples) == 1
+    assert validation_samples[0]["overflow"] is True
+    assert len(optimizer_inputs) == 1
+    assert optimizer_inputs[0]["csi_trustworthy"] is False
+    assert "processing/probe gap" in optimizer_inputs[0]["csi_quality_reason"]
+
+
+def test_perfect_pilot_fit_is_valid_adaptive_csi(backend_factory, monkeypatch):
+    backend = backend_factory(alpha=0.5, beta=1.0, tx_text="FDIDM OK")
+    rx = np.tile(backend._tx_waveform, 2).astype(np.complex128)
+    optimizer_inputs = []
+    monkeypatch.setattr(
+        hardtest_module,
+        "measure_pilot_fit",
+        lambda *args: hardtest_module.PilotFitMetrics(
+            fit_nmse=0.0, residual_sinr_db=float("inf")
+        ),
+    )
+    monkeypatch.setattr(
+        backend, "_maybe_queue_alpha_beta_adaptation",
+        lambda **kwargs: optimizer_inputs.append(kwargs),
+    )
+
+    backend._try_process_rx_window(rx, rx.size)
+
+    assert backend._frames_decode_ok == 1
+    assert math.isinf(backend._last_pilot_fit_metrics.residual_sinr_db)
+    assert len(optimizer_inputs) == 1
+    assert optimizer_inputs[0]["csi_trustworthy"] is True
+
+
 def test_exact_ser_counters_reset_only_with_runtime_counters(backend_factory):
     backend = backend_factory()
     backend._ser_errors_total = 12
@@ -111,6 +244,16 @@ def test_exact_ser_counters_reset_only_with_runtime_counters(backend_factory):
     backend._reset_rx_runtime_state("restart", reset_counters=True)
     assert backend._ser_errors_total == 0
     assert backend._ser_symbols_total == 0
+
+
+def test_live_transition_discards_exactly_two_fresh_probe_vectors(backend_factory):
+    backend = backend_factory()
+    backend._arm_live_transition()
+
+    assert backend._in_startup_settle(0) is True
+    assert backend._in_startup_settle(4096) is True
+    assert backend._in_startup_settle(4096) is True
+    assert backend._in_startup_settle(4096) is False
 
 
 def test_pilot_fit_diagnostic_does_not_change_diag_estimator_result(backend_factory):

@@ -35,8 +35,25 @@ INSUFFICIENT = "insufficient"
 MODE_ON = "adaptive_on"
 MODE_OFF = "adaptive_off"
 
-# 配对可比性检查的上下文字段（TDL 注入参数 + 链路模式）
+# Conditions that must stay fixed in both measurement windows.  Alpha/beta
+# are intentionally absent: they are the treatment being compared.
 CONTEXT_KEYS = (
+    "carrier_freq",
+    "sample_rate",
+    "tx_gain",
+    "rx_gain",
+    "fdidm_m",
+    "fdidm_n",
+    "cp_len",
+    "mod_order",
+    "equalizer",
+    "channel_estimator",
+    "coding_scheme",
+    "training_amplitude",
+    "tx_frame_count",
+    "inter_frame_guard_len",
+    "tx_uncoded_bits_len",
+    "tx_coded_bits_len",
     "channel_mode",
     "tdl_model",
     "tdl_doppler_hz",
@@ -265,8 +282,10 @@ class AdvantageObservationSession:
         self._last_status_frames = _i(initial.get("frames_processed"))
         self._last_status_ok = _i(initial.get("frames_decode_ok"))
         self._last_status_overflow = _i(initial.get("rx_overflow_count"))
+        self._last_status_processing_gap = _i(initial.get("rx_processing_gap_count"))
         self._last_ser_errors_total = _i(initial.get("ser_errors_total"))
         self._last_ser_symbols_total = _i(initial.get("ser_symbols_total"))
+        self._last_config = (float("nan"), float("nan"))
         if initial:
             self._update_symbol_counts(initial)
         self._open_window(bool(enabled))
@@ -301,17 +320,33 @@ class AdvantageObservationSession:
         if not self.active or self._current is None:
             return
         context_keys = CONTEXT_KEYS + EVIDENCE_CONTEXT_KEYS
-        self._context = {key: status.get(key) for key in context_keys if key in status}
-        self._current.context = dict(self._context)
+        next_context = dict(self._current.context)
+        next_context.update({key: status[key] for key in context_keys if key in status})
+        changed, _ = self._comparability(self._current.context, next_context)
+        context_changed = not changed
+        if context_changed and self._current.valid_samples > 0:
+            # Never silently relabel a window containing old RF/modem
+            # conditions with the latest status.  The sample spanning the
+            # transition is ambiguous and is dropped below.
+            self._finalize_window()
+            self._context = dict(next_context)
+            self._open_window(self._current_enabled)
+        else:
+            context_changed = False
+            self._context = dict(next_context)
+        self._current.context = dict(next_context)
 
         frames = _i(status.get("frames_processed"))
         ok = _i(status.get("frames_decode_ok"))
         overflow = _i(status.get("rx_overflow_count"))
+        processing_gap = _i(status.get("rx_processing_gap_count"))
         frames_delta = frames - self._last_status_frames
         ok_delta = ok - self._last_status_ok
         overflow_delta = overflow - self._last_status_overflow
+        processing_gap_delta = processing_gap - getattr(self, "_last_status_processing_gap", 0)
         self._last_status_frames, self._last_status_ok = frames, ok
         self._last_status_overflow = overflow
+        self._last_status_processing_gap = processing_gap
 
         exact_counts = "ser_errors_total" in status and "ser_symbols_total" in status
         ser_errors_delta = 0
@@ -341,11 +376,23 @@ class AdvantageObservationSession:
 
         if frames_delta <= 0:
             return  # 链路空闲采样：既非数据也非异常
+        if context_changed:
+            self._current.dropped_samples += 1
+            self._anomaly_drops.append((float(self._clock()), "context_change"))
+            if "context_change" not in self._current.anomalies:
+                self._current.anomalies.append("context_change")
+            return
         if overflow_delta > 0:
             self._current.dropped_samples += 1
             self._anomaly_drops.append((float(self._clock()), "rx_overflow"))
             if "rx_overflow" not in self._current.anomalies:
                 self._current.anomalies.append("rx_overflow")
+            return
+        if processing_gap_delta > 0:
+            self._current.dropped_samples += 1
+            self._anomaly_drops.append((float(self._clock()), "processing_gap"))
+            if "processing_gap" not in self._current.anomalies:
+                self._current.anomalies.append("processing_gap")
             return
         ser = _f(status.get("measured_ser"))
         if not np.isfinite(ser):
@@ -397,16 +444,66 @@ class AdvantageObservationSession:
         return sum(1 for item in self._windows if item.excluded)
 
     def latest_pair(self) -> Optional[PairComparison]:
-        before_win = self._last_finalized(MODE_OFF)
-        after_win = self._last_finalized(MODE_ON)
+        # Pair only adjacent local OFF -> ON segments.  A changing RF channel
+        # makes a session-wide baseline misleading: after another toggle we
+        # must never reach back to the first OFF window.  The active ON segment
+        # is allowed as a provisional ``after`` value while it is collecting.
+        before_win, after_win = self._latest_adjacent_pair()
+        # A completed comparison remains useful while the operator is taking
+        # another sample in the same RF context.  Once the active/trailing OFF
+        # segment reports a different channel/modem context, however, that
+        # result is stale and must not be shown as the baseline for the new
+        # channel.  Wait for a fresh local OFF→ON pair instead.
+        if after_win is not None and self._pair_has_trailing_context_change(after_win):
+            return None
         after_agg = after_win.aggregate if after_win is not None else None
         after_ctx = after_win.context if after_win is not None else None
-        # 开启中的段也参与配对：结论面板需要实时"开启后"数字（F5）
-        if after_agg is None and self._current is not None and self._current.mode == MODE_ON:
+        if self._current is not None and self._current.mode == MODE_ON:
             prov = self._provisional_aggregate(self._current)
             if prov is not None:
                 after_agg, after_ctx = prov, self._current.context
         if before_win is None or after_agg is None:
+            # An excluded OFF segment is a hard stop for attribution.  Do not
+            # manufacture a diagnostic pair from the following ON samples:
+            # callers use ``None`` to keep the UI in the explicit
+            # "collecting/invalid" state until a fresh local OFF window exists.
+            if (before_win is None and after_agg is not None and self._windows
+                    and self._windows[-1].mode == MODE_OFF
+                    and self._windows[-1].excluded):
+                return None
+            # If a usable ON result exists but its immediately preceding
+            # segment is not a valid OFF baseline (for example a context
+            # change split the ON window), expose an explicit inconclusive
+            # result rather than silently falling back to an old baseline.
+            if after_agg is not None and (after_win is not None or self._current is not None):
+                # For an active ON segment ``after_win`` is intentionally
+                # absent; the provisional segment itself is still sufficient
+                # to report that no adjacent OFF baseline is available.
+                prior = self._windows[-1] if self._windows else None
+                note = "无相邻可用的关闭基线；信道/配置已变化，请重新采集局部基线"
+                if prior is not None:
+                    current_ctx = self._current.context if self._current is not None else after_ctx
+                    _, context_note = self._comparability(prior.context, current_ctx or {})
+                    if context_note:
+                        note = context_note + "；禁止跨窗口复用旧基线"
+                if prior is not None and prior.mode != MODE_OFF:
+                    note += "；开启前不是关闭段，禁止跨窗口复用旧基线"
+                # Preserve a diagnostic pair for an ON segment whose local
+                # OFF predecessor was invalid.  Reuse the candidate aggregate
+                # for both payload slots so callers cannot accidentally show
+                # an old ON result as the current fixed baseline.
+                before_diag = after_agg
+                return PairComparison(
+                    before=before_diag,
+                    after=after_agg,
+                    ser_improvement_db=float("nan"),
+                    evm_delta_pp=float("nan"),
+                    crc_delta=float("nan"),
+                    comparable=False,
+                    comparability_note=note,
+                    outcome="inconclusive",
+                    validation_reason=note,
+                )
             return None
         comparable, note = self._comparability(before_win.context, after_ctx)
         if comparable and (
@@ -425,12 +522,12 @@ class AdvantageObservationSession:
                 note = "功率不可比: " + note
         backend_outcome = str((after_ctx or {}).get("adaptive_validation_state", ""))
         backend_reason = str((after_ctx or {}).get("adaptive_validation_reason", "") or "")
-        if backend_outcome in {"improved", "inconclusive", "regressed"}:
-            outcome = backend_outcome
-            validation_reason = backend_reason
-        elif not comparable:
+        if not comparable:
             outcome = "inconclusive"
             validation_reason = note
+        elif backend_outcome in {"improved", "inconclusive", "regressed"}:
+            outcome = backend_outcome
+            validation_reason = backend_reason
         elif before_win.aggregate.estimated_k or after_agg.estimated_k:
             outcome = "inconclusive"
             validation_reason = "旧后端错误计数为估算值，不能形成实测优势结论"
@@ -451,6 +548,39 @@ class AdvantageObservationSession:
             outcome=outcome,
             validation_reason=validation_reason,
         )
+
+    def _pair_has_trailing_context_change(self, after_win: ObservationWindow) -> bool:
+        """Return True when a later OFF segment no longer matches ``after_win``.
+
+        ``latest_pair`` intentionally keeps the last valid result visible while
+        an unchanged OFF window is being collected.  For a time-varying RF
+        channel this is only safe when the trailing OFF context is identical to
+        the candidate context.  Compare keys present in both windows so a
+        partially populated status snapshot does not create a false mismatch.
+        """
+        try:
+            after_index = self._windows.index(after_win)
+        except ValueError:
+            after_index = -1
+        trailing = list(self._windows[after_index + 1:]) if after_index >= 0 else []
+        if self._current is not None:
+            trailing.append(self._current)
+        compare_keys = CONTEXT_KEYS + ("tx_power_contract_id",)
+        for window in trailing:
+            if window.mode != MODE_OFF:
+                continue
+            shared = {
+                key for key in compare_keys
+                if key in (after_win.context or {}) and key in (window.context or {})
+            }
+            if not shared:
+                continue
+            before_ctx = {key: after_win.context.get(key) for key in shared}
+            current_ctx = {key: window.context.get(key) for key in shared}
+            comparable, _note = self._comparability(before_ctx, current_ctx)
+            if not comparable:
+                return True
+        return False
 
     def to_export_dict(self) -> Dict[str, Any]:
         pair = self.latest_pair()
@@ -490,9 +620,36 @@ class AdvantageObservationSession:
         win.aggregate = self._compute_aggregate(win)
         self._windows.append(win)
 
-    def _last_finalized(self, mode: str) -> Optional[ObservationWindow]:
-        return next((w for w in reversed(self._windows)
-                     if w.mode == mode and not w.excluded and w.aggregate is not None), None)
+    def _latest_adjacent_pair(self):
+        """Return the newest usable OFF window immediately before an ON.
+
+        ``_windows`` contains finalized segments in chronological order.  An
+        ON segment is paired only with the preceding segment when that segment
+        is OFF; this prevents a later ON from borrowing an obsolete baseline
+        across an intervening OFF/ON cycle or a context-split segment.
+        """
+        windows = self._windows
+        # The current ON segment has a local predecessor among finalized
+        # windows; keep it eligible for provisional aggregation in latest_pair.
+        if self._current is not None and self._current.mode == MODE_ON:
+            on_index = len(windows)
+            on_win = None
+        else:
+            on_index = -1
+            on_win = None
+            for idx in range(len(windows) - 1, -1, -1):
+                win = windows[idx]
+                if win.mode == MODE_ON and not win.excluded and win.aggregate is not None:
+                    on_index, on_win = idx, win
+                    break
+            if on_win is None:
+                return None, None
+        if on_index <= 0:
+            return None, on_win
+        before = windows[on_index - 1]
+        if before.mode != MODE_OFF or before.excluded or before.aggregate is None:
+            return None, on_win
+        return before, on_win
 
     def _provisional_aggregate(self, win: ObservationWindow) -> Optional[WindowAggregate]:
         """为开启中的段计算临时汇总，规则与收尾一致。"""

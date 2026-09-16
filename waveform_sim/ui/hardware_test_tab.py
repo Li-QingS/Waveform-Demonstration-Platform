@@ -4,8 +4,8 @@ ui/hardware_test_tab.py
 
 OFDM / OTFS / AFDM 通用 USRP 硬件测评页面。
 
-本文件必须导出 ``HardwareTestTab``，因为 ``ui.main_window`` 通过
-``ui.hardware_test_tab.HardwareTestTab`` 动态加载该页面。
+本文件必须导出 ``HardwareTestTab``，因为 ``waveform_sim.ui.main_window`` 通过
+``waveform_sim.ui.hardware_test_tab.HardwareTestTab`` 动态加载该页面。
 后端在用户点击“连接 / 配置 USRP”时才按需导入和实例化，避免仅打开主界面
 就占用 USRP，亦便于在缺少 GNU Radio / UHD 时给出清晰的界面错误信息。
 """
@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import gc
 import importlib
-import os
-import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -43,16 +41,10 @@ from PyQt5.QtWidgets import (
 )
 
 
-# 保证从 ui/ 目录加载时能找到同级的 hardware/ 包。
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-
 _BACKEND_SPECS: Dict[str, Tuple[str, str]] = {
-    "OFDM": ("hardware.ofdm_hardtest", "OfdmHardwareTx"),
-    "OTFS": ("hardware.otfs_hardtest", "OTFSHardwareTest"),
-    "AFDM": ("hardware.afdm_hardtest", "AFDMHardwareTest"),
+    "OFDM": ("waveform_sim.hardware.ofdm_hardtest", "OfdmHardwareTx"),
+    "OTFS": ("waveform_sim.hardware.otfs_hardtest", "OTFSHardwareTest"),
+    "AFDM": ("waveform_sim.hardware.afdm_hardtest", "AFDMHardwareTest"),
 }
 
 _DEFAULT_TEXTS = {

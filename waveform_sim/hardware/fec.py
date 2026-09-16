@@ -7,6 +7,8 @@ import numpy as np
 
 
 class FECMixin:
+    _conv_incoming_cache = None
+
     @staticmethod
     def _parity_u32(x: int) -> int:
         return int(int(x).bit_count() & 1)
@@ -56,31 +58,40 @@ class FECMixin:
         metrics[0] = 0
         prev_state = np.zeros((num_steps, num_states), dtype=np.uint8)
         prev_bit = np.zeros((num_steps, num_states), dtype=np.uint8)
-        next_state = np.zeros((num_states, 2), dtype=np.uint8)
-        out_bits = np.zeros((num_states, 2, 2), dtype=np.uint8)
-        for s in range(num_states):
-            for b in (0, 1):
-                ns, pair = cls._conv_next_state_output(s, b)
-                next_state[s, b] = ns
-                out_bits[s, b, 0] = pair[0]
-                out_bits[s, b, 1] = pair[1]
-        for t in range(num_steps):
-            rx0 = int(r[2 * t])
-            rx1 = int(r[2 * t + 1])
-            new_metrics = np.full(num_states, inf, dtype=np.int32)
+        # Store the two incoming branches for every destination state.  The
+        # old implementation walked 64 states x 2 bits in Python for every
+        # coded symbol and was called up to four times for QPSK phase trials;
+        # on Windows this alone cost ~0.45 s per RX frame and starved the GNU
+        # Radio probe.  The trellis and traceback are unchanged, only the
+        # per-step add/compare/select is vectorized.
+        incoming = getattr(cls, "_conv_incoming_cache", None)
+        if incoming is None:
+            predecessors = [[] for _ in range(num_states)]
             for s in range(num_states):
-                base = int(metrics[s])
-                if base >= inf:
-                    continue
                 for b in (0, 1):
-                    ns = int(next_state[s, b])
-                    dist = int(out_bits[s, b, 0] != rx0) + int(out_bits[s, b, 1] != rx1)
-                    cand = base + dist
-                    if cand < int(new_metrics[ns]):
-                        new_metrics[ns] = cand
-                        prev_state[t, ns] = s
-                        prev_bit[t, ns] = b
-            metrics = new_metrics
+                    ns, pair = cls._conv_next_state_output(s, b)
+                    predecessors[int(ns)].append((int(s), int(b), int(pair[0]), int(pair[1])))
+            incoming_states = np.asarray(
+                [[branch[0] for branch in branches] for branches in predecessors], dtype=np.uint8
+            )
+            incoming_bits = np.asarray(
+                [[branch[1] for branch in branches] for branches in predecessors], dtype=np.uint8
+            )
+            incoming_outputs = np.asarray(
+                [[[branch[2], branch[3]] for branch in branches] for branches in predecessors], dtype=np.uint8
+            )
+            incoming = (incoming_states, incoming_bits, incoming_outputs)
+            cls._conv_incoming_cache = incoming
+        incoming_states, incoming_bits, incoming_outputs = incoming
+        state_rows = np.arange(num_states, dtype=np.int64)
+        for t in range(num_steps):
+            received = r[2 * t:2 * t + 2].astype(np.uint8, copy=False)
+            branch_distance = np.count_nonzero(incoming_outputs != received[None, None, :], axis=2)
+            candidates = metrics[incoming_states] + branch_distance
+            choice = np.argmin(candidates, axis=1)
+            metrics = candidates[state_rows, choice].astype(np.int32, copy=False)
+            prev_state[t] = incoming_states[state_rows, choice]
+            prev_bit[t] = incoming_bits[state_rows, choice]
         state = 0 if flushed else int(np.argmin(metrics))
         decoded = np.zeros(num_steps, dtype=np.int8)
         for t in range(num_steps - 1, -1, -1):
@@ -169,4 +180,3 @@ class FECMixin:
             else:
                 break
         return int(max(0, best))
-

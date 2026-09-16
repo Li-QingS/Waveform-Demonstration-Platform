@@ -5,6 +5,7 @@
 """
 import json
 import os
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,7 +14,9 @@ import pytest
 pytest.importorskip("PyQt5")
 pytest.importorskip("pyqtgraph")
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QFileDialog
+import pyqtgraph as pg
 
 from waveform_sim.ui.fdidm_hardware_test_tab import FDIDMHardwareTestTab
 from waveform_sim.ui.hardware_advantage_observer import AdvantageObservationSession
@@ -145,6 +148,118 @@ def feed(tab, clock, n, ser, evm=8.0, overflow_step=0, alpha=0.5, beta=1.0,
     return frames, ok, overflow
 
 
+def test_timeline_only_adds_new_frames_and_masks_invalid_evm(app):
+    tab, clock = make_tab(app)
+    tab._start_observation_clicked()
+    try:
+        first = make_status(1, 1, ser=0.1, evm=8.0)
+        clock.advance()
+        tab._append_timeline_sample(first)
+        tab._append_timeline_sample(first)
+        assert len(tab._obs_t) == 1
+
+        second = make_status(2, 1, ser=0.1, evm=8.0)
+        second["evm_valid"] = False
+        clock.advance()
+        tab._append_timeline_sample(second)
+        assert len(tab._obs_t) == 2
+        assert np.isnan(tab._obs_evm[-1])
+    finally:
+        tab._on_stop_test_clicked()
+
+
+def test_effect_bars_keep_evm_when_exact_ser_is_zero(app):
+    """A clean zero-error link must not hide an otherwise valid EVM result."""
+    tab, clock = make_tab(app)
+    tab._start_observation_clicked()
+    try:
+        feed(tab, clock, 40, ser=0.0, evm=8.0)
+        tab.adaptive_enable_check.setChecked(True)
+        feed(tab, clock, 40, ser=0.0, evm=6.0)
+        pair = tab.observer.latest_pair()
+        assert pair is not None and pair.comparable
+
+        candidate = [float(v) for v in tab.timeline_candidate_bars.opts["height"]]
+        baseline = [float(v) for v in tab.timeline_baseline_bars.opts["height"]]
+        assert candidate[0] == pytest.approx(75.0)
+        assert baseline[0] == pytest.approx(100.0)
+        # SER=0/0 is represented as an explicit no-error comparison, not NaN.
+        assert candidate[1] == pytest.approx(100.0)
+        assert baseline[1] == pytest.approx(100.0)
+        labels = [item.toPlainText() for item in tab.timeline_effect_labels]
+        assert "EVM: 100" in labels[0] and "75.0%" in labels[0]
+        assert "SER: 100" in labels[1] and "双方0错误" in labels[1]
+    finally:
+        tab._on_stop_test_clicked()
+
+
+def test_effect_bars_mark_non_normalisable_zero_ser_baseline(app):
+    """A zero OFF baseline plus ON errors is shown as unavailable, never 100%."""
+    tab, clock = make_tab(app)
+    tab._start_observation_clicked()
+    try:
+        feed(tab, clock, 40, ser=0.0, evm=8.0)
+        tab.adaptive_enable_check.setChecked(True)
+        feed(tab, clock, 40, ser=0.01, evm=6.0)
+        pair = tab.observer.latest_pair()
+        assert pair is not None and pair.comparable
+
+        candidate = [float(v) for v in tab.timeline_candidate_bars.opts["height"]]
+        baseline = [float(v) for v in tab.timeline_baseline_bars.opts["height"]]
+        assert candidate[0] == pytest.approx(75.0)
+        assert baseline[0] == pytest.approx(100.0)
+        assert candidate[1] == pytest.approx(0.0)
+        assert baseline[1] == pytest.approx(0.0)
+        labels = [item.toPlainText() for item in tab.timeline_effect_labels]
+        assert "EVM: 100" in labels[0]
+        assert "SER: 基线为0，无法归一化" == labels[1]
+    finally:
+        tab._on_stop_test_clicked()
+
+
+def test_effect_plot_has_no_event_overlay_and_plot_ranges_are_independent(app):
+    """The categorical result must stay overlay-free and own its zoom state."""
+    tab, clock = make_tab(app)
+    tab._start_observation_clicked()
+    try:
+        feed(tab, clock, 40, ser=0.05, evm=8.0)
+        tab.adaptive_enable_check.setChecked(True)
+        feed(tab, clock, 40, ser=0.01, evm=6.0)
+
+        # Simulate a stale overlay left by an old/hot-reloaded build.  The next
+        # refresh must remove it; adaptive event lines belong only to α/β.
+        stale = pg.InfiniteLine(
+            pos=0.5, angle=90,
+            pen=pg.mkPen((237, 177, 32), style=Qt.DashLine),
+        )
+        tab.timeline_ser_plot.addItem(stale)
+        tab._refresh_timeline_plot()
+        effect_items = tab.timeline_ser_plot.getPlotItem().items
+        assert stale not in effect_items
+        assert not any(isinstance(item, (pg.InfiniteLine, pg.LinearRegionItem))
+                       for item in effect_items)
+
+        effect_view = tab.timeline_ser_plot.getPlotItem().getViewBox()
+        quality_view = tab.timeline_evm_plot.getPlotItem().getViewBox()
+        action_view = tab.timeline_ab_plot.getPlotItem().getViewBox()
+        assert effect_view.linkedView(0) is None and effect_view.linkedView(1) is None
+        assert quality_view.linkedView(0) is None and quality_view.linkedView(1) is None
+        assert action_view.linkedView(0) is None and action_view.linkedView(1) is None
+
+        # Let pending auto-range work from the newly supplied curve data settle
+        # before taking the reference ranges; after this point only the effect
+        # ViewBox is changed.
+        app.processEvents()
+        quality_before = [list(axis) for axis in quality_view.viewRange()]
+        action_before = [list(axis) for axis in action_view.viewRange()]
+        effect_view.setRange(xRange=(-0.1, 1.0), yRange=(0.0, 80.0), padding=0)
+        app.processEvents()
+        assert quality_view.viewRange() == quality_before
+        assert action_view.viewRange() == action_before
+    finally:
+        tab._on_stop_test_clicked()
+
+
 def test_observation_controls_default_state(app):
     tab = FDIDMHardwareTestTab()
     assert not tab.btn_start_observation.isEnabled()
@@ -172,6 +287,43 @@ def test_hardware_start_automatically_starts_observation_and_stop_preserves_it(a
     assert not tab.observer.active
     assert not tab.btn_start_observation.isEnabled()
     assert not tab.btn_stop_observation.isEnabled()
+
+
+def test_live_parameter_error_stops_backend_and_restores_controls(app):
+    tab = FDIDMHardwareTestTab()
+    backend = FakeBackend()
+    tab.backend = backend
+    tab.test_running = True
+
+    def reject_configure(**_kwargs):
+        raise ValueError("invalid live waveform")
+
+    backend.configure = reject_configure
+    tab._apply_params_to_backend()
+
+    assert backend.stop_calls == 1
+    assert not tab.test_running
+    assert tab.btn_start_test.isEnabled()
+    assert not tab.btn_stop_test.isEnabled()
+
+
+def test_start_error_stops_partially_started_backend(app):
+    tab = FDIDMHardwareTestTab()
+    backend = FakeBackend()
+    tab.backend = backend
+
+    def fail_start():
+        backend.start_calls += 1
+        raise RuntimeError("UHD start failed")
+
+    backend.start = fail_start
+    tab._on_start_test_clicked()
+
+    assert backend.start_calls == 1
+    assert backend.stop_calls == 1
+    assert not tab.test_running
+    assert tab.btn_start_test.isEnabled()
+    assert not tab.btn_stop_test.isEnabled()
 
 
 def test_automatic_end_to_end_observation_needs_no_extra_start_click(app):
@@ -238,20 +390,42 @@ def test_observation_pair_updates_panel_and_timeline(app):
     assert "实测优势" in tab.observation_improvement_label.text()
     # v2：两页签各四宫格；观测页统计表出现窗口汇总行（AC6/AC7）
     assert tab.plot_tabs.count() == 2
-    assert "开启前" in tab.observation_stats_label.text()
+    assert "固定基线" in tab.observation_stats_label.text()
     assert "可信" in tab.observation_badge_label.text()
     assert "精确计数" in tab.observation_badge_label.text()
-    assert "数据辅助EVM" in tab.observation_evm_label.text()
+    assert "EVM" in tab.observation_evm_label.text()
+    assert "解调误差 EVM" in tab.observation_evm_label.toolTip()
     stats_text = tab.observation_stats_label.text()
-    assert "raw/FEC BER" in stats_text and "CRC" in stats_text
-    assert "周期/数据RMS" in stats_text and "PAPR" in stats_text
-    assert "合同 common-rms" in stats_text
+    assert "CRC" in stats_text
+    assert "raw/FEC BER" in tab.observation_stats_label.toolTip()
+    assert "PAPR" not in stats_text and "合同" not in stats_text
+    assert "contract=common-rms" in tab.observation_stats_label.toolTip()
     assert "SER" in tab.observation_before_label.text()
     # 时间轴：曲线有数据 + 一条开关事件竖线（AC4）
     assert tab.timeline_ser_curve.xData is not None and len(tab.timeline_ser_curve.xData) > 0
     assert len(tab._timeline_event_items) == 1
     # live 路径：观测全程未触发后端 start/stop（AC6）
     assert tab.backend.start_calls == 0 and tab.backend.stop_calls == 0
+
+
+def test_observation_does_not_claim_candidate_before_waveform_switch(app):
+    tab, clock = make_tab(app)
+    tab._start_observation_clicked()
+    feed(tab, clock, 40, ser=0.05)
+    tab.adaptive_enable_check.setChecked(True)
+    feed(tab, clock, 40, ser=0.05)
+    tab._update_observation_display()
+    assert "无结论" in tab.observation_improvement_label.text()
+    assert "未切换候选波形" in tab.observation_improvement_label.text()
+
+
+def test_waiting_channel_status_gives_actionable_rf_hint(app):
+    tab, _clock = make_tab(app)
+    status = make_status(10, 0)
+    status.update({"adaptive_alpha_beta_enabled": True, "adaptive_alpha_beta_state": "waiting_channel"})
+    tab._handle_alpha_beta_adaptation(status)
+    assert "等待可信信道估计" in tab.adaptive_status_label.text()
+    assert "检查 CRC" in tab.adaptive_status_label.text()
 
 
 def test_anomaly_window_excluded_shown_in_panel(app):
@@ -288,9 +462,214 @@ def test_adaptive_state_row_shows_observability(app):
     status["adaptive_alpha_observable"] = False
     status["adaptive_beta_observable"] = True
     tab._update_adaptive_state_row(status)
-    txt = tab.adaptive_state_label.text()
-    assert "α可观测:否" in txt and "β可观测:是" in txt
-    assert "搜索:monitoring" in txt
+    assert "自适应过程" in tab.adaptive_state_label.text()
+    tip = tab.adaptive_state_label.toolTip()
+    assert "α可观测=False" in tip and "β可观测=True" in tip
+    assert "搜索状态=monitoring" in tip
+
+
+def test_idle_validation_does_not_hide_optimizer_state(app):
+    tab = FDIDMHardwareTestTab()
+    status = make_status(1, 0)
+    status.update({
+        "adaptive_alpha_beta_enabled": True,
+        "adaptive_alpha_beta_state": "optimizing",
+        "adaptive_validation_state": "idle",
+    })
+    tab._update_adaptive_state_row(status)
+    assert "optimizing" in tab.adaptive_state_label.text()
+
+
+def test_advantage_cards_use_exact_backend_validation_windows(app):
+    tab = FDIDMHardwareTestTab()
+    status = make_status(48, 42)
+    status.update({
+        "adaptive_validation_state": "candidate_collecting",
+        "adaptive_validation": {
+            "state": "candidate_collecting",
+            "outcome": "",
+            "old_alpha": 0.0,
+            "old_beta": 0.0,
+            "candidate_alpha": 0.75,
+            "candidate_beta": 0.8,
+            "min_frames": 24,
+            "baseline_window": {
+                "valid_frames": 24, "ser": 0.08, "ser_errors": 320,
+                "ser_symbols": 4000, "data_aided_evm_mean": 12.0,
+            },
+            "candidate_window": {
+                "valid_frames": 12, "ser": 0.01, "ser_errors": 20,
+                "ser_symbols": 2000, "data_aided_evm_mean": 6.0,
+            },
+            "contract": {"contract_id": "txp-test"},
+        },
+    })
+    tab._update_observation_display(status)
+    assert "0.00/0.00" in tab.observation_before_label.toolTip()
+    assert "0.75/0.80" in tab.observation_after_label.toolTip()
+    assert "12.00% → 6.00%" in tab.observation_evm_label.text()
+    assert "320/4000" in tab.observation_badge_label.toolTip()
+    assert "320/4000" in tab.observation_stats_label.text()
+
+
+def test_no_reliable_preamble_is_not_presented_as_an_evm_measurement(app):
+    tab = FDIDMHardwareTestTab()
+    status = make_status(0, 0, evm=1800.0)
+    status.update({"preamble_reliable": False, "evm_valid": False})
+    tab._update_decode_status({"decode_ok": False}, status)
+    assert "未检测到可靠 FDIDM 前导" in tab.decode_status_label.text()
+    assert "数据EVM=不可用%" in tab.decode_status_label.toolTip()
+
+
+def test_engineering_controls_are_simple_by_default_and_advanced_is_collapsible(app):
+    tab = FDIDMHardwareTestTab()
+    assert tab.tx_gain_spin.value() == 10.0 and tab.rx_gain_spin.value() == 20.0
+    assert tab.tx_gain_spin.isVisibleTo(tab) and tab.rx_gain_spin.isVisibleTo(tab)
+    assert "A:TX/RX" in tab.rf_port_note.text() and "A:RX2" in tab.rf_port_note.text()
+    assert not tab.advanced_group.isVisible()
+    assert tab.alpha_spin.isVisibleTo(tab)
+    assert tab.channel_mode_combo.isVisibleTo(tab)
+    assert not tab.channel_estimator_combo.isVisibleTo(tab)
+    assert not tab.samp_rate_spin.isVisibleTo(tab)
+    assert not tab.modem_group.isVisibleTo(tab)
+    assert not tab.text_group.isVisibleTo(tab)
+    assert not tab.tdl_ds_spin.isVisibleTo(tab)  # RF mode: value has no effect
+    assert tab.plot_tabs.currentIndex() == 1
+    assert tab.alpha_spin.minimum() == 0.0 and tab.beta_spin.minimum() == 0.0
+    tab.btn_toggle_advanced.setChecked(True)
+    assert tab.advanced_group.isVisibleTo(tab)
+    assert tab.samp_rate_spin.isVisibleTo(tab)
+    assert tab.modem_group.isVisibleTo(tab)
+    assert "收起" in tab.btn_toggle_advanced.text()
+
+
+def test_antenna_preset_is_explicit_and_only_available_for_b210(app):
+    tab = FDIDMHardwareTestTab()
+    tab.btn_antenna_preset.click()
+    assert tab.tx_gain_spin.value() == 25.0
+    assert tab.rx_gain_spin.value() == 45.0
+    assert tab.tx_gain_spin.maximum() == 45.0
+    assert tab.rx_gain_spin.maximum() == 45.0
+    assert "衰减器" in tab.btn_antenna_preset.toolTip()
+    tab.device_combo.setCurrentIndex(1)
+    assert not tab.btn_antenna_preset.isEnabled()
+    assert tab.rf_port_note.isHidden()
+
+
+def test_adaptive_backend_switch_updates_controls_without_erasing_unsaved_edits(app):
+    tab = FDIDMHardwareTestTab()
+    tab._last_backend_alpha_beta = (0.5, 1.0)
+    tab.alpha_spin.setValue(0.6)  # operator has not applied this edit yet
+    tab._sync_alpha_beta_controls_from_status({"alpha": 0.5, "beta": 1.0})
+    assert tab.alpha_spin.value() == 0.6
+    tab._sync_alpha_beta_controls_from_status({"alpha": 0.75, "beta": 0.8})
+    assert tab.alpha_spin.value() == 0.75
+    assert tab.beta_spin.value() == 0.8
+
+
+def test_tdl_controls_are_conditional_and_use_parametric_estimator(app):
+    tab = FDIDMHardwareTestTab()
+    assert tab.tdl_ds_spin.isHidden()
+    target_index = next(
+        i for i in range(tab.channel_mode_combo.count())
+        if tab.channel_mode_combo.itemData(i) == "rf_tdl_a"
+    )
+    tab.channel_mode_combo.setCurrentIndex(target_index)
+    assert not tab.tdl_ds_spin.isHidden()
+    assert tab._current_data(tab.channel_estimator_combo, "") == "tdl_param"
+
+
+def test_ui_does_not_apply_a_new_candidate_while_validation_is_active(app):
+    tab, _clock = make_tab(app)
+    tab.adaptive_enable_check.setChecked(True)
+    calls = []
+    tab.backend.apply_alpha_beta_candidate = lambda *args, **kwargs: calls.append((args, kwargs))
+    status = make_status(10, 8)
+    status.update({
+        "adaptive_alpha_beta_enabled": True,
+        "adaptive_alpha_beta_ready": True,
+        "adaptive_recommendation_seq": 3,
+        "adaptive_recommended_alpha": 0.75,
+        "adaptive_recommended_beta": 0.80,
+        "adaptive_predicted_improvement_db": 2.0,
+        "adaptive_validation_state": "baseline_collecting",
+    })
+    tab._handle_alpha_beta_adaptation(status)
+    assert calls == []
+    assert "真实链路验证" in tab.adaptive_status_label.text()
+
+
+@pytest.mark.parametrize("state", ["rollback_applying", "rollback_failed"])
+def test_ui_never_applies_a_candidate_during_rollback(app, state):
+    tab, _clock = make_tab(app)
+    calls = []
+    tab.backend.apply_alpha_beta_candidate = lambda *args, **kwargs: calls.append((args, kwargs))
+    status = make_status(10, 8)
+    status.update({
+        "adaptive_alpha_beta_enabled": True,
+        "adaptive_alpha_beta_ready": True,
+        "adaptive_recommendation_seq": 3,
+        "adaptive_recommended_alpha": 0.75,
+        "adaptive_recommended_beta": 0.8,
+        "adaptive_validation_state": state,
+    })
+    tab._handle_alpha_beta_adaptation(status)
+    assert calls == []
+
+
+def test_advantage_conclusion_distinguishes_evm_only_and_rollback_failure(app):
+    tab = FDIDMHardwareTestTab()
+    status = make_status(48, 42)
+    validation = {
+        "state": "improved",
+        "outcome": "improved",
+        "old_alpha": 0.0,
+        "old_beta": 0.0,
+        "candidate_alpha": 0.75,
+        "candidate_beta": 0.8,
+        "result_reason": "candidate EVM improvement is statistically supported without SER regression",
+        "measured": {"measured_ser_gain_db": 0.0, "evm_delta_pp": -3.5},
+        "baseline_window": {"valid_frames": 64},
+        "candidate_window": {"valid_frames": 64},
+    }
+    status.update({"adaptive_validation_state": "improved", "adaptive_validation": validation})
+    tab._update_observation_display(status)
+    assert "EVM 改善 3.50 pp" in tab.observation_improvement_label.text()
+    assert "SER 改善" not in tab.observation_improvement_label.text()
+
+    validation["result_reason"] = "candidate SER improvement is statistically supported"
+    validation["measured"] = {
+        "measured_ser_gain_db": None,
+        "ser_gain_lower_bound_db": 5.28,
+        "evm_delta_pp": -3.5,
+    }
+    tab._update_observation_display(status)
+    assert "SER ≥5.28 dB" in tab.observation_improvement_label.text()
+    assert "置信区间下界" in tab.observation_improvement_label.toolTip()
+
+    validation["state"] = "rollback_failed"
+    validation["outcome"] = "regressed"
+    status["adaptive_validation_state"] = "rollback_failed"
+    tab._update_observation_display(status)
+    assert "回滚失败" in tab.observation_improvement_label.text()
+    assert "已安全回滚" not in tab.observation_improvement_label.text()
+
+    validation["state"] = validation["outcome"] = "aborted"
+    validation["result_reason"] = "validation aborted; baseline was not restored"
+    status["adaptive_validation_state"] = "aborted"
+    status["adaptive_alpha_beta_enabled"] = False
+    tab._update_adaptive_state_row(status)
+    tab._update_observation_display(status)
+    assert "未确认回滚" in tab.observation_improvement_label.text()
+    assert "验证中断" in tab.adaptive_state_label.text()
+    assert "已回滚基线" not in tab.observation_improvement_label.text()
+
+    validation["state"] = validation["outcome"] = "inconclusive"
+    validation["result_reason"] = "pilot fit changed between A/B windows; RF channel is not stationary"
+    status["adaptive_validation_state"] = "inconclusive"
+    tab._update_observation_display(status)
+    assert "导频条件变化" in tab.observation_improvement_label.text()
+    assert "无法归因" in tab.observation_improvement_label.text()
 
 
 def test_export_writes_json_report(app, tmp_path, monkeypatch):
@@ -397,8 +776,9 @@ def test_predicted_metrics_are_visibly_separate_from_measured_metrics(app):
     })
     tab._handle_alpha_beta_adaptation(status)
     adaptive = tab.adaptive_status_label.text()
-    assert "预测SER=0.08→0.04" in adaptive
-    assert "预测模型SNR=17.0dB" in adaptive
+    assert "预计改善 3.01dB" in adaptive
+    assert "预测SER=0.08→0.04" in tab.adaptive_status_label.toolTip()
+    assert "预测SNR=17.0dB" in tab.adaptive_status_label.toolTip()
     tab._update_decode_status({"decode_ok": False}, status)
     measured = tab.decode_status_label.toolTip()
     assert "SER=0.05" in measured
@@ -406,7 +786,7 @@ def test_predicted_metrics_are_visibly_separate_from_measured_metrics(app):
     assert "残差SINR=18.00dB" in measured
 
 
-@pytest.mark.parametrize("width,height", [(1400, 800), (1400, 900), (1200, 780)])
+@pytest.mark.parametrize("width,height", [(1400, 800), (1400, 900), (1200, 780), (1100, 700)])
 def test_advantage_grid_four_cells_remain_balanced_with_long_text(app, width, height):
     tab = FDIDMHardwareTestTab()
     tab.resize(width, height)
@@ -423,5 +803,64 @@ def test_advantage_grid_four_cells_remain_balanced_with_long_text(app, width, he
         assert min(widths) > 0 and max(widths) / min(widths) <= 1.08
         assert min(heights) > 0 and max(heights) / min(heights) <= 1.08
         assert tab.observation_stats_group.parent() is tab.observation_stats_cell
+        cards = [tab.observation_before_label, tab.observation_after_label,
+                 tab.observation_improvement_label]
+        card_widths = [card.width() for card in cards]
+        assert min(card_widths) > 120
+        assert max(card_widths) / min(card_widths) <= 1.12
+        assert tab.comparison_result_group.height() >= 190
+        assert tab.comparison_result_group.maximumHeight() > 1000
+        assert all(card.height() >= card.minimumHeight() for card in cards)
+        # The default operator path fits without vertical scrolling even at the
+        # smallest supported window; advanced diagnostics remain collapsible.
+        assert tab.controls_panel.sizeHint().height() <= tab.controls_scroll.viewport().height()
+    finally:
+        tab.close()
+
+
+def test_real_validation_text_does_not_squeeze_advantage_grid(app):
+    tab = FDIDMHardwareTestTab()
+    tab.resize(1100, 700)
+    tab.plot_tabs.setCurrentIndex(1)
+    reason = (
+        "candidate SER improvement is statistically supported after comparing "
+        "exact symbol counts and confidence intervals over independent observations"
+    )
+    validation = {
+        "state": "rollback_failed", "outcome": "regressed",
+        "old_alpha": 0.0, "old_beta": 0.0,
+        "candidate_alpha": 1.0, "candidate_beta": 1.0,
+        "result_reason": reason,
+        "min_frames": 24,
+        "baseline_window": {
+            "valid_frames": 64, "ser_errors": 46, "ser_symbols": 10624,
+            "ser": 46 / 10624, "data_aided_evm_mean": 23.96,
+        },
+        "candidate_window": {
+            "valid_frames": 24, "ser_errors": 0, "ser_symbols": 3984,
+            "ser": 0.0, "data_aided_evm_mean": 19.75,
+        },
+        "contract": {"contract_id": "txp-6c0e3a277152"},
+    }
+    status = make_status(95, 95)
+    status.update({
+        "alpha": 1.0, "beta": 1.0,
+        "adaptive_alpha_beta_enabled": True,
+        "adaptive_alpha_beta_state": "rollback_failed",
+        "adaptive_validation_state": "rollback_failed",
+        "adaptive_validation": validation,
+    })
+    tab._update_adaptive_state_row(status)
+    tab._update_observation_display(status)
+    tab.show()
+    app.processEvents()
+    try:
+        cells = [tab.timeline_ser_cell, tab.timeline_evm_cell,
+                 tab.timeline_ab_cell, tab.observation_stats_cell]
+        assert min(cell.height() for cell in cells) >= 160
+        assert max(cell.height() for cell in cells) / min(cell.height() for cell in cells) <= 1.08
+        assert "回滚失败" in tab.observation_improvement_label.text()
+        assert "请立即停止测试" in tab.observation_improvement_label.text()
+        assert reason in tab.observation_stats_label.text()
     finally:
         tab.close()

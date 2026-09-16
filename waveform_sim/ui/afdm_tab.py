@@ -3,11 +3,7 @@ from PyQt5.QtWidgets import QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QHBoxLa
 from PyQt5.QtCore import QTimer
 import pyqtgraph as pg
 import numpy as np
-import sys
-import os
 import time
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 class AfdmTab(BaseWaveformTab):

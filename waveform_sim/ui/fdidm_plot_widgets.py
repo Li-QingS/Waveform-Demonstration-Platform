@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import sys
-import time
-from collections import deque
-
 import numpy as np
 import pyqtgraph as pg
 try:
@@ -14,11 +9,10 @@ try:
 except Exception:
     gl = None
     _PG_OPENGL_AVAILABLE = False
-from PyQt5.QtCore import Qt, QTimer, QSignalBlocker, pyqtSignal, QEvent, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QEvent, QSize
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton,
-    QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QSplitter,
-    QScrollArea, QSizePolicy, QCheckBox, QFileDialog, QDialog, QStackedLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
+    QSizePolicy, QStackedLayout,
 )
 
 

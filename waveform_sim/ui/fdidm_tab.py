@@ -10,8 +10,6 @@ This page intentionally removes alpha-beta heatmap and paper-figure modes.
 
 from __future__ import annotations
 
-import os
-import sys
 import threading
 import time
 from collections import OrderedDict
@@ -37,10 +35,6 @@ from PyQt5.QtWidgets import (
 
 from .base_waveform_tab import BaseWaveformTab
 from .fdidm_adaptive_widgets import AdaptiveControlBox, AdaptiveProcessPlots
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-
-
 
 from .fdidm_utils import alpha_ser_floor, copy_kwargs_with
 
@@ -1435,11 +1429,19 @@ class FDIDMTab(BaseWaveformTab):
         physical channel update rate are independent.
         """
         metric_events = [dict(h) for h in (history or []) if h.get("kind") == "metric"]
+        # Current runs publish independently decimated/smoothed metric events.
+        # Older exported histories only contain optimizer evaluations; render
+        # those as a fallback without changing the live metric pipeline.
+        legacy_evals = not metric_events
+        if legacy_evals:
+            metric_events = [dict(h) for h in (history or []) if h.get("kind") == "eval"]
+        source = "eval_fallback" if legacy_evals else "metric"
         switches = [dict(h) for h in (history or []) if h.get("kind") == "switch"]
         if not metric_events:
             return
 
-        if (len(metric_events) < self._time_plot_eval_count
+        if (source != getattr(self, "_time_plot_source", None)
+                or len(metric_events) < self._time_plot_eval_count
                 or len(switches) < self._time_switch_rendered):
             self._time_plot_eval_count = -1
             self._time_switch_rendered = 0
@@ -1453,6 +1455,7 @@ class FDIDMTab(BaseWaveformTab):
             self._time_switch_labels = []
             for curve in self._time_metric_curves.values():
                 curve.setData([], [])
+        self._time_plot_source = source
 
         if (len(metric_events) == self._time_plot_eval_count
                 and len(switches) == self._time_switch_rendered):
@@ -1464,7 +1467,7 @@ class FDIDMTab(BaseWaveformTab):
             "OFDM": [h.get("ser_ofdm", np.nan) for h in metric_events],
             "OTFS": [h.get("ser_otfs", np.nan) for h in metric_events],
             "AFDM": [h.get("ser_afdm", np.nan) for h in metric_events],
-            "FDIDM": [h.get("ser_fdidm", np.nan) for h in metric_events],
+            "FDIDM": [h.get("ser_fdidm", h.get("ser_current", np.nan)) for h in metric_events],
         }
         styles = {
             "OFDM": ((0, 114, 189), "o"),
@@ -1479,6 +1482,17 @@ class FDIDMTab(BaseWaveformTab):
                 float(v) if v is not None and np.isfinite(float(v)) and float(v) > 0 else np.nan
                 for v in values
             ], dtype=float)
+            if legacy_evals:
+                # Historical eval points were unsmoothed. Reconstruct the same
+                # causal log-domain EMA used by the current display publisher.
+                state = None
+                smoothed = np.full_like(y, np.nan)
+                for i, value in enumerate(y):
+                    if np.isfinite(value) and value > 0:
+                        log_value = float(np.log10(value))
+                        state = log_value if state is None else 0.28 * log_value + 0.72 * state
+                        smoothed[i] = float(10.0 ** state)
+                y = smoothed
             plotted[name] = y
             curve = self._time_metric_curves.get(name)
             if curve is None:

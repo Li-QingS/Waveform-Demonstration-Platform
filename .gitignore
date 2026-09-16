@@ -17,6 +17,26 @@ runs/
 # 调试日志
 *.log
 
+# 本地诊断/截图产物（不进入版本库）
+/log/*.json
+/_fdidm_v6_backup/
+/.tmp_diff.txt
+/alpha_beta_validation.json
+/bars*.png
+/current_*.png
+/debug_*.png
+/fdidm_hw.png
+/generic_hw.png
+/inspect_ui.png
+/legend_*.png
+/pair_*.png
+/tmp_check.png
+/commit_ui.py
+/head_ui.py
+/orig_ui.py
+/repaired_test.py
+/temp_blob.py
+
 # 压缩包 / 备份
 *.zip
 

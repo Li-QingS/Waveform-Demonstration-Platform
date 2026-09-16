@@ -131,37 +131,40 @@ def test_fdidm_time_plot_curves_are_smoothed(app):
         tab._on_qt_destroyed()
 
 
-def test_fdidm_sweep_channel_seed_separates_fdidm_from_ofdm(app):
-    """回归：SER-SNR 对比图使用固定信道，且所选信道能让 FDIDM 与 OFDM 分离。"""
-    from waveform_sim.simulation.simple_fdidm_rx import FDIDMTransceiver
+def test_fdidm_sweep_preserves_selected_seed_and_fair_reference(app, monkeypatch):
+    """The comparison keeps the selected realization, even if it is not flattering."""
+    from waveform_sim.simulation import simple_fdidm_rx
+
+    original = simple_fdidm_rx.FDIDMTransceiver
+    created = []
+
+    def recording_factory(**kwargs):
+        created.append(dict(kwargs))
+        return original(**kwargs)
+
+    monkeypatch.setattr(simple_fdidm_rx, "FDIDMTransceiver", recording_factory)
     tab = FDIDMTab()
     tab._search_worker = lambda *args, **kwargs: None
+    tab.SER_SNR_POINTS = (10.0,)
+    emitted = []
+    tab._emit_signal_safe = lambda name, *args: emitted.append((name, args)) or True
     base = dict(
-        alpha=0.0, beta=0.0, m_subcarriers=8, n_symbols=8,
+        alpha=0.0, beta=0.0, m_subcarriers=4, n_symbols=4,
         subcarrier_spacing_hz=300e3, mod_order="16QAM", channel_model="TDL-C",
         velocity_kmh=28080, doppler_radial_factor=0.10, decoder="ZF", snr_db=10.0,
         snr_definition="Eb/N0", optimize_indices=False, search_step=0.1,
-        fc_hz=20e9, link_mode="matrix", random_channel=True, channel_seed=42,
+        fc_hz=20e9, link_mode="matrix", random_channel=True, channel_seed=73,
         dynamic_channel=True, channel_dynamics="block",
         channel_coherence_frames=8, fast_channel_coherence_symbols=1,
         tf_notch_depth_db=0.0, tf_notch_count=0,
     )
     try:
-        seed = tab._pick_sweep_channel_seed(base, candidates=8, min_gain_db=0.3)
-        tb = FDIDMTransceiver(**dict(base, dynamic_channel=False,
-                                     channel_dynamics="fixed", channel_seed=seed,
-                                     snr_db=10.0))
-        ofdm = tb.evaluate_theory_point(0.0, 0.0, ebn0_db=10.0)["zf_theory_ser"]
-        res = tb.search_best_indices(step=0.1, ebn0_db=10.0,
-                                     objective_snr_points=[10.0], top_k=20,
-                                     significance_threshold_percent=0.0)
-        cands = res.get("top_candidates") or []
-        assert cands
-        exact = min(c["ser_at_working_ebn0"] for c in cands)
-        tied = [c for c in cands if c["ser_at_working_ebn0"] <= exact * (1 + 1e-9) + 1e-15]
-        best = min(tied, key=lambda c: (c["alpha"], c["beta"]))
-        fdidm = tb.evaluate_theory_point(best["alpha"], best["beta"],
-                                         ebn0_db=10.0)["zf_theory_ser"]
-        assert fdidm < ofdm * 0.98, "SER-SNR 图中 FDIDM 应与 OFDM 分离"
+        tab._theory_snr_worker(tab._auto_scan_token, base, threading.Event(), 0.0, 0.0)
+        assert created and created[0]["channel_seed"] == 73
+        assert created[0]["dynamic_channel"] is False
+        assert created[0]["channel_dynamics"] == "fixed"
+        points = {args[1]: float(args[3]) for name, args in emitted if name == "ser_snr_point"}
+        assert set(points) == {"OFDM", "OTFS", "AFDM", "FDIDM"}
+        assert points["FDIDM"] <= points["OFDM"] + 1e-12
     finally:
         tab._on_qt_destroyed()

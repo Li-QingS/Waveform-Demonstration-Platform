@@ -147,6 +147,16 @@ def test_overflow_samples_dropped_and_reported():
     assert not win.excluded and win.aggregate is not None
 
 
+def test_processing_gap_samples_are_dropped_separately_from_overflow():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, make_status(0, rx_processing_gap_count=0))
+    clock.advance(1.1)
+    session.on_sample(make_status(1, ser=0.05, rx_processing_gap_count=1))
+    assert session.anomaly_drops()[-1][1] == "processing_gap"
+    assert "processing_gap" in session._current.anomalies
+
+
 def test_anomaly_heavy_window_excluded():
     clock = FakeClock()
     session = AdvantageObservationSession(clock=clock)
@@ -195,6 +205,26 @@ def test_context_mismatch_marks_pair_not_comparable():
     pair = session.latest_pair()
     assert pair is not None and not pair.comparable
     assert "tdl_seed" in pair.comparability_note
+
+
+def test_rf_condition_change_splits_window_and_supersedes_stale_pair():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed(session, clock, 40, 0.05, carrier_freq=2.4e9, tx_gain=25.0)
+    session.on_toggle(True, 0.75, 0.8)
+    feed(session, clock, 40, 0.01, carrier_freq=2.4e9, tx_gain=25.0,
+         alpha=0.75, beta=0.8)
+    feed(session, clock, 40, 0.01, carrier_freq=2.5e9, tx_gain=25.0,
+         alpha=0.75, beta=0.8)
+
+    on_windows = [window for window in session.windows() if window.mode == MODE_ON]
+    assert on_windows and on_windows[-1].context["carrier_freq"] == 2.4e9
+    assert "context_change" in session._current.anomalies
+    pair = session.latest_pair()
+    assert pair is not None and not pair.comparable
+    assert pair.outcome == "inconclusive"
+    assert "carrier_freq" in pair.comparability_note
 
 
 def test_export_dict_is_json_serializable():
@@ -284,6 +314,20 @@ def test_power_contract_mismatch_marks_pair_inconclusive():
     assert not pair.comparable
     assert pair.outcome == "inconclusive"
     assert "功率不可比" in pair.comparability_note
+
+
+def test_backend_improved_cannot_override_power_mismatch():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    feed_exact(session, clock, 40, 0.05, power_rms=0.2, contract_id="p1")
+    session.on_toggle(True, 0.75, 0.8)
+    feed_exact(session, clock, 40, 0.01, power_rms=0.1, contract_id="p1",
+               state="improved", alpha=0.75, beta=0.8)
+    pair = session.latest_pair()
+    assert pair is not None and not pair.comparable
+    assert pair.outcome == "inconclusive"
+    assert "功率不可比" in pair.validation_reason
 
 
 def test_backend_validation_outcome_and_reason_are_preserved():
@@ -396,3 +440,86 @@ def test_idle_samples_ignored_and_missing_fields_tolerated():
     win = session.windows()[0]
     assert win.dropped_samples == 1 and "sync_loss" in win.anomalies
     assert win.valid_samples == 10
+
+
+def test_latest_pair_uses_adjacent_local_off_window_after_multiple_cycles():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    frames, ok, overflow = feed(session, clock, 40, 0.05)
+    session.on_toggle(True, 0.75, 0.8)
+    frames, ok, overflow = feed(
+        session, clock, 40, 0.01, _frames=frames, _ok=ok, _overflow=overflow,
+        alpha=0.75, beta=0.8,
+    )
+    session.on_toggle(False, 0.5, 1.0)
+    frames, ok, overflow = feed(
+        session, clock, 40, 0.20, _frames=frames, _ok=ok, _overflow=overflow,
+    )
+    session.on_toggle(True, 0.8, 0.7)
+    feed(
+        session, clock, 40, 0.02, _frames=frames, _ok=ok, _overflow=overflow,
+        alpha=0.8, beta=0.7,
+    )
+
+    pair = session.latest_pair()
+    assert pair is not None and pair.comparable
+    assert pair.before.ser == pytest.approx(0.20)
+    assert pair.after.ser == pytest.approx(0.02)
+
+
+def test_context_split_does_not_reuse_previous_cycle_as_current_baseline():
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    frames, ok, overflow = feed(session, clock, 40, 0.05, carrier_freq=2.4e9)
+    session.on_toggle(True, 0.75, 0.8)
+    feed(
+        session, clock, 40, 0.01, _frames=frames, _ok=ok, _overflow=overflow,
+        carrier_freq=2.4e9, alpha=0.75, beta=0.8,
+    )
+    # The channel changes while the ON segment is active.  The new segment
+    # has no adjacent OFF baseline and must remain explicitly inconclusive.
+    feed(
+        session, clock, 20, 0.01, carrier_freq=2.5e9,
+        alpha=0.75, beta=0.8,
+    )
+    pair = session.latest_pair()
+    assert pair is not None and not pair.comparable
+    assert pair.outcome == "inconclusive"
+    assert "carrier_freq" in pair.comparability_note
+
+
+def test_completed_pair_expires_when_trailing_off_context_changes():
+    """A later channel state must not leave the previous cycle as the claim."""
+    clock = FakeClock()
+    session = AdvantageObservationSession(clock=clock)
+    session.start(False, {})
+    frames, ok, overflow = feed(
+        session, clock, 40, 0.05, carrier_freq=2.4e9, tdl_seed=11)
+    session.on_toggle(True, 0.75, 0.8)
+    frames, ok, overflow = feed(
+        session, clock, 40, 0.01, _frames=frames, _ok=ok, _overflow=overflow,
+        carrier_freq=2.4e9, tdl_seed=11, alpha=0.75, beta=0.8)
+    # Finish the first ON window and begin collecting a new OFF baseline.
+    session.on_toggle(False, 0.5, 1.0)
+    assert session.latest_pair() is not None
+
+    # The channel changes before the next candidate is applied.  The prior
+    # pair is now stale and must disappear until a fresh adjacent OFF→ON pair
+    # has been collected.
+    feed(session, clock, 2, 0.20, _frames=frames, _ok=ok, _overflow=overflow,
+         carrier_freq=2.5e9, tdl_seed=12)
+    assert session.latest_pair() is None
+
+    frames, ok, overflow = feed(
+        session, clock, 40, 0.20, _frames=session._last_status_frames,
+        _ok=session._last_status_ok, _overflow=session._last_status_overflow,
+        carrier_freq=2.5e9, tdl_seed=12)
+    session.on_toggle(True, 0.8, 0.7)
+    feed(session, clock, 40, 0.02, _frames=frames, _ok=ok, _overflow=overflow,
+         carrier_freq=2.5e9, tdl_seed=12, alpha=0.8, beta=0.7)
+    pair = session.latest_pair()
+    assert pair is not None and pair.comparable
+    assert pair.before.ser == pytest.approx(0.20)
+    assert pair.after.ser == pytest.approx(0.02)

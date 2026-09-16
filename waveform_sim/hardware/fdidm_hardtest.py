@@ -23,7 +23,6 @@ from .evidence import (
     PilotFitMetrics,
     TxPowerContract,
     TxPowerMetrics,
-    analyze_unscaled_power,
     create_power_contract,
     frame_structure_metrics,
     measure_known_symbols,
@@ -35,6 +34,40 @@ from .evidence import (
 def project_log_directory() -> Path:
     """Return the repository-local directory used for FDIDM log exports."""
     return Path(__file__).resolve().parents[2] / "log"
+
+
+# Host-side guard for the FDIDM RF validation path.  UHD/daughterboard
+# reported ranges are intentionally not used as the safety policy: a device
+# can advertise a wider range than is appropriate for an antenna or direct
+# loopback bench.  The limit is a *configuration ceiling*, not a claim about
+# radiated power; the waveform peak limiter and external attenuation remain
+# mandatory for a direct RF connection.
+FDIDM_GAIN_MIN_DB = 0.0
+FDIDM_GAIN_MAX_DB = 45.0
+
+
+def validate_fdidm_gain(value: Any, *, name: str = "gain") -> float:
+    """Validate and normalize one FDIDM TX/RX gain setting.
+
+    Keeping this check at every public entry point (constructor, ``configure``
+    and the live setters) prevents an out-of-range value from bypassing the
+    UI and reaching UHD.  Non-finite values are rejected explicitly because
+    ``float('nan')`` would otherwise make comparisons and change detection
+    unreliable.
+    """
+
+    try:
+        gain = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a numeric dB value") from exc
+    if not math.isfinite(gain):
+        raise ValueError(f"{name} must be finite")
+    if gain < FDIDM_GAIN_MIN_DB or gain > FDIDM_GAIN_MAX_DB:
+        raise ValueError(
+            f"{name} must be between {FDIDM_GAIN_MIN_DB:.0f} and "
+            f"{FDIDM_GAIN_MAX_DB:.0f} dB (FDIDM host limit)"
+        )
+    return gain
 
 
 @dataclass
@@ -58,6 +91,10 @@ class WaveformBuildResult:
 
 
 class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
+    # Public aliases make the host-side RF limit discoverable to UI and
+    # integration callers without duplicating magic numbers.
+    GAIN_MIN_DB = FDIDM_GAIN_MIN_DB
+    GAIN_MAX_DB = FDIDM_GAIN_MAX_DB
     APP_MAGIC = b"MTPK"
     PILOT_SEED = 0xFD1D_0017  # deterministic pilot generator
     DEFAULT_PILOT_SYMBOL = (1.0 + 1.0j) / np.sqrt(2.0)
@@ -91,7 +128,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             max_full_htf_order: int = 4096,  # maximum order for full paper H_TF estimation
             channel_estimator: str = "full_htf",  # "full_htf" = paper Eq.(20)/(29) matrix receiver; "tdl_param" = software-TDL basis; "diag_tf" = fast diagnostic mode
             full_htf_update_interval_frames: int = 10000,  # kept for backward compatibility; one-shot mode ignores it
-            full_htf_once: bool = True,
+            full_htf_once: bool = False,
             process_interval_ms: float = 200.0,      # throttle heavy Python decoding to avoid UHD RX overflow
             usrp_buffer_frames: int = 2048,          # UHD streamer buffer hint for Windows/B210 stability
             tx_min_waveform_duration_ms: float = 500.0,  # repeat the FDIDM super-cycle into a long UHD-friendly vector
@@ -103,7 +140,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             residual_cfo_max_hz: float = 5_000.0,    # sanity limit for pilot residual CFO refinement
             startup_settle_ms: float = 800.0,        # drop dirty RX/probe windows after every USRP start
             startup_settle_windows: int = 3,         # additional fresh probe vectors to ignore after start/reconfigure
+            sync_half_len: Optional[int] = None,     # hardware default is long; offline fixtures may pin legacy geometry
             cfo_scan_min_score: float = 0.55,        # non-alias CFO must score at least this well without a lock/hint
+            preamble_refine_min_score: float = 0.20, # require a known-preamble match before channel estimation
             cfo_scan_jump_guard_hz: float = 12_000.0,# reject low-score CFO jumps far from last good CFO/hint
             coding_scheme: str = "conv12",          # "none" or "conv12" (rate-1/2 convolutional + interleaver)
             coding_interleaver: bool = True,
@@ -147,8 +186,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.carrier_freq = float(carrier_freq)
         self.sample_rate = float(samp_rate)
         self.samp_rate = self.sample_rate
-        self.tx_gain = float(tx_gain)
-        self.rx_gain = float(rx_gain)
+        self.tx_gain = validate_fdidm_gain(tx_gain, name="TX gain")
+        self.rx_gain = validate_fdidm_gain(rx_gain, name="RX gain")
         self.device_type = str(device_type)
         self.serial = serial
         self.tx_antenna = str(tx_antenna)
@@ -184,6 +223,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._estimator_forced_reason = ""
         self.full_htf_update_interval_frames = int(max(1, min(int(full_htf_update_interval_frames), 10_000)))
         self.full_htf_once = bool(full_htf_once)
+        # Hardware channels can drift while a probe cycle is running.  A
+        # one-shot full-H estimate is still available as an explicit opt-in,
+        # but the safe default refreshes CSI on each complete training frame.
         self.process_interval_sec = max(0.03, float(process_interval_ms) / 1000.0)
         self.usrp_buffer_frames = int(max(32, min(int(usrp_buffer_frames), 4096)))
         self.tx_min_waveform_duration_ms = float(max(0.0, min(float(tx_min_waveform_duration_ms), 5000.0)))
@@ -199,6 +241,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.startup_settle_sec = float(max(0.0, min(float(startup_settle_ms) / 1000.0, 5.0)))
         self.startup_settle_windows = int(max(0, min(int(startup_settle_windows), 32)))
         self.cfo_scan_min_score = float(max(0.0, min(float(cfo_scan_min_score), 1.0)))
+        self.preamble_refine_min_score = float(max(0.0, min(float(preamble_refine_min_score), 1.0)))
         self.cfo_scan_jump_guard_hz = float(max(0.0, min(float(cfo_scan_jump_guard_hz), max(self.sample_rate / 2.0, 1.0))))
         self._rx_settle_until_wall = 0.0
         self._rx_settle_windows_remaining = 0
@@ -268,6 +311,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._estimator_auto_note = ""
         self._resolve_effective_channel_estimator()
 
+        # Keep the requested preamble geometry available before frame timing is
+        # computed.  Hardware uses the long default; deterministic fixtures may
+        # pin a legacy value explicitly.
+        self.sync_half_len_requested = sync_half_len
+
         # Hardware/sync frame structure.
         # Frame = [pre_guard][sync_preamble][pilot_frame][data_frame][post_guard]
         self._recompute_strict_frame_timing()
@@ -294,7 +342,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._rebuild_pilot_matrices()
 
         # Runtime buffers/state.
-        self._lock = threading.Lock()
+        # A live validation waveform swap holds the RX state lock while it
+        # resets stale RX buffers.  That reset re-enters this lock on the same
+        # worker thread, so a non-reentrant Lock deadlocks the B210 flowgraph.
+        self._lock = threading.RLock()
         self._status = "idle"
         self._last_error = ""
         self._last_info = ""
@@ -303,10 +354,28 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._monitor_thread = None
         self._monitor_stop = threading.Event()
         self._usrp_args = self._build_device_args()
+        # Keep graph handles present even when GNU Radio is unavailable.  This
+        # lets offline ``configure()`` and diagnostic APIs follow the same
+        # code paths without attribute errors; live construction fills these
+        # handles in ``_build_top_block``.
+        self._vector_source = None
+        self._usrp_source = None
+        self._usrp_sink = None
+        self._tx_sink_vec = None
+        self._rx_sink_vec = None
         self._gr = None
         self._blocks = None
         self._uhd = None
+        self._runtime_available = False
+        self._runtime_import_error = ""
         self._import_runtime()
+        # ``_recompute_strict_frame_timing`` runs before optional GNU Radio
+        # imports so offline fixtures stay lightweight.  Once UHD is present,
+        # re-select the hardware-safe long repeated-half preamble before any
+        # buffers or TX vectors are allocated.  An explicit sync_half_len is
+        # preserved for deterministic replay/tests.
+        if self.sync_half_len_requested is None and self._gr is not None:
+            self._recompute_strict_frame_timing()
 
         self._buffer_keep = max(262144, 8 * self.frame_len)
         self._tx_buffer = _SampleRing(self._buffer_keep)
@@ -323,6 +392,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._rx_probe_last_fp = None
         self._rx_probe_total_est = 0
         self._rx_probe_start_t = 0.0
+        self._rx_probe_reanchor_pending = True
+        self._rx_probe_continuity = "unknown"
+        self._rx_probe_continuity_reason = "probe metadata unavailable"
+        # A probe_signal_vc exposes only the newest vector, not a cumulative
+        # UHD sample counter.  Keep an explicit continuity verdict so a vector
+        # that is internally well-formed is not mistaken for a proven stream
+        # continuation after a scheduler/USB queue jump.
+        self._rx_probe_last_update_wall = 0.0
+        self._rx_probe_last_abs_est = 0
+        self._rx_probe_last_delta = 0
+        self._rx_probe_last_vector_size = 0
+        self._rx_probe_continuity = "unknown"
+        self._rx_probe_generation = 0
+        self._rx_probe_stale_count = 0
         # Full-H_TF cache: first accepted CSI is reused until cleared or reconfigured.
         self._cached_htf_full: Optional[np.ndarray] = None
         self._cached_htf_leakage = float("nan")
@@ -334,7 +417,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._cached_H_cond_proxy = float("nan")
         self._full_htf_estimates = 0
         self._diag_csi_smooth: Optional[np.ndarray] = None
-        self._diag_csi_smooth_weight = 0.2
+        self._diag_csi_smooth_weight = 1.0
         self._cfo_smooth_hz = float("nan")
         self._rx_tracking_locked = False
         self._rx_tracking_failures = 0
@@ -360,6 +443,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._rx_last_update_wall = 0.0
         self._rx_spectrum_stale = True
         self._rx_spectrum_stale_sec = float("inf")
+        self._rx_input_rms = float("nan")
+        self._rx_input_peak = float("nan")
         # Constellation buffers.  _latest_constellation is POST-equalizer soft symbols
         # after residual gain/phase correction; _latest_constellation_pre_eq is the
         # cross-domain observation BEFORE equalization (Phi*y_TF or FDIT(Y_TF)).
@@ -400,11 +485,22 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.last_cfo_preamble_hz = 0.0
         self.last_cfo_source = "preamble"
         self.last_sync_metric = 0.0
+        self.last_preamble_reliable = False
+        self._preamble_reject_count = 0
         self.last_frame_ok = False
+        self.last_crc_ok = False
+        self.last_symbol_quality = "none"
+        self.last_effectively_ok = False
         self.last_bad_reason = "init"
         self.last_htf_nmse = 0.0
         self.last_cond_h_cross = float("nan")
         self.last_equalizer_warning = ""
+        self.last_residual_cfo_hz = 0.0
+        self.last_residual_cfo_confidence = 0.0
+        self.last_residual_cfo_pair_count = 0
+        self.last_residual_cfo_phase_std_rad = float("nan")
+        self.last_residual_cfo_accepted = False
+        self.last_residual_cfo_reject_reason = "not_estimated"
         self.last_evm_instant_percent = float("nan")
         self.last_evm_average_percent = float("nan")
         self.last_residual_gain_abs = float("nan")
@@ -416,6 +512,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._rx_last_overflow_samples = 0
         self._rx_overflow_reason = ""
         self._rx_overflow_threshold = 0
+        self._rx_processing_gap_count = 0
+        self._rx_last_processing_gap_samples = 0
+        self._rx_processing_gap_reason = ""
         self._last_processed_abs_start = -10 ** 18
         self._t0 = time.time()
         self._ber_hist_t: deque = deque(maxlen=200)
@@ -457,6 +556,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._adaptive_ab_eval_seq = 0
         self._adaptive_ab_last_queued_frame = -10**18
         self._adaptive_ab_last_applied_frame = -10**18
+        self._adaptive_ab_failed_until_frame = -10**18
+        self._adaptive_ab_rejected_context = None
+        self._adaptive_ab_rejected_pairs: Dict[tuple[float, float], int] = {}
         self._adaptive_ab_last_htf_identity = None
         self._adaptive_ab_force_next = False
         self._adaptive_ab_state = "idle" if self.adaptive_alpha_beta_enable else "disabled"
@@ -477,12 +579,24 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         }
 
         self._set_tx_text_internal(tx_text)
-        self._build_top_block()
+        # GNU Radio/UHD is optional for offline construction and deterministic
+        # decoder/configuration tests.  Do not build a flowgraph until the
+        # runtime is available; ``start()`` reports the actionable dependency
+        # error if a caller tries to use the live RF path.
+        if self._runtime_available:
+            self._build_top_block()
+        else:
+            self._needs_top_block_rebuild = True
+            self._status = "offline"
+            self._last_error = self._runtime_unavailable_message()
+            self._debug("WARN", self._last_error)
         self._debug("INFO",
-                    f"FDIDM backend v35 ready: chain={self.strict_chain_name}, "
+                    f"FDIDM hardware backend ready: chain={self.strict_chain_name}, "
                     f"estimator={self.channel_estimator} (requested={getattr(self, 'requested_channel_estimator', self.channel_estimator)}), use_full_htf={self.use_full_htf}, "
                     f"H_once={self.full_htf_once}, H_update_legacy={self.full_htf_update_interval_frames} frame(s), "
                     f"channel_mode={self.channel_mode}, "
+                    f"RF={self.carrier_freq / 1e6:.3f}MHz, TX/RX gain={self.tx_gain:.1f}/{self.rx_gain:.1f}dB, "
+                    f"ant={self.tx_antenna}->{self.rx_antenna}, device={self._usrp_args}, "
                     f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f} ns, fd={self.tdl_doppler_hz:.1f} Hz, "
                     f"spread={self.tdl_doppler_spread_hz:.1f} Hz, TDL_injected_SNR={self.tdl_snr_db:.1f} dB, "
                     f"process_interval={self.process_interval_sec*1000:.0f} ms, "
@@ -511,7 +625,19 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
     # =========================================================
     def _recompute_strict_frame_timing(self):
         self.pre_guard_len = max(16, self.M)
-        self.sync_half_len = max(32, self.M)
+        # A short repeated half gives a very wide CFO alias period but poor
+        # phase precision.  Keep a bounded, hardware-oriented minimum so the
+        # B210 has enough samples to average oscillator noise while avoiding
+        # unbounded preamble growth for large M.
+        requested_sync = getattr(self, "sync_half_len_requested", None)
+        if requested_sync is not None:
+            self.sync_half_len = max(32, int(requested_sync))
+        elif getattr(self, "_gr", None) is not None:
+            self.sync_half_len = max(128, 8 * self.M)
+        else:
+            # Keep no-UHD deterministic fixtures backward compatible.  This
+            # branch is never used by the live B210 path.
+            self.sync_half_len = max(32, self.M)
         self.sync_len = 2 * self.sync_half_len
         self.block_len = self.M + self.cp_len
         self.data_frame_len = self.N * self.block_len
@@ -719,7 +845,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         lim = self.compute_parameter_limits()
         ds = lim["tdl_delay_spread_limits"]
         return (
-            "v33 limits: "
+            "FDIDM link limits: "
             f"CFO common unamb=±{lim['cfo_unambiguous_hz']:.1f}Hz, "
             f"scan=±{lim['cfo_scan_max_hz']:.1f}Hz, practical≈±{lim['common_doppler_practical_hz']:.1f}Hz; "
             f"residual target<{lim['residual_cfo_target_hz']:.1f}Hz; "
@@ -1233,12 +1359,19 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         CFO-insensitive detector.  Timing is refined later with a CFO-scanned
         cross-correlation, so the broader autocorrelation plateau is safe.
         """
-        rx = np.asarray(rx, dtype=np.complex128)
+        rx = np.asarray(rx, dtype=np.complex128).reshape(-1)
         Ls = int(self.sync_len)
         L = int(self.sync_half_len)
-        if rx.size < Ls + 1:
+        sync = np.asarray(getattr(self, "sync_preamble", np.zeros(0, dtype=np.complex128)), dtype=np.complex128).reshape(-1)
+        sync_energy = float(getattr(self, "_sync_energy", float("nan")))
+        if (rx.size < Ls + 1 or L <= 0 or Ls <= 0 or sync.size != Ls
+                or not np.isfinite(sync_energy) or sync_energy <= 1e-12):
             return np.zeros(1, dtype=np.float64)
-        sync = self.sync_preamble.astype(np.complex128)
+        # Non-finite IQ must never create a synchronization peak. Replacing
+        # invalid samples with zero keeps the vector shape and makes all
+        # subsequent metrics finite while reducing the affected energy.
+        if not np.all(np.isfinite(rx)):
+            rx = np.nan_to_num(rx, nan=0.0, posinf=0.0, neginf=0.0)
         rx_abs2 = np.abs(rx) ** 2
         cum = np.concatenate([[0.0], np.cumsum(rx_abs2)])
 
@@ -1262,13 +1395,47 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         # The 0.85 factor prevents pure autocorr plateaus from out-ranking a
         # valid sharp cross-corr peak at low CFO, while still letting high-CFO
         # frames pass the 0.30 detector threshold.
-        return np.maximum(m_cross * gate, 0.85 * m_auto).astype(np.float64)
+        metric = np.maximum(m_cross * gate, 0.85 * m_auto)
+        return np.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
 
     def _preamble_cfo_period_hz(self) -> float:
         return float(self.sample_rate) / max(float(self.sync_half_len), 1.0)
 
     def _preamble_cfo_unambiguous_hz(self) -> float:
         return 0.5 * self._preamble_cfo_period_hz()
+
+    def _bounded_preamble_cfo_alias_hz(self, alias_hz: float) -> float:
+        """Normalize a repeated-preamble alias to a finite scan range."""
+        try:
+            fs = float(getattr(self, "sample_rate", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            fs = 0.0
+        if not np.isfinite(fs) or fs <= 0.0:
+            fs = 1.0
+        try:
+            half_len = float(getattr(self, "sync_half_len", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            half_len = 0.0
+        if not np.isfinite(half_len) or half_len <= 0.0:
+            half_len = 1.0
+        period = fs / half_len
+        if not np.isfinite(period) or period <= 0.0:
+            period = fs
+        try:
+            alias = float(alias_hz)
+        except (TypeError, ValueError, OverflowError):
+            alias = 0.0
+        if not np.isfinite(alias):
+            alias = 0.0
+        alias = ((alias + 0.5 * period) % period) - 0.5 * period
+        try:
+            configured_max = float(getattr(self, "cfo_search_max_hz", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            configured_max = 0.0
+        max_hz = min(configured_max, 0.49 * fs) if np.isfinite(configured_max) and configured_max > 0.0 else 0.0
+        if not np.isfinite(max_hz) or max_hz <= 0.0:
+            return 0.0
+        return float(np.clip(alias, -max_hz, max_hz))
 
     def _cfo_hint_hz(self) -> Optional[float]:
         """Return a soft CFO prior for alias resolution, never a hard override."""
@@ -1293,12 +1460,26 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         a candidate agrees with a recent good CFO / configured Doppler hint.
         This directly suppresses the observed fd=0 false locks around ±47 kHz.
         """
+        safe_alias = self._bounded_preamble_cfo_alias_hz(alias_hz)
         if not scored:
-            return float(alias_hz), 0.0, "empty"
-        scored = [(float(c), float(v)) for c, v in scored if np.isfinite(c) and np.isfinite(v)]
+            return safe_alias, 0.0, "empty"
+        try:
+            fs = float(getattr(self, "sample_rate", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            fs = 0.0
+        try:
+            configured_max = float(getattr(self, "cfo_search_max_hz", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            configured_max = 0.0
+        scan_max = min(configured_max, 0.49 * fs) if np.isfinite(fs) and fs > 0.0 and np.isfinite(configured_max) and configured_max > 0.0 else 0.0
+        scored = [
+            (float(c), float(np.clip(v, 0.0, 1.0)))
+            for c, v in scored
+            if np.isfinite(c) and np.isfinite(v) and abs(float(c)) <= scan_max + 1e-9
+        ]
         if not scored:
-            return float(alias_hz), 0.0, "empty_nonfinite"
-        alias = float(alias_hz)
+            return safe_alias, 0.0, "empty_nonfinite"
+        alias = safe_alias
         unamb = float(self._preamble_cfo_unambiguous_hz())
         min_score = float(getattr(self, "cfo_scan_min_score", 0.55))
         jump_guard = float(getattr(self, "cfo_scan_jump_guard_hz", 12000.0))
@@ -1334,31 +1515,54 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         alias_hz + k*Fs/L within ±cfo_search_max_hz, then the known preamble
         chooses the best one by compensated cross-correlation.
         """
-        alias = float(alias_hz)
-        period = max(self._preamble_cfo_period_hz(), 1e-12)
+        alias = self._bounded_preamble_cfo_alias_hz(alias_hz)
+        period = float(self._preamble_cfo_period_hz())
+        if not np.isfinite(period) or period <= 0.0:
+            period = max(float(getattr(self, "sample_rate", 1.0)), 1.0)
         if not bool(getattr(self, "cfo_search_enable", True)):
             return [alias]
-        max_hz = min(float(getattr(self, "cfo_search_max_hz", 0.0)), 0.49 * float(self.sample_rate))
+        try:
+            configured_max = float(getattr(self, "cfo_search_max_hz", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            configured_max = 0.0
+        fs = float(getattr(self, "sample_rate", 1.0))
+        if not np.isfinite(fs) or fs <= 0.0:
+            fs = 1.0
+        max_hz = min(configured_max, 0.49 * fs) if np.isfinite(configured_max) and configured_max > 0.0 else 0.0
+        if not np.isfinite(max_hz) or max_hz <= 0.0:
+            return [alias]
         if max_hz <= self._preamble_cfo_unambiguous_hz() + 1e-9:
             return [alias]
         k_min = int(np.ceil((-max_hz - alias) / period))
         k_max = int(np.floor((max_hz - alias) / period))
-        cands = [alias + k * period for k in range(k_min, k_max + 1)]
-        # Always include the raw alias first if numerical clipping removed it.
+        cands = []
+        for k in range(k_min, k_max + 1):
+            candidate = alias + k * period
+            if np.isfinite(candidate) and abs(candidate) <= max_hz + 1e-9:
+                cands.append(float(candidate))
+        # Always include an in-range alias if numerical endpoint rounding
+        # leaves the computed k interval empty.
         if not any(abs(c - alias) < 1e-9 for c in cands):
             cands.insert(0, alias)
-        return [float(c) for c in cands]
+        return cands or [alias]
 
     def _score_preamble_cfo(self, rx: np.ndarray, sync_start: int, cfo_hz: float) -> float:
         sync = self.sync_preamble.astype(np.complex128)
         Ls = int(sync.size)
         s = int(sync_start)
-        if s < 0 or s + Ls > rx.size:
+        if (s < 0 or s + Ls > rx.size or not np.isfinite(float(cfo_hz))
+                or not np.isfinite(float(getattr(self, "_sync_energy", float("nan"))))):
             return 0.0
         seg = np.asarray(rx[s:s + Ls], dtype=np.complex128)
+        if not np.all(np.isfinite(seg)):
+            return 0.0
         n = np.arange(Ls, dtype=np.float64)
         seg = seg * np.exp(-1j * 2.0 * np.pi * float(cfo_hz) * n / max(float(self.sample_rate), 1e-12))
-        return float((np.abs(np.vdot(sync, seg)) ** 2) / (self._sync_energy * (np.vdot(seg, seg).real + 1e-12)))
+        denom = float(self._sync_energy) * (float(np.vdot(seg, seg).real) + 1e-12)
+        if not np.isfinite(denom) or denom <= 1e-12:
+            return 0.0
+        value = float((np.abs(np.vdot(sync, seg)) ** 2) / denom)
+        return float(np.clip(value, 0.0, 1.0)) if np.isfinite(value) else 0.0
 
     def _refine_sync_and_cfo(self, rx: np.ndarray, coarse: int, search_radius: int = 24) -> Tuple[int, float, float, float]:
         """Refine sync timing and resolve high-Doppler CFO ambiguity.
@@ -1400,9 +1604,28 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         f"chosen={best_cfo:.1f}Hz, score={best_score:.3f}")
         return best_idx, best_cfo, best_score, best_alias
 
-    def _find_sync_peaks(self, metric: np.ndarray, max_candidates: int = 3) -> List[int]:
+    def _refined_preamble_is_reliable(self, score: float) -> bool:
+        """Decide whether a candidate really matches the deterministic preamble.
+
+        The coarse metric contains a repeated-half autocorrelation term so that
+        timing remains usable under CFO. Noise can occasionally create a high
+        value for that term. Channel estimation and EVM are therefore allowed
+        only after the CFO-compensated full-preamble correlation passes this
+        separate gate.
+        """
+        value = float(score)
+        threshold = float(getattr(self, "preamble_refine_min_score", 0.20))
+        return bool(np.isfinite(value) and value >= threshold)
+
+    def _find_sync_peaks(self, metric: np.ndarray, max_candidates: Optional[int] = None) -> List[int]:
         if metric.size <= 3:
             return []
+        if max_candidates is None:
+            # A probe vector may contain several frames.  Scale the search
+            # budget with the available span while keeping pathological noise
+            # windows bounded.
+            max_candidates = int(np.clip(metric.size // max(self.frame_len, 1) + 2, 3, 16))
+        max_candidates = max(1, int(max_candidates))
         max_metric = float(np.max(metric))
         if max_metric < self.sync_metric_threshold:
             return []
@@ -1447,8 +1670,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         a = rx[sync_start:sync_start + L]
         b = rx[sync_start + L:sync_start + 2 * L]
         P = np.sum(np.conj(a) * b)
+        if not (np.isfinite(P.real) and np.isfinite(P.imag)) or abs(P) <= 1e-15:
+            return 0.0
         phase = float(np.angle(P))
-        return float(phase * self.sample_rate / (2.0 * np.pi * max(L, 1)))
+        est = phase * float(self.sample_rate) / (2.0 * np.pi * max(L, 1))
+        # The repeated-half estimator is unambiguous only within +/- Fs/(2L).
+        # Clamp pathological numerical results before they enter alias search.
+        limit = 0.5 * float(self._preamble_cfo_period_hz())
+        return float(np.clip(est, -limit, limit)) if np.isfinite(est) else 0.0
 
     def _estimate_residual_cfo_from_pilot(self, pilot_samples: np.ndarray) -> float:
         """Refine residual CFO using all adjacent pilot OFDM symbols.
@@ -1460,11 +1689,18 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         diagonal, slowly varying TF channel; under strong TDL/Doppler it can be
         biased and should not override the preamble CFO by an implausible amount.
         """
+        self.last_residual_cfo_hz = 0.0
+        self.last_residual_cfo_confidence = 0.0
+        self.last_residual_cfo_pair_count = 0
+        self.last_residual_cfo_phase_std_rad = float("nan")
+        self.last_residual_cfo_accepted = False
+        self.last_residual_cfo_reject_reason = "insufficient_symbols"
         if self.N < 2:
             return 0.0
         try:
             y_tf = self._wigner(pilot_samples)
-        except ValueError:
+        except (ValueError, TypeError):
+            self.last_residual_cfo_reject_reason = "pilot_transform_failed"
             return 0.0
         x_tf = self._pilot_X_tf
         safe_x = np.where(np.abs(x_tf) < 1e-10, 1e-10 + 0j, x_tf)
@@ -1473,6 +1709,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         weights = np.abs(h[:, 1:]) * np.abs(h[:, :-1])
         good = np.isfinite(ratios) & np.isfinite(weights) & (weights > 1e-10)
         if not np.any(good):
+            self.last_residual_cfo_reject_reason = "no_finite_pairs"
             return 0.0
         # Robustly drop the weakest 20% pair products when enough samples exist.
         ww = weights[good]
@@ -1482,8 +1719,23 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             keep = ww >= floor
             ww = ww[keep]
             rr = rr[keep]
-        phasor = np.sum(ww * rr / np.maximum(np.abs(rr), 1e-12))
+        self.last_residual_cfo_pair_count = int(ww.size)
+        min_pairs = max(4, int(self.N // 2))
+        if ww.size < min_pairs:
+            self.last_residual_cfo_reject_reason = "too_few_pairs"
+            return 0.0
+        unit = rr / np.maximum(np.abs(rr), 1e-12)
+        phasor = np.sum(ww * unit)
         if not (np.isfinite(phasor.real) and np.isfinite(phasor.imag)) or abs(phasor) < 1e-12:
+            self.last_residual_cfo_reject_reason = "incoherent_pairs"
+            return 0.0
+        concentration = float(abs(phasor) / max(float(np.sum(ww)), 1e-12))
+        phase_resid = np.angle(unit * np.exp(-1j * np.angle(phasor)))
+        phase_std = float(np.sqrt(np.sum(ww * phase_resid ** 2) / max(float(np.sum(ww)), 1e-12)))
+        self.last_residual_cfo_confidence = concentration
+        self.last_residual_cfo_phase_std_rad = phase_std
+        if concentration < 0.35 or not np.isfinite(phase_std) or phase_std > 1.25:
+            self.last_residual_cfo_reject_reason = "low_phase_coherence"
             return 0.0
         phase = float(np.angle(phasor))
         block_period = float(self.block_len) / max(self.sample_rate, 1e-12)
@@ -1491,10 +1743,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         max_abs = min(float(getattr(self, "residual_cfo_max_hz", 5000.0)),
                       0.45 * float(self.sample_rate) / max(float(self.block_len), 1.0))
         if not np.isfinite(est):
+            self.last_residual_cfo_reject_reason = "nonfinite_estimate"
             return 0.0
         if abs(est) > max_abs:
             self._debug("DEBUG", f"residual CFO rejected as out-of-range: {est:.1f} Hz > {max_abs:.1f} Hz")
+            self.last_residual_cfo_reject_reason = "out_of_range"
             return 0.0
+        # A sub-Hz correction is below the practical resolution of a short pilot;
+        # accepting it only injects estimator noise into an otherwise locked frame.
+        if abs(est) < 0.5:
+            self.last_residual_cfo_reject_reason = "deadband"
+            return 0.0
+        self.last_residual_cfo_hz = float(est)
+        self.last_residual_cfo_accepted = True
+        self.last_residual_cfo_reject_reason = "accepted"
         return est
 
     def _fdidm_tx_matrix(self) -> np.ndarray:
@@ -1567,12 +1829,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         # by setting full_htf_once=False.
         return (int(self._frames_decode_ok) - int(self._cached_htf_frame_counter)) >= int(self.full_htf_update_interval_frames)
 
-    def _cache_full_htf(self, htf: np.ndarray, leakage: float):
-        """Cache H_TF and the expensive H=Phi H_TF A products for reuse.
-
-        This keeps the receiver paper-strict while avoiding repeated 256x256
-        matrix construction on every identical loopback frame.
-        """
+    def _prepare_full_htf_cache(self, htf: np.ndarray, leakage: float) -> Dict[str, Any]:
+        """Build full-H products without publishing a sync candidate as CSI."""
         K = int(self.full_htf_order)
         Htf = np.asarray(htf, dtype=np.complex128)
         if Htf.shape != (K, K):
@@ -1581,17 +1839,35 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         Phi = self._fdidm_rx_matrix()
         H = Phi @ Htf @ A
         Hh = H.conj().T
-        self._cached_htf_full = Htf.copy()
-        self._cached_htf_leakage = float(leakage)
+        try:
+            singular_values = np.linalg.svd(H, compute_uv=False)
+        except np.linalg.LinAlgError:
+            singular_values = np.zeros(0, dtype=np.float64)
+        finite_sv = singular_values[np.isfinite(singular_values) & (singular_values > 1e-12)]
+        cond = (float(np.max(finite_sv) / np.min(finite_sv))
+                if finite_sv.size else float("inf"))
+        return {
+            "htf": Htf.copy(), "leakage": float(leakage),
+            "H": H, "Hh": Hh, "HhH": Hh @ H, "Phi": Phi,
+            "cond": cond,
+            "singular_values": singular_values,
+        }
+
+    def _commit_full_htf_cache(self, prepared: Dict[str, Any]):
+        """Publish the selected, quality-accepted candidate for later frames."""
+        self._cached_htf_full = prepared["htf"]
+        self._cached_htf_leakage = float(prepared["leakage"])
         self._cached_htf_frame_counter = int(self._frames_decode_ok)
-        self._cached_H_cross = H
-        self._cached_Hh_cross = Hh
-        self._cached_HhH_cross = Hh @ H
-        self._cached_Phi = Phi
-        row_norm = np.linalg.norm(H, axis=1)
-        nz = row_norm[row_norm > 1e-12]
-        self._cached_H_cond_proxy = float(nz.max() / max(nz.min(), 1e-12)) if nz.size else float("inf")
+        self._cached_H_cross = prepared["H"]
+        self._cached_Hh_cross = prepared["Hh"]
+        self._cached_HhH_cross = prepared["HhH"]
+        self._cached_Phi = prepared["Phi"]
+        self._cached_H_cond_proxy = float(prepared["cond"])
         self._full_htf_estimates += 1
+
+    def _cache_full_htf(self, htf: np.ndarray, leakage: float):
+        """Cache H_TF and its cross-domain products for reuse."""
+        self._commit_full_htf_cache(self._prepare_full_htf_cache(htf, leakage))
 
     # =========================================================
     # Channel estimation
@@ -1618,7 +1894,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         offdiag_ratio = float(np.linalg.norm(Htf - diag, "fro") ** 2 / total)
         return Htf, offdiag_ratio
 
-    def _estimate_htf_diag_from_pilot(self, pilot_samples: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    def _estimate_htf_diag_from_pilot(self, pilot_samples: np.ndarray, *,
+                                      commit: bool = True, return_csi: bool = False):
         """Robust per-subcarrier TF channel estimate from one dense pilot frame.
 
         For a channel that is time-invariant over a frame and whose delay spread
@@ -1641,7 +1918,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
              tail-noise threshold are zeroed before transforming back.  Genuine
              channel taps are always kept, so this never deletes channel energy.
 
-        Returns (h_tf (M,N), selectivity, noise_var_cell).
+        Returns (h_tf (M,N), selectivity, noise_var_cell).  The receive
+        candidate search sets ``commit=False`` and ``return_csi=True`` so a
+        rejected candidate cannot change the cross-frame CSI cache.
         """
         y_tf = self._wigner(pilot_samples)                       # (M, N)
         x_tf = self._pilot_X_tf                                   # (M, N), |x|=const
@@ -1657,22 +1936,35 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         # Smooth the complete time-frequency pilot estimate once per frame.  The
         # equalizer below still consumes the time average, while the adaptive
         # worker receives this time-resolved copy so beta is not erased.
-        weight = float(np.clip(getattr(self, "_diag_csi_smooth_weight", 0.2), 0.02, 1.0))
+        # Each dense pilot already averages N symbols for the diagonal
+        # equalizer.  Independent RF frames have arbitrary common LO phase;
+        # mixing their complex CSI without phase registration corrupted live
+        # EVM even though the current pilot had a clean fit.  Keep the current
+        # frame as the production default.  An explicit weight below 1 is
+        # retained only for controlled experiments with phase-coherent input.
+        weight = float(np.clip(getattr(self, "_diag_csi_smooth_weight", 1.0), 0.02, 1.0))
         previous = getattr(self, "_diag_csi_smooth", None)
         if previous is not None and np.shape(previous) == np.shape(h_cell) and np.all(np.isfinite(previous)):
             h_cell_smooth = ((1.0 - weight) * np.asarray(previous, dtype=np.complex128) + weight * h_cell)
         else:
             h_cell_smooth = h_cell.copy()
-        self._diag_csi_smooth = h_cell_smooth.copy()
-        self._latest_adaptive_diag_csi = h_cell_smooth.copy()
+        if commit:
+            self._diag_csi_smooth = h_cell_smooth.copy()
+            self._latest_adaptive_diag_csi = h_cell_smooth.copy()
 
         # (1) average across the N pilot OFDM symbols -> per-subcarrier response.
         h_freq = np.mean(h_cell_smooth, axis=1)                   # (M,)
 
-        # Per-cell noise variance directly from the pilot residual (this is the
-        # quantity the diagonal MMSE load wants; far more reliable than the guard).
-        resid = h_cell_smooth - h_freq[:, None]
-        noise_var_cell = float(np.mean(np.abs(resid) ** 2)) if resid.size > h_freq.size else float("nan")
+        # MMSE needs the current-frame disturbance power.  Measuring the
+        # residual after EWMA CSI smoothing suppresses independent noise by
+        # roughly weight/(2-weight) (ninefold for the default weight=0.2),
+        # causing severe under-loading on faded subcarriers.
+        raw_resid = h_cell - np.mean(h_cell, axis=1)[:, None]
+        # h_cell=Ypilot/Xpilot, so its residual is in channel-coefficient
+        # units.  Convert back to data-grid noise power for the MMSE load.
+        pilot_power = float(np.mean(np.abs(x_tf) ** 2))
+        noise_var_cell = (float(np.mean(np.abs(raw_resid) ** 2)) * pilot_power
+                          if raw_resid.size > h_freq.size else float("nan"))
 
         # (2) impulse-response denoising of the averaged response.
         M = int(h_freq.size)
@@ -1691,6 +1983,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         h_abs = np.abs(h_freq)
         mean_abs = float(np.mean(h_abs)) + 1e-12
         selectivity = float(np.std(h_abs) / mean_abs)
+        if return_csi:
+            return h_tf, selectivity, noise_var_cell, h_cell_smooth.copy()
         return h_tf, selectivity, noise_var_cell
 
 
@@ -1930,7 +2224,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             return float("nan")
         return float(np.mean(np.abs(guard) ** 2))
 
-    def _pre_equalized_cross_observation(self, y_tf_data: np.ndarray) -> np.ndarray:
+    def _pre_equalized_cross_observation(
+        self, y_tf_data: np.ndarray, phi: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """Return the cross-domain received vector before channel equalization.
 
         For full-H_TF/TDL-param receivers this is y = Phi * vec(Y_TF), i.e.
@@ -1946,7 +2242,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if self.use_full_htf or self.use_tdl_param_htf:
                 K = int(self.full_htf_order)
                 y_tf_vec = y_tf.reshape(-1, order="F")[:K]
-                Phi = self._cached_Phi if (self._cached_Phi is not None and self.use_full_htf) else self._fdidm_rx_matrix()
+                Phi = phi if phi is not None else (
+                    self._cached_Phi if (self._cached_Phi is not None and self.use_full_htf)
+                    else self._fdidm_rx_matrix()
+                )
                 return (Phi @ y_tf_vec).reshape(-1, order="F")
             return self._fdit(y_tf).reshape(-1, order="F")
         except Exception:
@@ -1964,7 +2263,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         """
         H = np.asarray(h_tf_diag, dtype=np.complex128)
         Y = np.asarray(y_tf_data, dtype=np.complex128)
-        warning = "diag_tf_equalizer_not_general_paper_H"
+        warning = "diag_tf_equalizer_not_general_paper_H;source=diag_tf"
         h_abs = np.abs(H)
         if self.equalizer == "ZF":
             # Relative magnitude floor: on a deep frequency-selective fade a tiny
@@ -1982,7 +2281,15 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 warning += ";zf_floor_applied"
             Z = Y / safe_H
         else:  # MMSE
-            nv = max(float(noise_var) if np.isfinite(noise_var) else 0.0, 1e-12)
+            # A zero/invalid guard estimate must not collapse MMSE into ZF.
+            # Use a small relative floor tied to the measured channel power;
+            # this remains scale invariant for attenuated RF captures.
+            h_power = float(np.median(h_abs[h_abs > 1e-12]) ** 2) if np.any(h_abs > 1e-12) else 1.0
+            nv_raw = float(noise_var) if np.isfinite(noise_var) and noise_var > 0.0 else 0.0
+            nv_floor = max(1e-12, 1e-6 * h_power)
+            nv = max(nv_raw, nv_floor)
+            if nv_raw < nv_floor:
+                warning += ";mmse_noise_floor"
             W = np.conj(H) / (np.abs(H) ** 2 + nv)
             Z = Y * W
         x_hat = self._fdit(Z)
@@ -1999,7 +2306,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         return x_hat, cond_val, warning
 
     def _equalize_data_full_htf(self, y_tf_data: np.ndarray, h_tf: np.ndarray,
-                                noise_var: float) -> Tuple[np.ndarray, float, str]:
+                                noise_var: float, *,
+                                candidate_cache: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, float, str]:
         """Paper-strict receiver using H = Phi H_TF Phi^H (Eq. 29).
 
         Data path:
@@ -2008,7 +2316,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             H     = Phi H_TF A
         Then apply the paper's ZF/MMSE linear decoder to y = Hx+n.
 
-        v21 uses cached H, H^H and H^H H whenever H_TF is reused.
+        The solve is implemented in the SVD domain.  This avoids normal-equation
+        squaring of the condition number and makes a marginal RF estimate
+        observable instead of allowing it to explode the constellation.
         """
         K = int(self.full_htf_order)
         y_tf_vec = np.asarray(y_tf_data, dtype=np.complex128).reshape(-1, order="F")[:K]
@@ -2016,7 +2326,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         if Htf.shape != (K, K):
             raise ValueError(f"H_TF shape mismatch: {Htf.shape} != {(K, K)}")
 
-        use_cached_cross = (
+        use_cached_cross = candidate_cache is not None or (
             self._cached_htf_full is not None and
             Htf is self._cached_htf_full and
             self._cached_H_cross is not None and
@@ -2025,37 +2335,64 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._cached_Phi is not None
         )
         if use_cached_cross:
-            H = self._cached_H_cross
-            Hh = self._cached_Hh_cross
-            HhH = self._cached_HhH_cross
-            Phi = self._cached_Phi
-            cond_val = self._cached_H_cond_proxy
+            products = candidate_cache if candidate_cache is not None else {
+                "H": self._cached_H_cross, "Hh": self._cached_Hh_cross,
+                "HhH": self._cached_HhH_cross, "Phi": self._cached_Phi,
+                "cond": self._cached_H_cond_proxy,
+            }
+            H = products["H"]
+            Phi = products["Phi"]
+            cond_val = products["cond"]
         else:
             A = self._fdidm_tx_matrix()
             Phi = self._fdidm_rx_matrix()
             H = Phi @ Htf @ A
-            Hh = H.conj().T
-            HhH = Hh @ H
-            row_norm = np.linalg.norm(H, axis=1)
-            nz = row_norm[row_norm > 1e-12]
-            cond_val = float(nz.max() / max(nz.min(), 1e-12)) if nz.size else float("inf")
+            cond_val = float("nan")
 
-        y = Phi @ y_tf_vec
-        nv = max(float(noise_var) if np.isfinite(noise_var) else 0.0, 1e-12)
-        warning = ""
-        try:
-            if self.equalizer == "ZF":
-                x = np.linalg.solve(H, y)
+        warning_parts = ["source=tdl_param" if self.use_tdl_param_htf else "source=full_htf"]
+        H = np.asarray(H, dtype=np.complex128)
+        y = np.asarray(Phi, dtype=np.complex128) @ y_tf_vec
+        if H.shape != (K, K) or y.shape != (K,) or not np.all(np.isfinite(H)) or not np.all(np.isfinite(y)):
+            warning_parts.append("nonfinite_input")
+            x = np.zeros(K, dtype=np.complex128)
+            cond_val = float("inf")
+        else:
+            try:
+                U, s, Vh = np.linalg.svd(H, full_matrices=False)
+            except np.linalg.LinAlgError:
+                U = np.zeros((K, K), dtype=np.complex128)
+                s = np.zeros(K, dtype=np.float64)
+                Vh = np.zeros((K, K), dtype=np.complex128)
+                warning_parts.append("svd_failed")
+            if s.size:
+                s = np.asarray(s, dtype=np.float64)
+                s_max = float(np.max(s))
+                s_positive = s[s > max(s_max * 1e-15, 1e-15)] if s_max > 0.0 else np.zeros(0)
+                s_min = float(np.min(s_positive)) if s_positive.size else 0.0
+                cond_val = float(s_max / s_min) if s_min > 0.0 else float("inf")
+                rcond = float(np.clip(getattr(self, "adaptive_alpha_beta_rcond", 1e-6), 1e-8, 1e-2))
+                sv_floor = max(s_max * rcond, s_max * 1e-12, 1e-12)
+                active = s >= sv_floor
+                if not np.all(active):
+                    warning_parts.append("svd_truncated")
+                nv = max(float(noise_var) if np.isfinite(noise_var) else 0.0, 1e-12)
+                if self.equalizer == "ZF":
+                    gain = np.where(active, 1.0 / np.maximum(s, sv_floor), 0.0)
+                else:
+                    # SVD-MMSE is equivalent to (H^H H + nv I)^-1 H^H,
+                    # without forming a squared-condition normal equation.
+                    load = nv
+                    if not np.isfinite(load) or load <= 0.0:
+                        load = max(s_max * s_max * 1e-8, 1e-12)
+                        warning_parts.append("mmse_loaded")
+                    gain = np.where(active, s / (s * s + load), 0.0)
+                    if np.any(~active) or cond_val > 1.0 / rcond:
+                        warning_parts.append("mmse_loaded")
+                x = Vh.conj().T @ (gain * (U.conj().T @ y))
             else:
-                lhs = HhH + nv * np.eye(K, dtype=np.complex128)
-                rhs = Hh @ y
-                x = np.linalg.solve(lhs, rhs)
-        except np.linalg.LinAlgError:
-            warning = "H_cross_singular_used_loaded_normal_eq"
-            load = max(nv, 1e-6 * float(np.mean(np.abs(H) ** 2) + 1e-12))
-            lhs = HhH + load * np.eye(K, dtype=np.complex128)
-            rhs = Hh @ y
-            x = np.linalg.solve(lhs, rhs)
+                x = np.zeros(K, dtype=np.complex128)
+                warning_parts.append("svd_empty")
+        warning = ";".join(dict.fromkeys(warning_parts))
         # An ill-conditioned full-H_TF solve can amplify noise into very large
         # values; keep them finite and bounded so the downstream EVM/abs/**2 math
         # cannot overflow.  Well-conditioned (good) frames stay O(1) and untouched.
@@ -2341,7 +2678,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             mapped = legacy_baseband[m]
             self._channel_mode_note = (
                 f"legacy baseband-only channel_mode={raw!r} mapped to {mapped!r}; "
-                "baseband-only loopback is disabled in v33 so every run traverses the USRP RF path."
+                "baseband-only loopback is disabled; every run traverses the USRP RF path."
             )
             return mapped
         if m in ("rf_tdl_a", "rf_tdla", "hybrid_tdl_a", "hybrid_tdla", "usrp_tdl_a", "usrp_tdla"):
@@ -2445,11 +2782,24 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._blocks = blocks
             self._gr = gr
             self._uhd = uhd
+            self._runtime_available = True
+            self._runtime_import_error = ""
         except Exception as e:
-            raise RuntimeError(
-                "Cannot import GNU Radio/UHD. Please install gnuradio and gnuradio-uhd.\n"
-                f"Original error: {e}"
-            )
+            # Keep the algorithm/configuration backend usable on machines that
+            # do not have GNU Radio/UHD (CI, documentation builds, and offline
+            # waveform fixtures).  The live RF entry points still reject use
+            # with the original import detail via ``_runtime_unavailable_message``.
+            self._runtime_available = False
+            self._runtime_import_error = f"{type(e).__name__}: {e}"
+            self._blocks = None
+            self._gr = None
+            self._uhd = None
+
+    def _runtime_unavailable_message(self) -> str:
+        detail = str(getattr(self, "_runtime_import_error", "")).strip()
+        message = "GNU Radio/UHD runtime is unavailable; FDIDM is in offline mode. " \
+                  "Install gnuradio and gnuradio-uhd before starting the RF flowgraph."
+        return f"{message} ({detail})" if detail else message
 
     def _make_rx_ring_sink(self):
         """Fallback bounded RX sink for old GNU Radio builds.
@@ -2513,6 +2863,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         gr = self._gr
         blocks = self._blocks
         uhd = self._uhd
+
+        if not bool(getattr(self, "_runtime_available", False)) or gr is None or blocks is None or uhd is None:
+            self._needs_top_block_rebuild = True
+            raise RuntimeError(self._runtime_unavailable_message())
 
         old_tb = getattr(self, "_tb", None)
         if old_tb is not None:
@@ -2668,8 +3022,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._rx_last_update_wall = 0.0
             self._rx_spectrum_stale = True
             self._rx_spectrum_stale_sec = float("inf")
+            self._rx_input_rms = float("nan")
+            self._rx_input_peak = float("nan")
             self._rx_text = ""
             self._decode_ok = False
+            self.last_frame_ok = False
+            self.last_crc_ok = False
+            self.last_symbol_quality = "none"
+            self.last_effectively_ok = False
             self._match_bytes = 0
             self._ber_estimate = float("nan")
             self._last_error = ""
@@ -2679,6 +3039,15 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._tx_preview_start_t = time.time()
             self._rx_probe_total_est = 0
             self._rx_probe_last_fp = None
+            self._rx_probe_reanchor_pending = True
+            self._rx_probe_continuity = "unknown"
+            self._rx_probe_continuity_reason = "top_block rebuilt; probe metadata re-anchored"
+            self._rx_probe_last_update_wall = 0.0
+            self._rx_probe_last_abs_est = 0
+            self._rx_probe_last_delta = 0
+            self._rx_probe_last_vector_size = 0
+            self._rx_probe_generation = 0
+            self._rx_probe_stale_count = 0
             self._rx_last_overflow_samples = 0
             self._rx_overflow_reason = ""
             self._last_processed_abs_start = -10 ** 18
@@ -2735,13 +3104,23 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._last_known_symbol_metrics = KnownSymbolMetrics()
             self._last_pilot_fit_metrics = PilotFitMetrics()
             self.last_frame_ok = False
+            self.last_crc_ok = False
+            self.last_symbol_quality = "none"
+            self.last_effectively_ok = False
             self.last_bad_reason = reason
             self.last_sync_metric = 0.0
+            self.last_preamble_reliable = False
             self.last_cfo_est_hz = 0.0
             self.last_cfo_preamble_hz = 0.0
             self.last_cfo_source = "reset"
             self._last_cfo_alias_hz = float("nan")
             self._last_cfo_scan_score = float("nan")
+            self.last_residual_cfo_hz = 0.0
+            self.last_residual_cfo_confidence = 0.0
+            self.last_residual_cfo_pair_count = 0
+            self.last_residual_cfo_phase_std_rad = float("nan")
+            self.last_residual_cfo_accepted = False
+            self.last_residual_cfo_reject_reason = "reset"
             self.last_evm_instant_percent = float("nan")
             self.last_evm_average_percent = float("nan")
             self._evm_history.clear()
@@ -2752,14 +3131,28 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._rx_spectrum_stale = True
             self._rx_spectrum_stale_sec = float("inf")
             self._rx_samples_seen = 0
+            if reset_counters:
+                self._preamble_reject_count = 0
             self._rx_probe_total_est = 0
             self._rx_probe_last_fp = None
+            # Re-anchor wall-clock estimation together with the sample count.
+            # Keeping the old epoch while setting _rx_samples_seen to zero made
+            # the first vector after every live waveform swap look like a
+            # multi-million-sample overflow.
+            self._rx_probe_start_t = time.time()
+            self._rx_probe_reanchor_pending = True
             self._last_processed_abs_start = -10 ** 18
             self._last_process_t = 0.0
+            # A graph restart or alpha/beta swap can change the RF common
+            # phase.  Never seed the new candidate from the old CSI, even if
+            # phase-coherent smoothing was explicitly enabled.
+            self._diag_csi_smooth = None
+            self._latest_adaptive_diag_csi = np.zeros((self.M, self.N), dtype=np.complex128)
             if reset_counters:
                 self._frames_processed = 0
                 self._frames_decode_ok = 0
                 self._rx_overflow_count = 0
+                self._rx_processing_gap_count = 0
                 self._ser_errors_total = 0
                 self._ser_symbols_total = 0
                 self._ber_hist_t.clear()
@@ -2783,9 +3176,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
     def _in_startup_settle(self, rx_new_samples: int) -> bool:
         now = time.time()
         settling_time = now < float(getattr(self, "_rx_settle_until_wall", 0.0))
-        if int(rx_new_samples) > 0 and int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0:
-            self._rx_settle_windows_remaining = max(0, int(self._rx_settle_windows_remaining) - 1)
         settling_windows = int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0
+        if int(rx_new_samples) > 0 and settling_windows:
+            self._rx_settle_windows_remaining = max(0, int(self._rx_settle_windows_remaining) - 1)
+        # This vector is still part of the settle budget even when it consumes
+        # the last credit.  Compute before decrementing to avoid an off-by-one.
         return bool(settling_time or settling_windows)
 
     def _waveform_fingerprint(self) -> str:
@@ -2826,12 +3221,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
     def _sync_waveform_to_top_block(self):
         """Push the current TX vector into the GNU Radio source.
 
-        v32/v33-pre rebuilt the entire top_block from this offline path.  That made one
-        UI parameter application trigger two UHD teardown/build cycles: once
-        here and once again in configure().  v33 keeps this method side-effect
-        bounded: when stopped, it updates vector_source_c in place whenever
-        possible and only queues a rebuild if the vector source cannot be
-        updated or configure() already knows the graph structure changed.
+        When stopped, update vector_source_c in place. While running, pause
+        the current flowgraph before replacing the repeating vector, then
+        restart that same graph. This avoids a UHD object rebuild and avoids
+        changing vector_source_c data concurrently with its scheduler work.
         """
 
         if self._tb is None or self._vector_source is None:
@@ -2841,9 +3234,22 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
         fingerprint = self._waveform_fingerprint()
         data_list = self._tx_waveform.astype(np.complex64).tolist()
-        path = "live swap" if self._running else "offline set_data"
+        live = bool(self._running)
+        path = "paused live swap" if live else "offline set_data"
         self._debug("INFO", f"sync ({path} path): {fingerprint}")
+        paused = False
         try:
+            if live:
+                # vector_source_c.set_data() is not safe to call while the
+                # scheduler is consuming its repeating vector. On B210 this
+                # blocked the first alpha/beta validation indefinitely. Keep
+                # the graph and UHD objects, but stop their streaming threads
+                # for the short waveform replacement.
+                self._debug("INFO", "live waveform sync: pausing top_block")
+                self._tb.stop()
+                paused = True
+                self._tb.wait()
+                self._debug("INFO", "live waveform sync: top_block paused")
             try:
                 self._vector_source.set_data(data_list, [])
             except TypeError:
@@ -2857,14 +3263,29 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     self._tdl_channel_block.reset_channel()
                 except Exception:
                     pass
+            if live:
+                self._tb.start()
+                paused = False
+                self._debug("INFO", "live waveform sync: top_block restarted")
             self._needs_top_block_rebuild = False
             self._reset_rx_runtime_state(reason=f"waveform_sync_{path.replace(' ', '_')}", reset_counters=False)
             self._debug("INFO", f"{path}: set_data() + rewind ok")
         except Exception as e:
+            if paused:
+                try:
+                    self._tb.start()
+                    self._debug("WARN", "live waveform sync failed; previous graph restarted")
+                except Exception as restart_exc:
+                    self._running = False
+                    self._status = "stopped"
+                    self._monitor_stop.set()
+                    self._debug("ERROR", f"live waveform sync restart failed: {type(restart_exc).__name__}: {restart_exc}")
             self._debug("WARN",
                         f"{path}: set_data() failed ({type(e).__name__}: {e}); "
                         f"queued top_block rebuild for next start/configure")
             self._needs_top_block_rebuild = True
+            if live:
+                raise RuntimeError(f"live waveform sync failed: {type(e).__name__}: {e}") from e
 
     # Legacy alias kept for any external caller.
     def _push_new_waveform_to_source(self):
@@ -2906,6 +3327,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             startup_settle_ms: Optional[float] = None,
             startup_settle_windows: Optional[int] = None,
             cfo_scan_min_score: Optional[float] = None,
+            preamble_refine_min_score: Optional[float] = None,
             cfo_scan_jump_guard_hz: Optional[float] = None,
             coding_scheme: Optional[str] = None,
             coding_interleaver: Optional[bool] = None,
@@ -3029,15 +3451,26 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     rebuild_top_block = True
             else:
                 rebuild_top_block = True
-        if tx_gain is not None and float(tx_gain) != self.tx_gain:
-            self.tx_gain = float(tx_gain)
+        # Validate both sides before mutating either one.  A UI Apply sends
+        # the complete parameter set; rejecting an invalid RX value must not
+        # leave a valid TX edit half-applied.
+        new_tx_gain = (
+            validate_fdidm_gain(tx_gain, name="TX gain")
+            if tx_gain is not None else self.tx_gain
+        )
+        new_rx_gain = (
+            validate_fdidm_gain(rx_gain, name="RX gain")
+            if rx_gain is not None else self.rx_gain
+        )
+        if tx_gain is not None and new_tx_gain != self.tx_gain:
+            self.tx_gain = new_tx_gain
             if getattr(self, "_usrp_sink", None) is not None:
                 try:
                     self._usrp_sink.set_gain(self.tx_gain, 0)
                 except Exception:
                     pass
-        if rx_gain is not None and float(rx_gain) != self.rx_gain:
-            self.rx_gain = float(rx_gain)
+        if rx_gain is not None and new_rx_gain != self.rx_gain:
+            self.rx_gain = new_rx_gain
             if getattr(self, "_usrp_source", None) is not None:
                 try:
                     self._usrp_source.set_gain(self.rx_gain, 0)
@@ -3137,7 +3570,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self.tx_max_waveform_samples = v
                 rebuild_waveform = True
         if tx_prerender_tdl_before_rf is not None and not bool(tx_prerender_tdl_before_rf):
-            self._debug("WARN", "TDL->RF live Python channel was requested but is disabled in v33; TX-side TDL remains pre-rendered to protect UHD from underflow")
+            self._debug("WARN", "TDL->RF live Python channel was requested but is disabled; TX-side TDL remains pre-rendered to protect UHD from underflow")
         self.tx_prerender_tdl_before_rf = True
         if enable_realtime_scheduling is not None:
             self.enable_realtime_scheduling = bool(enable_realtime_scheduling)
@@ -3159,6 +3592,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self.startup_settle_windows = int(max(0, min(int(startup_settle_windows), 32)))
         if cfo_scan_min_score is not None:
             self.cfo_scan_min_score = float(max(0.0, min(float(cfo_scan_min_score), 1.0)))
+        if preamble_refine_min_score is not None:
+            self.preamble_refine_min_score = float(max(0.0, min(float(preamble_refine_min_score), 1.0)))
         if cfo_scan_jump_guard_hz is not None:
             self.cfo_scan_jump_guard_hz = float(max(0.0, min(float(cfo_scan_jump_guard_hz), max(self.sample_rate / 2.0, 1.0))))
         if coding_scheme is not None:
@@ -3375,6 +3810,15 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._rx_buffer = _SampleRing(self._buffer_keep)
                 self._rx_probe_last_fp = None
                 self._rx_probe_total_est = 0
+                self._rx_probe_reanchor_pending = True
+                self._rx_probe_continuity = "unknown"
+                self._rx_probe_continuity_reason = "top block rebuilt"
+                self._rx_probe_last_update_wall = 0.0
+                self._rx_probe_last_abs_est = 0
+                self._rx_probe_last_delta = 0
+                self._rx_probe_last_vector_size = 0
+                self._rx_probe_generation = 0
+                self._rx_probe_stale_count = 0
                 self._tx_preview_start_t = time.time()
             if getattr(self, "_estimator_auto_note", ""):
                 self._debug("WARN", self._estimator_auto_note)
@@ -3393,14 +3837,24 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         f"TDL_DS={self.tdl_rms_delay_spread_ns:.1f}ns, fd={self.tdl_doppler_hz:.1f}Hz, "
                         f"spread={self.tdl_doppler_spread_hz:.1f}Hz, TDL_injected_SNR={self.tdl_snr_db:.1f}dB")
             self._usrp_args = self._build_device_args()
-            self._build_top_block()
-            self._debug("INFO", self._format_link_limit_summary())
+            if self._runtime_available:
+                self._build_top_block()
+                self._debug("INFO", self._format_link_limit_summary())
+            else:
+                # Keep offline configuration deterministic.  The updated
+                # waveform/configuration is retained and the flowgraph is
+                # rebuilt automatically once a live runtime is installed.
+                self._needs_top_block_rebuild = True
+                self._last_error = self._runtime_unavailable_message()
+                self._debug("WARN", f"configure(): top_block rebuild deferred; {self._last_error}")
 
     # =========================================================
     # Runtime
     # =========================================================
     def start(self):
         if self._tb is None:
+            if not bool(getattr(self, "_runtime_available", False)):
+                raise RuntimeError(self._runtime_unavailable_message())
             raise RuntimeError("top_block not built")
         if self._running:
             self._debug("WARN", "start() called but already running; ignored")
@@ -3428,15 +3882,26 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     f"frame_len={self.frame_len}, alpha={self.alpha:.3f}, beta={self.beta:.3f}, "
                     f"mod={self.mod_order}, eq={self.equalizer}, Fs={self.sample_rate:.0f} Hz, "
                     f"coding={self._coding_summary()}, H_once={self.full_htf_once}, channel_mode={self.channel_mode}, "
+                    f"RF={self.carrier_freq / 1e6:.3f}MHz, TX/RX gain={self.tx_gain:.1f}/{self.rx_gain:.1f}dB, "
+                    f"ant={self.tx_antenna}->{self.rx_antenna}, "
                     f"tdl_prerender={self._tx_tdl_prerendered}, "
                     f"TDL_fd={self.tdl_doppler_hz:.1f} Hz")
         self._tb.start()
         self._tx_preview_start_t = time.time()
         self._rx_probe_start_t = time.time()
+        self._rx_probe_reanchor_pending = True
         self._arm_startup_settle()
         self._last_process_t = 0.0
         self._rx_probe_total_est = 0
         self._rx_probe_last_fp = None
+        self._rx_probe_continuity = "unknown"
+        self._rx_probe_continuity_reason = "run started"
+        self._rx_probe_last_update_wall = 0.0
+        self._rx_probe_last_abs_est = 0
+        self._rx_probe_last_delta = 0
+        self._rx_probe_last_vector_size = 0
+        self._rx_probe_generation = 0
+        self._rx_probe_stale_count = 0
         self._running = True
         self._status = "running"
         self._monitor_stop.clear()
@@ -3447,7 +3912,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._debug("INFO", "start(): monitor thread launched")
 
     def stop(self):
-        if not self._running:
+        monitor_alive = self._monitor_thread is not None and self._monitor_thread.is_alive()
+        if not self._running and not monitor_alive:
             self._debug("INFO", "stop() called but not running; ignored")
             return
         self._debug("INFO",
@@ -3507,19 +3973,82 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             fp_idx = np.linspace(0, vec.size - 1, sample_count, dtype=np.int64)
             fp = (int(vec.size), int(zlib.crc32(vec[fp_idx].tobytes()) & 0xFFFFFFFF))
             if fp == self._rx_probe_last_fp:
+                self._rx_probe_continuity = "stale"
+                self._rx_probe_continuity_reason = "probe fingerprint unchanged"
+                self._rx_probe_stale_count = int(getattr(self, "_rx_probe_stale_count", 0)) + 1
                 return vec, int(self._rx_samples_seen), int(vec.size), 0
             self._rx_probe_last_fp = fp
             now = time.time()
+            if bool(getattr(self, "_rx_probe_reanchor_pending", False)):
+                self._rx_probe_start_t = now
+                self._rx_probe_reanchor_pending = False
+                self._rx_probe_continuity = "unknown"
+                self._rx_probe_continuity_reason = "probe vector has no monotonic sample metadata"
+                self._rx_probe_last_update_wall = now
+                self._rx_probe_last_vector_size = int(vec.size)
+                self._rx_probe_last_delta = int(vec.size)
+                self._rx_probe_generation = int(getattr(self, "_rx_probe_generation", 0)) + 1
+                abs_est = max(1, int(vec.size))
+                # Keep the first estimated endpoint explicit.  Without this
+                # assignment a fresh vector reports a valid ``abs_seen`` to
+                # the monitor but leaves the public continuity metadata at
+                # zero until the next poll.
+                self._rx_probe_last_abs_est = int(abs_est)
+                return vec, abs_est, int(vec.size), int(vec.size)
             if self._rx_probe_start_t <= 0.0:
                 self._rx_probe_start_t = now
             abs_est = int(max(0.0, (now - self._rx_probe_start_t) * max(self.sample_rate, 1.0)))
             if abs_est <= int(self._rx_samples_seen):
                 abs_est = int(self._rx_samples_seen) + max(1, int(vec.size))
             newly = int(max(0, abs_est - int(self._rx_samples_seen)))
+            previous_wall = float(getattr(self, "_rx_probe_last_update_wall", 0.0))
+            previous_size = int(getattr(self, "_rx_probe_last_vector_size", 0))
+            dt = now - previous_wall if previous_wall > 0.0 else float("nan")
+            expected = dt * max(float(self.sample_rate), 1.0) if np.isfinite(dt) and dt > 0.0 else float("nan")
+            self._rx_probe_last_delta = int(newly)
+            self._rx_probe_last_update_wall = now
+            self._rx_probe_last_vector_size = int(vec.size)
+            self._rx_probe_last_abs_est = int(abs_est)
+            self._rx_probe_generation = int(getattr(self, "_rx_probe_generation", 0)) + 1
+            if not np.isfinite(expected) or expected <= 0.0:
+                self._rx_probe_continuity = "unknown"
+                self._rx_probe_continuity_reason = "wall-clock interval unavailable"
+            elif newly <= 0:
+                self._rx_probe_continuity = "stale"
+                self._rx_probe_continuity_reason = "non-advancing wall-clock sample estimate"
+            elif expected > 0.0 and (newly < 0.25 * expected or newly > 4.0 * expected):
+                self._rx_probe_continuity = "gap"
+                self._rx_probe_continuity_reason = (
+                    f"sample delta {newly} differs from wall-clock estimate {expected:.0f}"
+                )
+            else:
+                self._rx_probe_continuity = "contiguous"
+                self._rx_probe_continuity_reason = (
+                    f"sample delta {newly}, wall-clock estimate {expected:.0f}, prior vector {previous_size}"
+                )
             return vec, abs_est, int(vec.size), newly
 
         vec, total, count = self._rx_buffer.read_latest(desired_len)
         newly = int(max(0, int(total) - int(self._rx_samples_seen)))
+        now = time.time()
+        self._rx_probe_last_delta = int(newly)
+        self._rx_probe_last_vector_size = int(count)
+        self._rx_probe_generation = int(getattr(self, "_rx_probe_generation", 0)) + (1 if newly > 0 else 0)
+        if newly <= 0:
+            self._rx_probe_continuity = "stale"
+            self._rx_probe_continuity_reason = "fallback ring has no new samples"
+            self._rx_probe_stale_count = int(getattr(self, "_rx_probe_stale_count", 0)) + 1
+        elif int(getattr(self, "_rx_samples_seen", 0)) <= 0:
+            # The fallback ring owns a monotonic cumulative sample counter.
+            # Its first positive advancement is therefore a real contiguous
+            # update even though the stream origin is not known.
+            self._rx_probe_continuity = "contiguous"
+            self._rx_probe_continuity_reason = "fallback ring cumulative count established"
+        else:
+            self._rx_probe_continuity = "contiguous"
+            self._rx_probe_continuity_reason = f"fallback ring cumulative count advanced by {newly}"
+        self._rx_probe_last_update_wall = now if newly > 0 else float(getattr(self, "_rx_probe_last_update_wall", 0.0))
+        self._rx_probe_last_abs_est = int(total)
         return vec, int(total), int(count), newly
 
     def _monitor_worker(self):
@@ -3544,9 +4073,18 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 rx_window, abs_seen, rx_buf_size, rx_data_size = self._read_rx_probe_window(process_window_len)
                 tx_data = self.get_tx_waveform_preview(min(8192, max(1, self._tx_waveform.size)))
                 now = time.time()
+                rx_recent = rx_window[-8192:].astype(np.complex64, copy=True)
+                if rx_recent.size:
+                    rx_input_rms = float(np.sqrt(np.mean(np.abs(rx_recent.astype(np.complex128)) ** 2)))
+                    rx_input_peak = float(np.max(np.abs(rx_recent)))
+                else:
+                    rx_input_rms = float("nan")
+                    rx_input_peak = float("nan")
                 with self._lock:
                     self._rx_samples_seen = int(abs_seen)
-                    self._latest_rx_samples = rx_window[-8192:].astype(np.complex64, copy=True)
+                    self._latest_rx_samples = rx_recent
+                    self._rx_input_rms = rx_input_rms
+                    self._rx_input_peak = rx_input_peak
                     self._latest_tx_samples = tx_data[-8192:].astype(np.complex64, copy=True)
                     self._rx_last_new_samples = int(rx_data_size)
                     self._rx_latest_window_len = int(rx_window.size)
@@ -3562,29 +4100,64 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         else:
                             self._rx_spectrum_stale_sec = float("inf")
                     tx_buf_size = len(self._tx_buffer)
-                overflow_window = bool(
+                    continuity = str(getattr(self, "_rx_probe_continuity", "unknown"))
+                    continuity_reason = str(getattr(self, "_rx_probe_continuity_reason", ""))
+                # A probe vector without proven continuity cannot seed timing or
+                # CSI.  Gap vectors remain useful as explicitly non-comparable
+                # diagnostics; stale/unknown vectors are not processed again.
+                if self._rx_probe_mode == "probe_signal_vc":
+                    if continuity == "stale":
+                        self._last_process_t = now
+                        if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
+                            break
+                        continue
+                    if continuity == "unknown":
+                        self._debug("DEBUG", f"probe continuity unknown; dropping vector: {continuity_reason}")
+                        self._last_process_t = now
+                        if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
+                            break
+                        continue
+                discontinuity_window = bool(
+                    (self._rx_probe_mode == "probe_signal_vc" and continuity == "gap") or
                     rx_data_size > int(getattr(self, "_rx_overflow_threshold", 0))
                     and rx_data_size > max(4 * int(rx_window.size), 65536)
                 )
-                if overflow_window:
+                if discontinuity_window:
                     with self._lock:
-                        self._rx_overflow_count = int(getattr(self, "_rx_overflow_count", 0)) + 1
-                        self._rx_last_overflow_samples = int(rx_data_size)
-                        self._rx_overflow_reason = (
-                            f"rx_delta={int(rx_data_size)} > threshold={int(self._rx_overflow_threshold)}"
-                        )
+                        if self._rx_probe_mode == "probe_signal_vc":
+                            self._rx_processing_gap_count = int(getattr(self, "_rx_processing_gap_count", 0)) + 1
+                            self._rx_last_processing_gap_samples = int(rx_data_size)
+                            self._rx_processing_gap_reason = (
+                                f"probe_delta={int(rx_data_size)} > threshold={int(self._rx_overflow_threshold)}"
+                            )
+                            discontinuity_kind = "RX processing/probe gap"
+                            suppress_window = False
+                        else:
+                            self._rx_overflow_count = int(getattr(self, "_rx_overflow_count", 0)) + 1
+                            self._rx_last_overflow_samples = int(rx_data_size)
+                            self._rx_overflow_reason = (
+                                f"rx_delta={int(rx_data_size)} > threshold={int(self._rx_overflow_threshold)}"
+                            )
+                            discontinuity_kind = "RX overflow/queue jump"
+                            suppress_window = True
                     self._debug(
                         "WARN",
-                        f"RX overflow/queue jump suppressed: new={int(rx_data_size)}, "
+                        f"{discontinuity_kind}: new={int(rx_data_size)}, "
                         f"window={int(rx_window.size)}, threshold={int(self._rx_overflow_threshold)}; "
-                        "discarding this window from decode/CSI",
+                        + ("discarding this window from decode/CSI" if suppress_window else
+                           "latest probe vector is contiguous; decoding it but excluding the interval from evidence"),
                     )
-                    # The probe has already advanced.  Continue draining and
-                    # let the next contiguous window re-establish sync.
-                    self._last_process_t = now
-                    if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
-                        break
-                    continue
+                    if suppress_window:
+                        # The callback ring has already advanced. Continue
+                        # draining and let the next contiguous window sync.
+                        self._watchdog_alpha_beta_validation(
+                            attempted=True,
+                            reason="RX overflow/queue discontinuity",
+                        )
+                        self._last_process_t = now
+                        if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
+                            break
+                        continue
                 # Heartbeat: log every ~2s so a static UI plot is easy to diagnose.
                 if now - self._monitor_last_log_t > 2.0:
                     dt = now - self._monitor_last_log_t
@@ -3594,6 +4167,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                                 f"TX buf={tx_buf_size}, RX buf={rx_buf_size}, "
                                 f"last_tx_chunk={tx_data.size}, last_rx_chunk={rx_data_size}, "
                                 f"rx_seen_total={abs_seen}, last_rate~{rate / 1000:.1f} kS/s, "
+                                f"RXrms={rx_input_rms:.3e}, RXpeak={rx_input_peak:.3e}, "
                                 f"rx_mode={self._rx_probe_mode}, probe_len={self._rx_probe_len}, "
                                 f"frames_processed={self._frames_processed}, "
                                 f"frames_decode_ok={self._frames_decode_ok}")
@@ -3610,10 +4184,22 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     if now - self._last_process_t >= float(self.process_interval_sec):
                         self._last_process_t = now
                         rx_window = rx_window[-process_window_len:]
+                        frames_before = int(self._frames_processed)
                         try:
-                            self._try_process_rx_window(rx_window.astype(np.complex128), abs_seen)
+                            self._try_process_rx_window(
+                                rx_window.astype(np.complex128), abs_seen,
+                                processing_gap=bool(discontinuity_window),
+                            )
                         except Exception as e:
                             self._debug("WARN", f"frame processing exception: {type(e).__name__}: {e}")
+                        if int(self._frames_processed) == frames_before:
+                            self._watchdog_alpha_beta_validation(
+                                attempted=True,
+                                reason=str(getattr(self, "last_bad_reason", "frame processing produced no evidence")),
+                            )
+                # Enforce the wall-clock deadline even while the RX stream is
+                # temporarily silent or the monitor is between decode attempts.
+                self._watchdog_alpha_beta_validation(attempted=False)
                 # Wake periodically; respond to stop quickly via Event.wait
                 if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
                     break
@@ -3623,7 +4209,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     break
         self._debug("INFO", f"monitor: exited after {self._monitor_cycles} cycles")
 
-    def _try_process_rx_window(self, rx_window: np.ndarray, abs_seen: int):
+    def _try_process_rx_window(
+        self, rx_window: np.ndarray, abs_seen: int, *, processing_gap: bool = False
+    ):
         # DSP on real RF captures legitimately produces denormal underflow (tiny
         # values from FFT tails / phasor exponentials) and, on an ill-conditioned
         # channel, transient overflow before the equalizer output is sanitized.
@@ -3631,9 +4219,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         # explicit magnitude floors/clamps in the estimators and equalizers - so
         # silence the spurious NumPy warnings around the whole receive pipeline.
         with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-            return self._try_process_rx_window_impl(rx_window, abs_seen)
+            return self._try_process_rx_window_impl(
+                rx_window, abs_seen, processing_gap=processing_gap
+            )
 
-    def _try_process_rx_window_impl(self, rx_window: np.ndarray, abs_seen: int):
+    def _try_process_rx_window_impl(
+        self, rx_window: np.ndarray, abs_seen: int, *, processing_gap: bool = False
+    ):
         known_cfo = self._software_known_cfo_for_current_mode()
         sync_rx = np.asarray(rx_window, dtype=np.complex128)
         if known_cfo is not None and abs(float(known_cfo)) > 1e-12:
@@ -3648,10 +4240,23 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         with self._lock:
             self.last_sync_metric = max_metric
 
-        peaks = self._find_sync_peaks(metric, max_candidates=3)
+        # Let the peak finder scale its bounded candidate budget with the
+        # actual RX window.  A fixed three-candidate cap silently drops valid
+        # frames when a probe vector spans several repeated cycles.
+        peaks = self._find_sync_peaks(metric, max_candidates=None)
         if not peaks:
             with self._lock:
+                # No candidate means there is no current decode result.  Clear
+                # legacy aliases as well, otherwise the UI can display the
+                # previous frame's CRC/match count beside ``symbol_quality=none``.
+                self._decode_ok = False
+                self._match_bytes = 0
                 self.last_frame_ok = False
+                self.last_crc_ok = False
+                self.last_symbol_quality = "none"
+                self.last_effectively_ok = False
+                self.last_preamble_reliable = False
+                self.last_evm_instant_percent = float("nan")
                 self.last_bad_reason = f"sync_peak_not_found({max_metric:.3f})"
             self._rx_tracking_failures = int(getattr(self, "_rx_tracking_failures", 0)) + 1
             if self._rx_tracking_failures >= 2:
@@ -3669,11 +4274,24 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
         best = None
         attempts = 0
+        max_refined_score = float("nan")
+        rejected_by_preamble = 0
         for coarse in peaks:
             attempts += 1
             sync_start, cfo_scan_hz, cfo_scan_score, cfo_alias_hz = self._refine_sync_and_cfo(
                 sync_rx, coarse, search_radius=max(16, self.M // 2)
             )
+            if not np.isfinite(max_refined_score) or float(cfo_scan_score) > max_refined_score:
+                max_refined_score = float(cfo_scan_score)
+            if not self._refined_preamble_is_reliable(cfo_scan_score):
+                rejected_by_preamble += 1
+                self._preamble_reject_count = int(getattr(self, "_preamble_reject_count", 0)) + 1
+                self._debug(
+                    "DEBUG",
+                    f"peak rejected: known-preamble score={float(cfo_scan_score):.3f} "
+                    f"below {self.preamble_refine_min_score:.3f} (coarse={coarse}, sync_start={sync_start})",
+                )
+                continue
             frame_start = sync_start - self.pre_guard_len
             frame_end = frame_start + self.frame_len
             if frame_start < 0 or frame_end > rx_window.size:
@@ -3696,6 +4314,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             else:
                 cfo_hz = float(cfo_hz_preamble)
                 cfo_source = "preamble_scan" if abs(float(cfo_scan_hz) - float(cfo_alias_hz)) > 0.5 else "preamble"
+            # Reject implausible oscillator jumps unless the preamble match is
+            # exceptionally strong. This prevents a noisy alias from poisoning
+            # tracking and equalizer phase on the next frame.
+            last_good = float(getattr(self, "_last_good_cfo_hz", float("nan")))
+            jump_guard = float(getattr(self, "cfo_scan_jump_guard_hz", 12000.0))
+            if (cfo_source.startswith("preamble") and np.isfinite(last_good)
+                    and abs(cfo_hz - last_good) > jump_guard
+                    and float(cfo_scan_score) < 0.85):
+                self._debug("DEBUG", f"candidate rejected: CFO jump {cfo_hz-last_good:.1f} Hz exceeds {jump_guard:.1f} Hz")
+                continue
             frame_raw = rx_window[frame_start:frame_end].copy()
             t_idx = np.arange(frame_raw.size, dtype=np.float64)
             frame = frame_raw * np.exp(-1j * 2.0 * np.pi * cfo_hz * t_idx / max(self.sample_rate, 1e-12))
@@ -3719,16 +4347,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 # the repeated preamble CFO correction is used and the path model
                 # handles the remaining TF coupling.
                 res_cfo = self._estimate_residual_cfo_from_pilot(pilot_samples)
-                if abs(res_cfo) > 0.0:
+                if bool(getattr(self, "last_residual_cfo_accepted", False)) and abs(res_cfo) > 0.0:
                     t_idx2 = np.arange(frame.size, dtype=np.float64)
                     frame = frame * np.exp(-1j * 2.0 * np.pi * res_cfo * t_idx2 / max(self.sample_rate, 1e-12))
                     pilot_samples = frame[self._off_pilot:self._off_data]
                     data_samples = frame[self._off_data:self._off_end]
-                    cfo_hz = cfo_hz + res_cfo
+                cfo_hz = cfo_hz + res_cfo
 
-            # Smooth valid CFO estimates across frames. The first estimate is
-            # used unchanged; later updates suppress random preamble phase jitter
-            # with one scalar multiply/add and no extra search.
+            # Smooth against the last *accepted* frame only.  A candidate may
+            # pass preamble correlation yet fail payload/quality checks; it
+            # must not overwrite the tracking state before that decision.
             if np.isfinite(cfo_hz):
                 cfo_frame_value = float(cfo_hz)
                 cfo_weight = 0.2
@@ -3740,33 +4368,32 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     frame = frame * np.exp(-1j * 2.0 * np.pi * (float(cfo_hz) - cfo_frame_value) * t_idx3 / max(self.sample_rate, 1e-12))
                     pilot_samples = frame[self._off_pilot:self._off_data]
                     data_samples = frame[self._off_data:self._off_end]
-                self._cfo_smooth_hz = float(cfo_hz)
-                self._rx_tracking_locked = True
-                self._rx_tracking_failures = 0
 
             htf_cache_refreshing = False
-            htf_old_snapshot = None
+            htf_candidate_cache = None
+            candidate_pilot_fit = PilotFitMetrics()
+            candidate_diag_csi = None
             try:
                 if self.use_full_htf:
                     if self._should_refresh_full_htf():
-                        htf_old_snapshot = self._snapshot_channel_cache()
                         h_tf_est, leakage = self._estimate_htf_full_from_pilot(pilot_samples)
-                        # Tentatively cache so the equalizer can use the precomputed
-                        # H, H^H, and H^H H. The cache is committed only after this
-                        # candidate proves good; otherwise it is rolled back below.
-                        self._cache_full_htf(h_tf_est, leakage)
+                        # Each sync peak needs its own CSI. Prepare the expensive
+                        # cross-domain products locally; do not make this estimate
+                        # visible to later candidates until selection and quality
+                        # checks have completed.
+                        htf_candidate_cache = self._prepare_full_htf_cache(h_tf_est, leakage)
                         htf_cache_refreshing = True
-                        h_tf_est = self._cached_htf_full
+                        h_tf_est = htf_candidate_cache["htf"]
                         h_abs = np.abs(h_tf_est)
                         nz_abs = h_abs[h_abs > 1e-12]
                         if nz_abs.size == 0:
                             nz_abs = np.array([0.0])
                         self._debug("INFO",
                                     f"FULL H_TF tentative update: order={self.full_htf_order}, "
-                                    f"estimate_count={self._full_htf_estimates}, reuse_interval={self.full_htf_update_interval_frames}, "
+                                    f"estimate_count={self._full_htf_estimates + 1}, reuse_interval={self.full_htf_update_interval_frames}, "
                                     f"|H|_mean={float(np.mean(nz_abs)):.4f}, |H|_min={float(nz_abs.min()):.4e}, "
                                     f"|H|_max={float(nz_abs.max()):.4e}, offdiag_energy={leakage:.3e}, "
-                                    f"cond_proxy={self._cached_H_cond_proxy:.2e}")
+                                    f"cond_proxy={htf_candidate_cache['cond']:.2e}")
                     else:
                         h_tf_est = self._cached_htf_full
                         leakage = float(self._cached_htf_leakage)
@@ -3775,7 +4402,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     # Re-estimated each frame to follow software TDL time variation.
                     h_tf_est, leakage = self._estimate_htf_tdl_param_from_pilot(pilot_samples)
                 else:
-                    h_tf_est, leakage, noise_var_cell = self._estimate_htf_diag_from_pilot(pilot_samples)
+                    h_tf_est, leakage, noise_var_cell, candidate_diag_csi = (
+                        self._estimate_htf_diag_from_pilot(
+                            pilot_samples, commit=False, return_csi=True
+                        )
+                    )
+                    candidate_pilot_fit = self._last_pilot_fit_metrics
                     h_abs = np.abs(h_tf_est)
                     self._debug("DEBUG",
                                 f"DIAG H_TF stats: |H|_mean={float(np.mean(h_abs)):.4f}, "
@@ -3807,10 +4439,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._debug("WARN", f"wigner failed: {type(e).__name__}: {e}")
                 continue
 
-            pre_eq_syms = self._pre_equalized_cross_observation(y_tf_data)
+            pre_eq_syms = self._pre_equalized_cross_observation(
+                y_tf_data, phi=htf_candidate_cache["Phi"] if htf_candidate_cache is not None else None
+            )
             tf_syms = np.asarray(y_tf_data, dtype=np.complex128).reshape(-1, order="F")
             if self.use_full_htf or self.use_tdl_param_htf:
-                x_hat, cond_val, warning = self._equalize_data_full_htf(y_tf_data, h_tf_est, noise_var)
+                x_hat, cond_val, warning = self._equalize_data_full_htf(
+                    y_tf_data, h_tf_est, noise_var, candidate_cache=htf_candidate_cache
+                )
                 if self.use_tdl_param_htf:
                     warning = (warning + ";" if warning else "") + f"tdl_param_fit_nmse={self._last_tdl_param_fit_nmse:.2e}"
             else:
@@ -3819,6 +4455,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             ber, raw_bytes, rx_payload, rx_text, match_bytes, decode_ok, rx_syms_best, evm_inst = (
                 self._recover_payload_from_symbols(rx_syms)
             )
+            # Demodulation diagnostics are mutated by each trial; snapshot
+            # them with this candidate so later, worse sync peaks cannot make
+            # the selected frame's BER/phase evidence inconsistent.
+            candidate_fec_ber = float(self._last_fec_bit_ber)
+            candidate_raw_ber = float(self._last_raw_bit_ber)
+            candidate_residual_gain = float(self.last_residual_gain_abs)
+            candidate_residual_phase = float(self.last_residual_phase_deg)
 
             sync_here = float(metric[min(max(int(coarse), 0), len(metric) - 1)])
             self._debug("DEBUG",
@@ -3852,12 +4495,23 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 pilot_samples=pilot_samples.astype(np.complex64),
                 data_samples=data_samples.astype(np.complex64),
                 evm_inst=float(evm_inst),
-                adaptive_htf=(getattr(self, "_latest_adaptive_diag_csi", h_tf_est)
+                fec_bit_ber=candidate_fec_ber,
+                raw_bit_ber=candidate_raw_ber,
+                residual_gain_abs=candidate_residual_gain,
+                residual_phase_deg=candidate_residual_phase,
+                residual_cfo_hz=float(getattr(self, "last_residual_cfo_hz", 0.0)),
+                residual_cfo_confidence=float(getattr(self, "last_residual_cfo_confidence", 0.0)),
+                residual_cfo_pair_count=int(getattr(self, "last_residual_cfo_pair_count", 0)),
+                residual_cfo_phase_std_rad=float(getattr(self, "last_residual_cfo_phase_std_rad", float("nan"))),
+                residual_cfo_accepted=bool(getattr(self, "last_residual_cfo_accepted", False)),
+                residual_cfo_reject_reason=str(getattr(self, "last_residual_cfo_reject_reason", "")),
+                adaptive_htf=(candidate_diag_csi
                               if not (self.use_full_htf or self.use_tdl_param_htf) else h_tf_est),
                 adaptive_htf_kind=("full" if (self.use_full_htf or self.use_tdl_param_htf) else "diag"),
                 adaptive_htf_source=("full_htf" if self.use_full_htf else ("tdl_param" if self.use_tdl_param_htf else "diag_tf")),
+                pilot_fit_metrics=candidate_pilot_fit,
                 htf_cache_refreshing=bool(htf_cache_refreshing),
-                htf_old_snapshot=htf_old_snapshot,
+                htf_candidate_cache=htf_candidate_cache,
             )
             if best is None or cand["score"] > best["score"]:
                 best = cand
@@ -3866,11 +4520,31 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
         if best is None:
             with self._lock:
+                self._decode_ok = False
+                self._match_bytes = 0
                 self.last_frame_ok = False
-                self.last_bad_reason = f"candidate_decode_fail({max_metric:.3f})"
+                self.last_crc_ok = False
+                self.last_symbol_quality = "none"
+                self.last_effectively_ok = False
+                self.last_preamble_reliable = False
+                self.last_evm_instant_percent = float("nan")
+                if np.isfinite(max_refined_score):
+                    self._last_cfo_scan_score = float(max_refined_score)
+                if rejected_by_preamble:
+                    self.last_bad_reason = (
+                        f"preamble_score_low({max_refined_score:.3f}<"
+                        f"{self.preamble_refine_min_score:.3f})"
+                    )
+                else:
+                    self.last_bad_reason = f"candidate_decode_fail({max_metric:.3f})"
+            self._rx_tracking_failures = int(getattr(self, "_rx_tracking_failures", 0)) + 1
+            if self._rx_tracking_failures >= 2:
+                self._rx_tracking_locked = False
+                self._cfo_smooth_hz = float("nan")
             self._debug("WARN",
                         f"all {attempts} sync candidate(s) failed: max_metric={max_metric:.3f}, "
-                        f"peaks={peaks}")
+                        f"max_known_preamble={max_refined_score:.3f}, rejected_by_preamble="
+                        f"{rejected_by_preamble}, peaks={peaks}")
             return
 
         known_metrics = measure_known_symbols(
@@ -3890,21 +4564,26 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 best["evm_inst"] < float(self.constellation_soft_evm_threshold)
             )
         )
-        # If a freshly estimated full-H_TF did not produce a good frame, roll it
-        # back. This prevents one bad estimate from poisoning all later frames.
-        if self.use_full_htf and best.get("htf_cache_refreshing") and not good_quality:
-            self._restore_channel_cache(best.get("htf_old_snapshot"))
+        trusted_quality = bool(good_quality and not processing_gap)
+        if trusted_quality and not (self.use_full_htf or self.use_tdl_param_htf):
+            accepted_csi = best.get("adaptive_htf")
+            if accepted_csi is not None:
+                self._diag_csi_smooth = np.asarray(accepted_csi, dtype=np.complex128).copy()
+                self._latest_adaptive_diag_csi = self._diag_csi_smooth.copy()
+        # Candidate CSI has stayed local through the whole sync search. Only
+        # the selected good frame may update the cross-frame cache.
+        if self.use_full_htf and best.get("htf_cache_refreshing") and not trusted_quality:
             self._debug("WARN",
                         f"FULL H_TF tentative update rejected: BER={best['ber']:.3e}, "
-                        f"EVM={best['evm_inst']:.2f}%, decode_ok={best['decode_ok']}; restored previous cache")
-        elif self.use_full_htf and best.get("htf_cache_refreshing"):
+                        f"EVM={best['evm_inst']:.2f}%, decode_ok={best['decode_ok']}; previous cache unchanged")
+        elif self.use_full_htf and best.get("htf_cache_refreshing") and trusted_quality:
             # Mark refresh against the successful decode count after the frame has
             # been accepted, so the reuse interval is measured in good frames.
-            self._cached_htf_frame_counter = int(self._frames_decode_ok)
+            self._commit_full_htf_cache(best["htf_candidate_cache"])
 
         if np.isfinite(best.get("evm_inst", float("nan"))):
             self.last_evm_instant_percent = float(best["evm_inst"])
-        if good_quality:
+        if trusted_quality:
             self._update_evm_history(best["evm_inst"])
         # Always publish the best candidate constellation as a diagnostic,
         # even if CRC/BER quality gates fail.  The status field
@@ -3913,10 +4592,21 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         post_points = self._prepare_constellation_points(best["rx_syms"], display_mode="raw")
         pre_points = self._prepare_constellation_points(best.get("rx_syms_pre_eq", np.zeros(0, dtype=np.complex64)), display_mode="raw")
         tf_points = self._prepare_constellation_points(best.get("rx_syms_tf", np.zeros(0, dtype=np.complex64)), display_mode="raw")
-        const_source = "post_eq_good" if good_quality else "post_eq_diagnostic_bad_frame"
+        const_source = "post_eq_good" if trusted_quality else ("post_eq_diagnostic_gap" if processing_gap else "post_eq_diagnostic_bad_frame")
         t_now = time.time() - self._t0
         with self._lock:
             self._last_known_symbol_metrics = known_metrics
+            self._last_fec_bit_ber = float(best["fec_bit_ber"])
+            self._last_raw_bit_ber = float(best["raw_bit_ber"])
+            self.last_residual_gain_abs = float(best["residual_gain_abs"])
+            self.last_residual_phase_deg = float(best["residual_phase_deg"])
+            self.last_residual_cfo_hz = float(best.get("residual_cfo_hz", 0.0))
+            self.last_residual_cfo_confidence = float(best.get("residual_cfo_confidence", 0.0))
+            self.last_residual_cfo_pair_count = int(best.get("residual_cfo_pair_count", 0))
+            self.last_residual_cfo_phase_std_rad = float(best.get("residual_cfo_phase_std_rad", float("nan")))
+            self.last_residual_cfo_accepted = bool(best.get("residual_cfo_accepted", False))
+            self.last_residual_cfo_reject_reason = str(best.get("residual_cfo_reject_reason", ""))
+            self._last_pilot_fit_metrics = best.get("pilot_fit_metrics", PilotFitMetrics())
             self._last_measured_ser = float(known_metrics.ser)
             self._ser_errors_total += int(known_metrics.ser_errors)
             self._ser_symbols_total += int(known_metrics.ser_symbols)
@@ -3924,16 +4614,25 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self.last_sync_index = int(best["frame_start"])
             self.last_payload_start = int(best["frame_start"] + self._off_data)
             self.last_sync_metric = float(best["sync_metric"])
+            self.last_preamble_reliable = True
             self.last_cfo_est_hz = float(best["cfo_hz"])
             self.last_cfo_preamble_hz = float(best.get("cfo_hz_preamble", best["cfo_hz"]))
             self.last_cfo_source = str(best.get("cfo_source", "preamble"))
             self._last_cfo_alias_hz = float(best.get("cfo_alias_hz", float("nan")))
             self._last_cfo_scan_score = float(best.get("cfo_scan_score", float("nan")))
             self._last_cfo_unambiguous_hz = float(self._preamble_cfo_unambiguous_hz())
-            if good_quality and np.isfinite(float(best["cfo_hz"])):
+            if trusted_quality and np.isfinite(float(best["cfo_hz"])):
+                self._cfo_smooth_hz = float(best["cfo_hz"])
+                self._rx_tracking_locked = True
+                self._rx_tracking_failures = 0
                 self._last_good_cfo_hz = float(best["cfo_hz"])
                 self._last_good_cfo_wall = time.time()
                 self._last_good_cfo_mode_key = self._current_cfo_mode_key()
+            elif not processing_gap and not good_quality:
+                self._rx_tracking_failures = int(self._rx_tracking_failures) + 1
+                if self._rx_tracking_failures >= 2:
+                    self._rx_tracking_locked = False
+                    self._cfo_smooth_hz = float("nan")
             self.last_htf_nmse = float(best["htf_leakage"])
             self.last_cond_h_cross = float(best["cond_h"])
             self.last_noise_var = float(best["noise_var"])
@@ -3941,10 +4640,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             # v18: meaningful "frame ok". decode_ok is CRC-authoritative; the soft
             # tier now means "link essentially working" (BER < 2%), not the v17
             # BER < 0.45 which is indistinguishable from random bits.
-            self.last_frame_ok = bool(best["decode_ok"] or best["ber"] < 0.02)
-            self.last_bad_reason = "ok" if best["decode_ok"] else (
-                "soft_ok" if best["ber"] < 0.02 else f"high_ber({best['ber']:.2f})"
-            )
+            self.last_crc_ok = bool(best["decode_ok"])
+            self.last_symbol_quality = ("diagnostic_gap" if processing_gap else ("good" if good_quality else "bad"))
+            self.last_effectively_ok = bool(trusted_quality and (best["decode_ok"] or best["ber"] < 0.02))
+            self.last_frame_ok = bool(self.last_effectively_ok)
+            self.last_bad_reason = "ok" if self.last_effectively_ok else ("processing_gap" if processing_gap else ("soft_ok" if best["ber"] < 0.02 else f"high_ber({best['ber']:.2f})"))
             self._latest_rx_frame_samples = np.asarray(best.get("frame_samples", []), dtype=np.complex64).copy()
             self._latest_rx_pilot_samples = np.asarray(best.get("pilot_samples", []), dtype=np.complex64).copy()
             self._latest_rx_data_samples = np.asarray(best.get("data_samples", []), dtype=np.complex64).copy()
@@ -3953,25 +4653,28 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._latest_constellation_post_eq_raw = np.asarray(best.get("rx_syms_post_raw", np.zeros(0, dtype=np.complex64)), dtype=np.complex64).copy()
             self._latest_constellation_pre_eq = pre_points.astype(np.complex64)
             self._latest_constellation_tf = tf_points.astype(np.complex64)
-            self._last_constellation_is_good = bool(good_quality)
+            self._last_constellation_is_good = bool(trusted_quality)
             self._last_constellation_source = const_source
             self.last_constellation_source = const_source
             self.last_constellation_points = int(self._latest_constellation.size)
-            self.last_constellation_quality = "good" if good_quality else "bad_candidate"
-            if good_quality:
+            self.last_constellation_quality = ("good" if trusted_quality else ("diagnostic_gap" if processing_gap else "bad_candidate"))
+            if trusted_quality:
                 self._last_good_constellation = self._latest_constellation.copy()
             self._last_raw_bytes = best["raw_bytes"]
             self._ber_estimate = float(best["ber"])
             self._ber_hist_t.append(t_now)
             self._ber_hist_v.append(max(float(best["ber"]), 1e-6))
+            # CRC is a per-candidate result, so do not leave a previous
+            # successful frame visible after a failed diagnostic attempt.
+            self._decode_ok = bool(best["decode_ok"])
+            self._match_bytes = int(best["match_bytes"])
             if best["rx_payload"]:
                 self._rx_text = best["rx_text"]
                 self._last_good_rx_payload = best["rx_payload"]
-                self._decode_ok = bool(best["decode_ok"])
-                self._match_bytes = int(best["match_bytes"])
             self._status = "running"
             expected_payload = max(1, len(self._tx_payload))
-            self._record_alpha_beta_performance_sample_locked({
+            if not processing_gap:
+                self._record_alpha_beta_performance_sample_locked({
                 "evm_instant_percent": float(best.get("evm_inst", float("nan"))),
                 "evm_average_percent": float(self.last_evm_average_percent),
                 "evm_average_count": int(len(self._evm_history)),
@@ -3987,7 +4690,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "cfo_abs_hz": abs(float(best.get("cfo_hz", 0.0))) if np.isfinite(float(best.get("cfo_hz", 0.0))) else float("nan"),
                 "decode_ok": bool(best.get("decode_ok", False)),
                 "match_ratio": float(best.get("match_bytes", 0)) / float(expected_payload),
-            })
+                })
             self._record_alpha_beta_validation_sample_locked({
                 "evm_average_percent": float(self.last_evm_average_percent),
                 "data_aided_evm_percent": float(known_metrics.data_aided_evm_percent),
@@ -3999,16 +4702,51 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "raw_bit_ber": float(getattr(self, "_last_raw_bit_ber", float("nan"))),
                 "crc_success_ratio": float(bool(best.get("decode_ok", False))),
                 "decode_ok": bool(best.get("decode_ok", False)),
-                "sync_valid": bool(best.get("sync_metric", 0.0) >= self.sync_metric_threshold),
-                "overflow": False,
+                "sync_valid": bool(self._refined_preamble_is_reliable(best.get("cfo_scan_score", float("nan")))),
+                "pilot_fit_nmse": float(getattr(best.get("pilot_fit_metrics", PilotFitMetrics()), "fit_nmse", float("nan"))),
+                "pilot_fitted_power": float(getattr(best.get("pilot_fit_metrics", PilotFitMetrics()), "fitted_power", float("nan"))),
+                # The newest probe vector itself may be contiguous, but a
+                # processing gap makes this A/B observation non-comparable.
+                "overflow": bool(processing_gap),
                 "tx_power_contract_id": str(self._tx_power_metrics.contract_id),
                 "tx_cycle_rms": float(self._tx_power_metrics.cycle_rms),
                 "context_key": self._alpha_beta_adaptation_context_key(),
             })
 
-        adaptive_channel_valid = not (
+        pilot_fit = best.get("pilot_fit_metrics", PilotFitMetrics())
+        fit_nmse = float(getattr(pilot_fit, "fit_nmse", float("nan")))
+        fit_sinr_db = float(getattr(pilot_fit, "residual_sinr_db", float("nan")))
+        cond_value = float(best.get("cond_h", float("nan")))
+        noise_value = float(best.get("noise_var", float("nan")))
+        scan_score = float(best.get("cfo_scan_score", float("nan")))
+        csi_reasons = []
+        if processing_gap:
+            csi_reasons.append("RX processing/probe gap")
+        if not self._refined_preamble_is_reliable(scan_score):
+            csi_reasons.append("unreliable preamble")
+        if not bool(good_quality) and (not np.isfinite(scan_score) or scan_score < 0.35):
+            csi_reasons.append(f"weak preamble score {scan_score:.3f}")
+        if not np.isfinite(cond_value) or cond_value > 1e10:
+            csi_reasons.append(f"ill-conditioned channel {cond_value:.2e}")
+        if not np.isfinite(noise_value) or noise_value <= 0.0:
+            csi_reasons.append("invalid noise estimate")
+        if str(best.get("adaptive_htf_kind", "")) == "diag":
+            if not np.isfinite(fit_nmse) or fit_nmse > 0.95:
+                csi_reasons.append(f"pilot fit NMSE {fit_nmse:.3f}")
+            # A perfect pilot fit is represented by +inf dB, which is valid.
+            if np.isnan(fit_sinr_db) or fit_sinr_db < -10.0:
+                csi_reasons.append(f"pilot residual SINR {fit_sinr_db:.1f} dB")
+        elif str(best.get("adaptive_htf_source", "")) == "tdl_param":
+            tdl_fit = float(getattr(self, "_last_tdl_param_fit_nmse", float("nan")))
+            if not np.isfinite(tdl_fit) or tdl_fit > 0.95:
+                csi_reasons.append(f"TDL fit NMSE {tdl_fit:.3f}")
+
+        # A gap frame is still useful to the asynchronous optimizer as a
+        # rejected observation.  Pass it through with ``csi_trustworthy=False``
+        # so the worker can account for the event without adopting its CSI.
+        adaptive_channel_valid = bool(processing_gap or not (
             self.use_full_htf and best.get("htf_cache_refreshing") and not good_quality
-        )
+        ))
         if adaptive_channel_valid:
             self._maybe_queue_alpha_beta_adaptation(
                 h_tf_est=best.get("adaptive_htf"),
@@ -4017,11 +4755,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 noise_var=float(best.get("noise_var", float("nan"))),
                 sync_metric=float(best.get("sync_metric", 0.0)),
                 good_quality=bool(good_quality),
+                csi_trustworthy=not csi_reasons,
+                csi_quality_reason="; ".join(csi_reasons),
             )
 
         self._debug(
             "INFO",
-            f"v33 frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
+            f"FDIDM frame: mode={self.channel_estimator}, full_cached={self._cached_htf_full is not None}, sync={best['sync_metric']:.3f}, CFO={best['cfo_hz']:.1f} Hz({best.get('cfo_source','preamble')}), rawCFO={best.get('cfo_hz_preamble', best['cfo_hz']):.1f} Hz, "
             f"alias={best.get('cfo_alias_hz', float('nan')):.1f}Hz, scanScore={best.get('cfo_scan_score', float('nan')):.3f}, "
             f"Hleak={best['htf_leakage']:.3f}, cond={best['cond_h']:.2e}, "
             f"BER={best['ber']:.3e}, rawBER={float(getattr(self, '_last_raw_bit_ber', float('nan'))):.3e}, "
@@ -4109,8 +4849,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self.constellation_display_mode = mode
 
     def set_tx_gain(self, value: float):
-        changed = float(value) != float(getattr(self, "tx_gain", value))
-        self.tx_gain = float(value)
+        gain = validate_fdidm_gain(value, name="TX gain")
+        changed = gain != float(getattr(self, "tx_gain", gain))
+        self.tx_gain = gain
         if changed:
             self._invalidate_alpha_beta_adaptation(reason="tx_gain_changed", cooldown=False)
         if getattr(self, "_usrp_sink", None) is not None:
@@ -4120,8 +4861,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 pass
 
     def set_rx_gain(self, value: float):
-        changed = float(value) != float(getattr(self, "rx_gain", value))
-        self.rx_gain = float(value)
+        gain = validate_fdidm_gain(value, name="RX gain")
+        changed = gain != float(getattr(self, "rx_gain", gain))
+        self.rx_gain = gain
         if changed:
             self._invalidate_alpha_beta_adaptation(reason="rx_gain_changed", cooldown=False)
         if getattr(self, "_usrp_source", None) is not None:
@@ -4264,6 +5006,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             ratio = (self._match_bytes / expected) if expected > 0 else 0.0
             return {
                 "decode_ok": bool(self._decode_ok),
+                # Explicit quality tiers mirror the debug/status contract;
+                # ``decode_ok`` remains the historical CRC-compatible alias.
+                "crc_ok": bool(getattr(self, "last_crc_ok", self._decode_ok)),
+                "symbol_quality": str(getattr(self, "last_symbol_quality", "none")),
+                "effectively_ok": bool(getattr(self, "last_effectively_ok", self.last_frame_ok)),
                 "match_bytes": int(self._match_bytes),
                 "expected_bytes": int(expected),
                 "match_ratio": float(ratio),
@@ -4426,20 +5173,41 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
 
     def get_debug_snapshot(self) -> Dict[str, Any]:
-        adaptive_ab = self.get_alpha_beta_adaptation_status()
         with self._lock:
+            # Keep lock order consistent with the RX worker and live waveform
+            # transition path (_lock -> _adaptive_ab_lock).  Reading adaptive
+            # status before acquiring _lock can deadlock against a frame that
+            # is publishing evidence while it waits for the adaptive lock.
+            adaptive_ab = self.get_alpha_beta_adaptation_status()
             return {
                 "frame_ok": bool(self.last_frame_ok),
                 "reason": str(self.last_bad_reason),
                 "sync_idx": int(self.last_sync_index),
                 "payload_start": int(self.last_payload_start),
                 "sync_metric": float(self.last_sync_metric),
+                "preamble_reliable": bool(getattr(self, "last_preamble_reliable", False)),
+                "preamble_refine_min_score": float(getattr(self, "preamble_refine_min_score", 0.20)),
+                "preamble_reject_count": int(getattr(self, "_preamble_reject_count", 0)),
+                "rf_tx_port": f"A:{self.tx_antenna}",
+                "rf_rx_port": f"A:{self.rx_antenna}",
+                "gain_limits_db": {
+                    "tx_min": float(FDIDM_GAIN_MIN_DB),
+                    "tx_max": float(FDIDM_GAIN_MAX_DB),
+                    "rx_min": float(FDIDM_GAIN_MIN_DB),
+                    "rx_max": float(FDIDM_GAIN_MAX_DB),
+                },
                 "cfo_est_hz": float(self.last_cfo_est_hz),
                 "cfo_preamble_hz": float(getattr(self, "last_cfo_preamble_hz", self.last_cfo_est_hz)),
                 "cfo_source": str(getattr(self, "last_cfo_source", "preamble")),
                 "cfo_alias_hz": float(getattr(self, "_last_cfo_alias_hz", float("nan"))),
                 "cfo_scan_score": float(getattr(self, "_last_cfo_scan_score", float("nan"))),
                 "cfo_last_good_hz": float(getattr(self, "_last_good_cfo_hz", float("nan"))),
+                "residual_cfo_hz": float(getattr(self, "last_residual_cfo_hz", 0.0)),
+                "residual_cfo_confidence": float(getattr(self, "last_residual_cfo_confidence", 0.0)),
+                "residual_cfo_pair_count": int(getattr(self, "last_residual_cfo_pair_count", 0)),
+                "residual_cfo_phase_std_rad": float(getattr(self, "last_residual_cfo_phase_std_rad", float("nan"))),
+                "residual_cfo_accepted": bool(getattr(self, "last_residual_cfo_accepted", False)),
+                "residual_cfo_reject_reason": str(getattr(self, "last_residual_cfo_reject_reason", "")),
                 "startup_settling": bool(time.time() < float(getattr(self, "_rx_settle_until_wall", 0.0)) or int(getattr(self, "_rx_settle_windows_remaining", 0)) > 0),
                 "startup_settle_windows_remaining": int(getattr(self, "_rx_settle_windows_remaining", 0)),
                 "ber": float(self._ber_estimate) if np.isfinite(self._ber_estimate) else float("nan"),
@@ -4470,8 +5238,26 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "rx_last_overflow_samples": int(getattr(self, "_rx_last_overflow_samples", 0)),
                 "rx_overflow_reason": str(getattr(self, "_rx_overflow_reason", "")),
                 "rx_overflow_threshold": int(getattr(self, "_rx_overflow_threshold", 0)),
+                "rx_processing_gap_count": int(getattr(self, "_rx_processing_gap_count", 0)),
+                "rx_last_processing_gap_samples": int(getattr(self, "_rx_last_processing_gap_samples", 0)),
+                "rx_processing_gap_reason": str(getattr(self, "_rx_processing_gap_reason", "")),
+                "rx_probe_continuity": str(getattr(self, "_rx_probe_continuity", "unknown")),
+                "rx_probe_continuity_reason": str(getattr(self, "_rx_probe_continuity_reason", "")),
+                "rx_probe_last_abs_est": int(getattr(self, "_rx_probe_last_abs_est", 0)),
+                "rx_probe_last_delta": int(getattr(self, "_rx_probe_last_delta", 0)),
+                "rx_probe_last_vector_size": int(getattr(self, "_rx_probe_last_vector_size", 0)),
+                "rx_probe_generation": int(getattr(self, "_rx_probe_generation", 0)),
+                "rx_probe_stale_count": int(getattr(self, "_rx_probe_stale_count", 0)),
+                # Explicit quality tiers.  ``decode_ok``/``frame_ok`` remain
+                # compatibility aliases, while these fields distinguish CRC,
+                # soft symbol quality, and a gap-free business result.
+                "crc_ok": bool(getattr(self, "last_crc_ok", self._decode_ok)),
+                "symbol_quality": str(getattr(self, "last_symbol_quality", "none")),
+                "effectively_ok": bool(getattr(self, "last_effectively_ok", self.last_frame_ok)),
                 "rx_spectrum_stale": bool(getattr(self, "_rx_spectrum_stale", True)),
                 "rx_spectrum_stale_sec": float(getattr(self, "_rx_spectrum_stale_sec", float("inf"))),
+                "rx_input_rms": float(getattr(self, "_rx_input_rms", float("nan"))),
+                "rx_input_peak": float(getattr(self, "_rx_input_peak", float("nan"))),
                 "constellation_source": str(getattr(self, "_last_constellation_source", "none")),
                 "constellation_is_good": bool(getattr(self, "_last_constellation_is_good", False)),
                 "constellation_good": bool(getattr(self, "_last_constellation_is_good", False)),
@@ -4565,7 +5351,6 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "tdl_param_num_sinusoids": int(getattr(self, "tdl_param_num_sinusoids", 8)),
                 "tdl_param_max_paths": int(getattr(self, "tdl_param_max_paths", 96)),
                 "constellation_quality": str(getattr(self, "last_constellation_quality", "unknown")),
-                "constellation_good": bool(getattr(self, "_last_constellation_is_good", False)),
                 "rx_frame_samples": int(np.asarray(getattr(self, "_latest_rx_frame_samples", []), dtype=np.complex64).size),
                 "rx_data_samples": int(np.asarray(getattr(self, "_latest_rx_data_samples", []), dtype=np.complex64).size),
                 "rx_pilot_samples": int(np.asarray(getattr(self, "_latest_rx_pilot_samples", []), dtype=np.complex64).size),
@@ -4590,8 +5375,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "subcarrier_spacing": self.subcarrier_spacing,
             "tx_gain": self.tx_gain,
             "rx_gain": self.rx_gain,
+            "gain_limits_db": {
+                "tx_min": float(FDIDM_GAIN_MIN_DB),
+                "tx_max": float(FDIDM_GAIN_MAX_DB),
+                "rx_min": float(FDIDM_GAIN_MIN_DB),
+                "rx_max": float(FDIDM_GAIN_MAX_DB),
+            },
+            "tx_gain_min_db": float(FDIDM_GAIN_MIN_DB),
+            "tx_gain_max_db": float(FDIDM_GAIN_MAX_DB),
+            "rx_gain_min_db": float(FDIDM_GAIN_MIN_DB),
+            "rx_gain_max_db": float(FDIDM_GAIN_MAX_DB),
             "device_type": self.device_type,
             "device_args": self._usrp_args,
+            "rf_tx_port": str(snap.get("rf_tx_port", f"A:{self.tx_antenna}")),
+            "rf_rx_port": str(snap.get("rf_rx_port", f"A:{self.rx_antenna}")),
             "mod_order": self.mod_order,
             "equalizer": self.equalizer,
             "alpha": float(self.alpha),
@@ -4622,6 +5419,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "fdidm_m": int(self.M),
             "fdidm_n": int(self.N),
             "cp_len": int(self.cp_len),
+            # Expose the actual runtime preamble geometry.  The hardware path
+            # selects a longer repeated half after UHD is available, while
+            # deterministic offline fixtures may request a shorter value.
+            "sync_half_len": int(self.sync_half_len),
+            "sync_len": int(self.sync_len),
+            "preamble_cfo_period_hz": float(self._preamble_cfo_period_hz()),
+            "preamble_cfo_unambiguous_hz": float(self._preamble_cfo_unambiguous_hz()),
             "frame_len": int(self.frame_len),
             "htf_training_blocks": int(self.htf_training_blocks),
             "full_htf_order": int(self.M * self.N),
@@ -4630,7 +5434,6 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "requested_channel_estimator": str(getattr(self, "requested_channel_estimator", self.channel_estimator)),
             "estimator_effective_reason": str(getattr(self, "estimator_effective_reason", "")),
             "fdidm_transform_impl": "fft_4_dft_sum_for_fdit_ifdit",
-            "estimator_auto_note": str(getattr(self, "_estimator_auto_note", "")),
             "use_full_htf": bool(self.use_full_htf),
             "full_htf_update_interval_frames": int(self.full_htf_update_interval_frames),
             "full_htf_once": bool(self.full_htf_once),
@@ -4647,17 +5450,15 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "tdl_param_prune_db": float(snap.get("tdl_param_prune_db", getattr(self, "tdl_param_prune_db", -90.0))),
             "tdl_param_num_sinusoids": int(snap.get("tdl_param_num_sinusoids", getattr(self, "tdl_param_num_sinusoids", 8))),
             "tdl_param_max_paths": int(snap.get("tdl_param_max_paths", getattr(self, "tdl_param_max_paths", 96))),
-            "rx_last_new_samples": int(snap.get("rx_last_new_samples", 0)),
             "rx_overflow_count": int(snap.get("rx_overflow_count", 0)),
             "rx_last_overflow_samples": int(snap.get("rx_last_overflow_samples", 0)),
             "rx_overflow_reason": str(snap.get("rx_overflow_reason", "")),
             "rx_overflow_threshold": int(snap.get("rx_overflow_threshold", 0)),
-            "rx_spectrum_stale": bool(snap.get("rx_spectrum_stale", True)),
-            "rx_spectrum_stale_sec": float(snap.get("rx_spectrum_stale_sec", float("inf"))),
-            "constellation_source": str(snap.get("constellation_source", "none")),
-            "constellation_is_good": bool(snap.get("constellation_is_good", False)),
-            "constellation_points": int(snap.get("constellation_points", 0)),
-            "constellation_pre_eq_points": int(snap.get("constellation_pre_eq_points", 0)),
+            "rx_processing_gap_count": int(snap.get("rx_processing_gap_count", 0)),
+            "rx_last_processing_gap_samples": int(snap.get("rx_last_processing_gap_samples", 0)),
+            "rx_processing_gap_reason": str(snap.get("rx_processing_gap_reason", "")),
+            "rx_input_rms": float(snap.get("rx_input_rms", float("nan"))),
+            "rx_input_peak": float(snap.get("rx_input_peak", float("nan"))),
             "constellation_quality": str(snap.get("constellation_quality", "unknown")),
             "rx_frame_samples": int(snap.get("rx_frame_samples", 0)),
             "rx_data_samples": int(snap.get("rx_data_samples", 0)),
@@ -4705,14 +5506,27 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "last_error": self._last_error,
             "last_info": self._last_info,
             "frame_ok": snap["frame_ok"],
+            "crc_ok": bool(snap.get("crc_ok", snap.get("decode_ok", False))),
+            "symbol_quality": str(snap.get("symbol_quality", "none")),
+            "effectively_ok": bool(snap.get("effectively_ok", snap["frame_ok"])),
             "reason": snap["reason"],
             "sync_metric": snap["sync_metric"],
+            "preamble_reliable": bool(snap.get("preamble_reliable", False)),
+            "preamble_refine_min_score": float(snap.get("preamble_refine_min_score", getattr(self, "preamble_refine_min_score", 0.20))),
+            "preamble_reject_count": int(snap.get("preamble_reject_count", 0)),
+            "evm_valid": bool(snap.get("preamble_reliable", False) and np.isfinite(float(snap.get("evm_instant_percent", float("nan"))))),
             "cfo_est_hz": snap["cfo_est_hz"],
             "cfo_preamble_hz": snap.get("cfo_preamble_hz", snap["cfo_est_hz"]),
             "cfo_source": snap.get("cfo_source", "preamble"),
             "cfo_alias_hz": float(snap.get("cfo_alias_hz", getattr(self, "_last_cfo_alias_hz", float("nan")))),
             "cfo_scan_score": float(snap.get("cfo_scan_score", getattr(self, "_last_cfo_scan_score", float("nan")))),
             "cfo_unambiguous_hz": float(getattr(self, "_last_cfo_unambiguous_hz", self._preamble_cfo_unambiguous_hz())),
+            "residual_cfo_hz": float(snap.get("residual_cfo_hz", getattr(self, "last_residual_cfo_hz", 0.0))),
+            "residual_cfo_confidence": float(snap.get("residual_cfo_confidence", getattr(self, "last_residual_cfo_confidence", 0.0))),
+            "residual_cfo_pair_count": int(snap.get("residual_cfo_pair_count", getattr(self, "last_residual_cfo_pair_count", 0))),
+            "residual_cfo_phase_std_rad": float(snap.get("residual_cfo_phase_std_rad", getattr(self, "last_residual_cfo_phase_std_rad", float("nan")))),
+            "residual_cfo_accepted": bool(snap.get("residual_cfo_accepted", getattr(self, "last_residual_cfo_accepted", False))),
+            "residual_cfo_reject_reason": str(snap.get("residual_cfo_reject_reason", getattr(self, "last_residual_cfo_reject_reason", ""))),
             "cfo_search_enable": bool(getattr(self, "cfo_search_enable", True)),
             "cfo_search_max_hz": float(getattr(self, "cfo_search_max_hz", 0.0)),
             "residual_cfo_max_hz": float(getattr(self, "residual_cfo_max_hz", 0.0)),
@@ -4724,7 +5538,6 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "cfo_last_good_hz": float(snap.get("cfo_last_good_hz", getattr(self, "_last_good_cfo_hz", float("nan")))),
             "parameter_limits": self.compute_parameter_limits(),
             "estimator_forced_reason": str(getattr(self, "_estimator_forced_reason", "")),
-            "estimator_auto_note": str(getattr(self, "_estimator_auto_note", "")),
             "auto_tdl_param_for_software": bool(getattr(self, "auto_tdl_param_for_software", True)),
             "ber": snap["ber"],
             "measured_ser": float(snap.get("measured_ser", float("nan"))),
@@ -4750,17 +5563,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "pilot_fitted_power": float(snap.get("pilot_fitted_power", float("nan"))),
             "frame_structure": dict(snap.get("frame_structure", {}) or {}),
             "rx_samples_seen": snap["rx_samples_seen"],
-            "rx_last_new_samples": int(snap.get("rx_last_new_samples", 0)),
             "rx_stream_updates": int(snap.get("rx_stream_updates", 0)),
             "rx_latest_window_len": int(snap.get("rx_latest_window_len", 0)),
-            "rx_spectrum_stale": bool(snap.get("rx_spectrum_stale", True)),
-            "rx_spectrum_stale_sec": float(snap.get("rx_spectrum_stale_sec", float("inf"))),
-            "constellation_source": str(snap.get("constellation_source", "none")),
-            "constellation_is_good": bool(snap.get("constellation_is_good", False)),
+            # Probe continuity metadata is part of the hardware evidence
+            # contract.  Keep it visible in the status API so consumers can
+            # distinguish contiguous samples from stale/gapped probe reads.
+            "rx_probe_continuity": str(snap.get("rx_probe_continuity", "unknown")),
+            "rx_probe_continuity_reason": str(snap.get("rx_probe_continuity_reason", "")),
+            "rx_probe_last_abs_est": int(snap.get("rx_probe_last_abs_est", 0)),
+            "rx_probe_last_delta": int(snap.get("rx_probe_last_delta", 0)),
+            "rx_probe_last_vector_size": int(snap.get("rx_probe_last_vector_size", 0)),
+            "rx_probe_generation": int(snap.get("rx_probe_generation", 0)),
+            "rx_probe_stale_count": int(snap.get("rx_probe_stale_count", 0)),
             "constellation_good": bool(snap.get("constellation_good", snap.get("constellation_is_good", False))),
-            "constellation_points": int(snap.get("constellation_points", 0)),
             "constellation_post_eq_points": int(snap.get("constellation_post_eq_points", 0)),
-            "constellation_pre_eq_points": int(snap.get("constellation_pre_eq_points", 0)),
             "constellation_tf_points": int(snap.get("constellation_tf_points", 0)),
             "residual_gain_abs": snap["residual_gain_abs"],
             "residual_phase_deg": snap["residual_phase_deg"],
@@ -4808,7 +5624,7 @@ class FDIDMHardwareTest:
 if __name__ == "__main__":
     tb = FDIDMHardwareTest(fdidm_m=16, fdidm_n=16, channel_mode="tdl_a_rf")
     st = tb.get_status()
-    print(f"v35 channel-adaptive FDIDM ready: chain={st['chain']}, channel={st['channel_mode']}, "
+    print(f"Channel-adaptive FDIDM hardware ready: chain={st['chain']}, channel={st['channel_mode']}, "
           f"coding={st['coding_summary']}, tx_vector={st['tx_waveform_samples']} samples, "
           f"frame_len={st['frame_len']} samples "
           f"({st['frame_len'] / st['sample_rate'] * 1000:.2f} ms at {st['sample_rate'] / 1e6:.2f} MHz)")

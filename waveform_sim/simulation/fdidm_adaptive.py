@@ -44,7 +44,7 @@ DEFAULT_ADAPTIVE_CONFIG: Dict[str, Any] = {
     # Agile defaults: react to channel changes within a few seconds while
     # keeping a small hysteresis guard against single-eval noise.
     "interval_frames": 16,
-    "window_frames": 32,
+    "window_frames": 16,
     "window_stride_frames": 1,
     "ensemble_snapshots": 3,
     # Display pipeline is independent of the optimizer cadence.
@@ -109,6 +109,25 @@ class FDIDMSimAdaptiveMixin:
         # because the endpoint is intentionally visible in the search result.
         return float(np.clip(float(value), 0.0, 2.0))
 
+    @staticmethod
+    def _adaptive_same_search_region(
+        anchor: Optional[Tuple[float, float]],
+        proposal: Tuple[float, float],
+        baseline: Tuple[float, float],
+        coarse_step: float,
+    ) -> bool:
+        if anchor is None:
+            return False
+        if abs(proposal[0] - anchor[0]) + abs(proposal[1] - anchor[1]) > coarse_step + 1e-12:
+            return False
+
+        def direction(pair):
+            da = float(pair[0]) - baseline[0]
+            db = float(pair[1]) - baseline[1]
+            return ("alpha", np.sign(da)) if abs(da) >= abs(db) else ("beta", np.sign(db))
+
+        return bool(direction(proposal) == direction(anchor))
+
     # ------------------------------------------------------------------ state/config
     def _init_adaptive_state_locked(self) -> None:
         if getattr(self, "_adaptive_initialized", False):
@@ -144,7 +163,7 @@ class FDIDMSimAdaptiveMixin:
         self._adaptive_last_queued_frame = -10**9
         self._adaptive_last_metric_frame = -10**9
         self._adaptive_last_applied_frame = -10**9
-        self._adaptive_stable_key: Optional[Tuple[int, int]] = None
+        self._adaptive_stable_key: Optional[Tuple[float, float]] = None
         self._adaptive_stable_count = 0
         self._adaptive_eval_seq = 0
         # Incremented whenever the *applied* alpha/beta pair changes.  Queued
@@ -596,11 +615,21 @@ class FDIDMSimAdaptiveMixin:
         decision_sim_time_s = float(decision_frame * decision_frame_duration_s)
 
         fine = max(float(self._adaptive_cfg("fine_step", 0.1)), 1e-6)
-        key = (int(round(best_a / fine)), int(round(best_b / fine)))
+        coarse = max(float(self._adaptive_cfg("coarse_step", 0.5)), fine)
+        key = (best_a, best_b)
         with self._adaptive_lock:
             if not bool(self._adaptive_cfg("enabled", False)):
                 return
-            if key == self._adaptive_stable_key:
+            anchor = self._adaptive_stable_key
+            # Consecutive optimum coordinates need not be bit-identical on a
+            # changing channel. Count a vote when the proposal stays in the
+            # same coarse search neighbourhood and continues along the same
+            # index axis. Keep the first vote as the anchor so gradual drift
+            # cannot accumulate into an arbitrarily large "stable" move.
+            same_region = self._adaptive_same_search_region(
+                anchor, key, (current_a, current_b), coarse
+            )
+            if same_region:
                 self._adaptive_stable_count += 1
             else:
                 self._adaptive_stable_key = key

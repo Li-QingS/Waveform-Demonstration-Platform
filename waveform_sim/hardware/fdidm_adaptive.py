@@ -42,16 +42,46 @@ class FDIDMAdaptiveMixin:
         lock = getattr(self, "_adaptive_ab_lock", None)
         if lock is None:
             return
+        reason = str(reason)
+        stopping = reason == "hardware_stop" or reason.startswith("start_run_")
+        manual_override = reason == "configure_alpha_beta_changed"
+        # A topology/objective change may already have modified the waveform
+        # configuration.  A concurrent rollback built with the old power
+        # contract would race the new user-requested configuration.
+        must_cancel_rollback = stopping or manual_override or reason == "objective_context_changed"
         with lock:
             validation = getattr(self, "_adaptive_ab_validation", None)
-            if isinstance(validation, dict) and str(validation.get("state", "")) in {
-                "baseline_applying", "baseline_settling", "baseline_collecting",
-                "candidate_applying", "candidate_settling", "candidate_collecting",
-            }:
-                validation["state"] = "inconclusive"
-                validation["outcome"] = "inconclusive"
-                validation["result_reason"] = f"validation invalidated: {reason}"
-                validation["apply_generation"] = int(validation.get("apply_generation", 0)) + 1
+            validation_state = str(validation.get("state", "")) if isinstance(validation, dict) else ""
+            preserve_safety_state = bool(
+                validation_state == "rollback_failed" and not stopping
+                or validation_state == "rollback_applying" and not must_cancel_rollback
+            )
+            if isinstance(validation, dict) and self._validation_active_state(validation_state):
+                if preserve_safety_state:
+                    # A failed rollback is fail-closed until the hardware is
+                    # stopped.  Likewise, unrelated configuration changes
+                    # must not cancel an already running safety rollback.
+                    pass
+                else:
+                    # Invalidation is cancellation, NOT proof of rollback.
+                    # Stop and manual alpha/beta edits in particular must not
+                    # spawn a worker that could re-enable TX or override the
+                    # operator's selected waveform.
+                    validation["state"] = "aborted"
+                    validation["outcome"] = "aborted"
+                    validation["terminal_outcome"] = "aborted"
+                    validation["aborted_from_state"] = validation_state
+                    validation["aborted_reason"] = reason
+                    validation["rollback_complete"] = False
+                    validation["rollback_pending"] = False
+                    validation["apply_generation"] = int(validation.get("apply_generation", 0)) + 1
+                    if stopping:
+                        detail = "hardware stop/restart requested; TX is being stopped, baseline was not restored"
+                    elif manual_override:
+                        detail = "manual alpha/beta override; no automatic rollback was performed"
+                    else:
+                        detail = "baseline was not restored; selected waveform may still be the candidate"
+                    validation["result_reason"] = f"validation aborted: {reason}; {detail}"
             self._adaptive_ab_snapshot_seq = int(getattr(self, "_adaptive_ab_snapshot_seq", 0)) + 1
             self._adaptive_ab_snapshot = None
             # A snapshot from the previous channel/configuration is not valid
@@ -59,6 +89,9 @@ class FDIDMAdaptiveMixin:
             # explicit so a restarted run cannot reuse stale CSI.
             self._adaptive_ab_last_snapshot = None
             self._adaptive_ab_recommendation = {}
+            self._adaptive_ab_rejected_context = None
+            self._adaptive_ab_rejected_pairs = {}
+            self._adaptive_ab_failed_until_frame = -10**18
             self._adaptive_ab_stable_key = None
             self._adaptive_ab_stable_count = 0
             self._adaptive_ab_last_htf_identity = None
@@ -73,6 +106,8 @@ class FDIDMAdaptiveMixin:
                 self._adaptive_ab_last_queued_frame = -10**18
                 self._adaptive_ab_last_applied_frame = -10**18
                 self._adaptive_ab_state = "waiting_channel" if self.adaptive_alpha_beta_enable else "disabled"
+            if preserve_safety_state:
+                self._adaptive_ab_state = validation_state
             self._adaptive_ab_last_skip_reason = ""
             self._adaptive_ab_last_skip_log_wall = 0.0
         try:
@@ -88,6 +123,17 @@ class FDIDMAdaptiveMixin:
                                    predicted_improvement_db: float = float("nan"),
                                    recommendation_seq: int = 0) -> Dict[str, Any]:
         """Start a power-comparable, multi-frame real-link validation."""
+        # A validation owns the live waveform until it reaches a terminal
+        # outcome.  Previously every new optimizer recommendation replaced
+        # this dictionary, so the baseline window was restarted every eight
+        # frames and the candidate side was never reached.
+        with self._adaptive_ab_lock:
+            active = dict(getattr(self, "_adaptive_ab_validation", {}) or {})
+            if self._validation_active_state(str(active.get("state", ""))):
+                public = self._validation_public_state(active)
+                public["busy"] = True
+                public["busy_reason"] = "validation already in progress"
+                return public
         old_alpha = float(getattr(self, "alpha", 0.0))
         old_beta = float(getattr(self, "beta", 0.0))
         candidate_alpha = float(alpha)
@@ -113,7 +159,12 @@ class FDIDMAdaptiveMixin:
         context_key = self._alpha_beta_adaptation_context_key()
         baseline_window = EvidenceWindow(contract_id=contract.contract_id, context_key=context_key)
         candidate_window = EvidenceWindow(contract_id=contract.contract_id, context_key=context_key)
+        started_wall = time.monotonic()
         with self._adaptive_ab_lock:
+            recommendation = getattr(self, "_adaptive_ab_recommendation", None)
+            if isinstance(recommendation, dict):
+                recommendation["ready"] = False
+                recommendation["pending"] = False
             self._adaptive_ab_validation = {
                 "state": "prepare_contract",
                 "outcome": "",
@@ -124,6 +175,13 @@ class FDIDMAdaptiveMixin:
                 "predicted_improvement_db": float(predicted_improvement_db),
                 "recommendation_seq": int(recommendation_seq),
                 "start_frame": int(getattr(self, "_frames_processed", 0)),
+                "started_wall": started_wall,
+                "phase_started_wall": started_wall,
+                "deadline_wall": started_wall + 90.0,
+                "phase_timeout_sec": 30.0,
+                "invalid_attempts": 0,
+                "max_invalid_attempts": 96,
+                "last_invalid_reason": "",
                 "settle_frames": 3,
                 "settle_remaining": 0,
                 "min_frames": 24,
@@ -157,6 +215,7 @@ class FDIDMAdaptiveMixin:
         return str(state) in {
             "prepare_contract", "baseline_applying", "baseline_settling", "baseline_collecting",
             "candidate_applying", "candidate_settling", "candidate_collecting",
+            "rollback_applying", "rollback_failed",
         }
 
     @staticmethod
@@ -172,6 +231,59 @@ class FDIDMAdaptiveMixin:
             else:
                 result[key] = repr(value)
         return result
+
+    def _complete_validation_transition_locked(self, final_state: str) -> None:
+        """Commit a validation terminal state and arm the real cooldown gate."""
+        validation = getattr(self, "_adaptive_ab_validation", {})
+        if isinstance(validation, dict):
+            validation["state"] = str(final_state)
+            validation["rollback_pending"] = False
+        frame = int(getattr(self, "_frames_processed", 0))
+        baseline_window = validation.get("baseline_window")
+        candidate_window = validation.get("candidate_window")
+        min_frames = int(validation.get("min_frames", 24))
+        completed_comparison = bool(
+            isinstance(baseline_window, EvidenceWindow)
+            and isinstance(candidate_window, EvidenceWindow)
+            and baseline_window.valid_frames >= min_frames
+            and candidate_window.valid_frames >= min_frames
+        )
+        inconclusive_reason = str(validation.get("result_reason", ""))
+        no_supported_gain = bool(
+            str(final_state) == "inconclusive" and completed_comparison
+            and "pilot" not in inconclusive_reason
+            and "context" not in inconclusive_reason
+            and "power" not in inconclusive_reason
+        )
+        if (str(final_state) == "regressed" or no_supported_gain) and bool(validation.get("rollback_complete", False)):
+            context = tuple(validation.get("context_key", ()) or ())
+            if context != getattr(self, "_adaptive_ab_rejected_context", None):
+                self._adaptive_ab_rejected_context = context
+                self._adaptive_ab_rejected_pairs = {}
+            pair = (round(float(validation["candidate_alpha"]), 9),
+                    round(float(validation["candidate_beta"]), 9))
+            self._adaptive_ab_rejected_pairs[pair] = frame
+            # A measured regression or a full comparison without supported
+            # gain outranks the predicted SER.  Avoid repeatedly swapping to
+            # the same candidate while the RF conditions remain unchanged.
+            self._adaptive_ab_failed_until_frame = frame + max(
+                64, 4 * int(getattr(self, "adaptive_alpha_beta_cooldown_frames", 16))
+            )
+        elif str(final_state) == "inconclusive":
+            self._adaptive_ab_failed_until_frame = frame + max(
+                64, 4 * int(getattr(self, "adaptive_alpha_beta_cooldown_frames", 16))
+            )
+        self._adaptive_ab_last_applied_frame = frame
+        self._adaptive_ab_last_queued_frame = frame
+        self._adaptive_ab_snapshot_seq = int(getattr(self, "_adaptive_ab_snapshot_seq", 0)) + 1
+        self._adaptive_ab_snapshot = None
+        self._adaptive_ab_last_snapshot = None
+        self._adaptive_ab_recommendation = {}
+        self._adaptive_ab_stable_key = None
+        self._adaptive_ab_stable_count = 0
+        self._adaptive_ab_last_htf_identity = None
+        self._adaptive_ab_force_next = False
+        self._adaptive_ab_state = str(final_state)
 
     def _publish_validation_waveform(self, side: str, generation: int) -> None:
         with self._adaptive_ab_lock:
@@ -197,14 +309,26 @@ class FDIDMAdaptiveMixin:
                 forced_rms = None
                 contract_id = ""
         try:
-            self._commit_waveform_build(alpha, beta, forced_rms=forced_rms, contract_id=contract_id)
-            tx_buffer = getattr(self, "_tx_buffer", None)
-            if tx_buffer is not None and hasattr(tx_buffer, "write"):
-                tx_buffer.write(np.asarray(self._tx_waveform, dtype=np.complex64))
-            if hasattr(self, "_sync_waveform_to_top_block"):
-                self._sync_waveform_to_top_block()
-            if bool(getattr(self, "_running", False)) and hasattr(self, "_arm_live_transition"):
-                self._arm_live_transition()
+            # Hold the generation lock across the state-changing commit. This
+            # makes invalidation and waveform publication mutually exclusive;
+            # an obsolete worker can no longer pass a check, build, and then
+            # overwrite a newer manual/adaptive transition.
+            # The receiver records evidence under _lock and may then acquire
+            # _adaptive_ab_lock.  Use the same order here: the reverse order
+            # deadlocked when a live swap met a completed RX frame.
+            with self._lock:
+                with self._adaptive_ab_lock:
+                    validation = getattr(self, "_adaptive_ab_validation", {})
+                    if generation != int(validation.get("apply_generation", -1)):
+                        return
+                    self._commit_waveform_build(alpha, beta, forced_rms=forced_rms, contract_id=contract_id)
+                    tx_buffer = getattr(self, "_tx_buffer", None)
+                    if tx_buffer is not None and hasattr(tx_buffer, "write"):
+                        tx_buffer.write(np.asarray(self._tx_waveform, dtype=np.complex64))
+                    if hasattr(self, "_sync_waveform_to_top_block"):
+                        self._sync_waveform_to_top_block()
+                    if bool(getattr(self, "_running", False)) and hasattr(self, "_arm_live_transition"):
+                        self._arm_live_transition()
         except Exception as exc:
             self._debug("ERROR", f"alpha/beta validation {side} waveform failed: {type(exc).__name__}: {exc}")
             if side == "rollback":
@@ -213,6 +337,8 @@ class FDIDMAdaptiveMixin:
                     validation["rollback_pending"] = False
                     validation["rollback_complete"] = False
                     validation["rollback_error"] = f"{type(exc).__name__}: {exc}"
+                    validation["state"] = "rollback_failed"
+                    self._adaptive_ab_state = "rollback_failed"
                 return
             self._finish_alpha_beta_validation(
                 ValidationDecision("inconclusive", reason=f"{side} waveform apply failed: {type(exc).__name__}: {exc}")
@@ -225,16 +351,25 @@ class FDIDMAdaptiveMixin:
             if side in {"baseline", "candidate"}:
                 validation["state"] = f"{side}_settling"
                 validation["settle_remaining"] = int(validation.get("settle_frames", 3))
+                validation["phase_started_wall"] = time.monotonic()
+                validation["invalid_attempts"] = 0
+                validation["last_invalid_reason"] = ""
                 self._adaptive_ab_state = str(validation["state"])
             else:
                 validation["rollback_pending"] = False
                 validation["rollback_complete"] = True
+                final_state = str(validation.get("terminal_outcome", validation.get("outcome", "inconclusive")))
+                self._complete_validation_transition_locked(final_state)
         self._debug("INFO", f"alpha/beta validation waveform applied: side={side}, alpha={alpha:.2f}, beta={beta:.2f}")
 
     def _queue_validation_waveform(self, side: str) -> None:
         with self._adaptive_ab_lock:
             validation = getattr(self, "_adaptive_ab_validation", {})
             if not isinstance(validation, dict):
+                return
+            if not self._validation_active_state(str(validation.get("state", ""))):
+                return
+            if str(validation.get("state", "")) == "rollback_failed":
                 return
             validation["apply_generation"] = int(validation.get("apply_generation", 0)) + 1
             generation = int(validation["apply_generation"])
@@ -243,6 +378,9 @@ class FDIDMAdaptiveMixin:
                 self._adaptive_ab_state = str(validation["state"])
             else:
                 validation["rollback_pending"] = True
+                validation["state"] = "rollback_applying"
+                validation["phase_started_wall"] = time.monotonic()
+                self._adaptive_ab_state = "rollback_applying"
         if bool(getattr(self, "_validation_synchronous", False)):
             self._publish_validation_waveform(side, generation)
             return
@@ -259,13 +397,24 @@ class FDIDMAdaptiveMixin:
             validation = getattr(self, "_adaptive_ab_validation", {})
             if not isinstance(validation, dict):
                 return
+            # A monitor timeout and a waveform worker failure may race.  A
+            # terminal decision or an in-flight rollback cannot be replaced
+            # by a stale second finish call.
+            state = str(validation.get("state", ""))
+            if not self._validation_active_state(state) or state in {"rollback_applying", "rollback_failed"}:
+                return
             validation["decision"] = decision
             validation["outcome"] = decision.outcome
-            validation["state"] = decision.outcome
+            validation["terminal_outcome"] = decision.outcome
             validation["measured"] = decision.as_dict()
             validation["result_reason"] = decision.reason
-            self._adaptive_ab_state = decision.outcome
             rollback = decision.outcome != "improved" and isinstance(validation.get("contract"), TxPowerContract)
+            if rollback:
+                validation["state"] = "rollback_applying"
+                validation["rollback_pending"] = True
+                self._adaptive_ab_state = "rollback_applying"
+            else:
+                self._complete_validation_transition_locked(decision.outcome)
         self._debug(
             "INFO",
             f"alpha/beta validation {decision.outcome}: measured_SER_gain={decision.measured_ser_gain_db:.3f}dB, "
@@ -273,6 +422,57 @@ class FDIDMAdaptiveMixin:
         )
         if rollback:
             self._queue_validation_waveform("rollback")
+
+    def _watchdog_alpha_beta_validation(self, *, attempted: bool = False, reason: str = "") -> None:
+        """Bound validation time even when no frame reaches the evidence path.
+
+        This is called by the RX monitor independently of successful decoding.
+        Without it, loss of synchronization after a candidate switch leaves the
+        single-flight validation permanently stuck in a settling/collecting state.
+        """
+        decision: Optional[ValidationDecision] = None
+        now = time.monotonic()
+        with self._adaptive_ab_lock:
+            validation = getattr(self, "_adaptive_ab_validation", None)
+            if not isinstance(validation, dict):
+                return
+            state = str(validation.get("state", ""))
+            if not self._validation_active_state(state) or state in {"rollback_applying", "rollback_failed"}:
+                return
+            if attempted:
+                validation["invalid_attempts"] = int(validation.get("invalid_attempts", 0)) + 1
+                validation["invalid_attempts_total"] = int(validation.get("invalid_attempts_total", 0)) + 1
+                validation["last_invalid_reason"] = str(reason or "no valid frame")
+
+            phase_started = float(validation.get("phase_started_wall", now))
+            deadline = float(validation.get("deadline_wall", now + 1.0))
+            phase_timeout = max(1.0, float(validation.get("phase_timeout_sec", 30.0)))
+            invalid_limit = max(1, int(validation.get("max_invalid_attempts", 96)))
+            timed_out = now >= deadline or now - phase_started >= phase_timeout
+            too_many_invalid = int(validation.get("invalid_attempts", 0)) >= invalid_limit
+            if not timed_out and not too_many_invalid:
+                return
+
+            side = "candidate" if state.startswith("candidate") else "baseline"
+            trigger = "deadline" if timed_out else "invalid-frame budget"
+            last_reason = str(validation.get("last_invalid_reason", "no valid frame"))
+            validation["watchdog_triggered"] = True
+            validation["watchdog_reason"] = f"{side} {trigger}: {last_reason}"
+            baseline = validation.get("baseline_window")
+            min_frames = int(validation.get("min_frames", 24))
+            baseline_ready = isinstance(baseline, EvidenceWindow) and baseline.valid_frames >= min_frames
+            if side == "candidate" and baseline_ready:
+                decision = ValidationDecision(
+                    "regressed",
+                    reason=f"candidate lost reliable synchronization ({trigger}: {last_reason})",
+                )
+            else:
+                decision = ValidationDecision(
+                    "inconclusive",
+                    reason=f"{side} validation timed out without enough reliable frames ({last_reason})",
+                )
+        if decision is not None:
+            self._finish_alpha_beta_validation(decision)
 
     def _record_alpha_beta_validation_sample_locked(self, metrics: Dict[str, Any]):
         validation = getattr(self, "_adaptive_ab_validation", None)
@@ -325,11 +525,14 @@ class FDIDMAdaptiveMixin:
             ser_errors=ser_errors,
             ser_symbols=ser_symbols,
             data_aided_evm_percent=metrics.get("data_aided_evm_percent"),
-            crc_ok=bool(metrics.get("decode_ok", False)),
+            crc_ok=bool(metrics.get("crc_ok", metrics.get("decode_ok", False))),
             raw_ber=metrics.get("raw_bit_ber"),
             fec_ber=metrics.get("fec_bit_ber"),
             power_rms=tx_rms,
+            pilot_fit_nmse=metrics.get("pilot_fit_nmse"),
+            pilot_fitted_power=metrics.get("pilot_fitted_power"),
         )
+        validation["invalid_attempts"] = 0
         min_frames = int(validation.get("min_frames", 24))
         max_frames = int(validation.get("max_frames", 64))
         min_errors = int(validation.get("min_errors_for_improvement", 100))
@@ -358,7 +561,8 @@ class FDIDMAdaptiveMixin:
             min_errors_for_improvement=min_errors,
             min_ser_gain_db=float(getattr(self, "adaptive_alpha_beta_min_improvement_db", 0.5)),
         )
-        if decision.outcome != "inconclusive" or window.valid_frames >= max_frames:
+        pilot_instability = decision.outcome == "inconclusive" and "pilot" in decision.reason
+        if decision.outcome != "inconclusive" or pilot_instability or window.valid_frames >= max_frames:
             self._finish_alpha_beta_validation(decision)
 
     def _ensure_alpha_beta_adaptation_worker(self):
@@ -567,6 +771,30 @@ class FDIDMAdaptiveMixin:
         for da, db in ((-step, 0.0), (step, 0.0), (0.0, -step), (0.0, step)):
             candidates.add((round(float(np.clip(current_alpha + da, 0.0, 2.0)), 9),
                            round(float(np.clip(current_beta + db, 0.0, 2.0)), 9)))
+        # The five-point search is cheap but cannot leave a local optimum.
+        # Explore after a manual request, an OFDM reset, or repeated no-move
+        # evaluations.  A diagonal CSI permits a dense grid; full-H CSI uses
+        # only a few canonical anchors to keep live receiver CPU bounded.
+        stalled = int(snapshot.get("stalled_evals", 0) or 0)
+        global_explore = bool(
+            snapshot.get("global_explore", False)
+            or (abs(current_alpha) <= 1e-12 and abs(current_beta) <= 1e-12)
+            or stalled >= max(2, int(snapshot.get("stability_evals", 2)))
+        )
+        if global_explore:
+            if diagonal_fast_path:
+                explore_step = max(coarse_step, 0.5)
+                values = self._adaptive_grid_values(explore_step)
+                candidates.update(
+                    (round(float(a), 9), round(float(b), 9))
+                    for a in values for b in values
+                )
+            else:
+                candidates.update({
+                    (0.0, 0.0), (0.0, 1.0), (1.0, 0.0),
+                    (0.5, 0.5), (0.5, 1.0), (1.0, 0.5),
+                    (1.0, 1.0), (1.0, 1.5), (1.5, 1.0),
+                })
         results = self._adaptive_evaluate_candidates(
             prepared, sorted(candidates), M, N, snapshot["mod_order"]
         )
@@ -586,11 +814,19 @@ class FDIDMAdaptiveMixin:
         alpha_observable = bool(alpha_span > flat_floor)
         beta_observable = bool(beta_span > flat_floor)
 
-        eligible = [r for r in results if r is not current_eval]
-        eligible = [r for r in eligible if not (
-            (float(r["alpha"]) != current[0] and not alpha_observable) or
-            (float(r["beta"]) != current[1] and not beta_observable)
-        )]
+        rejected = {
+            (round(float(pair[0]), 9), round(float(pair[1]), 9))
+            for pair in snapshot.get("rejected_pairs", ())
+        }
+        eligible = [
+            r for r in results if r is not current_eval
+            and (round(float(r["alpha"]), 9), round(float(r["beta"]), 9)) not in rejected
+        ]
+        if not global_explore:
+            eligible = [r for r in eligible if not (
+                (float(r["alpha"]) != current[0] and not alpha_observable) or
+                (float(r["beta"]) != current[1] and not beta_observable)
+            )]
         best = min([current_eval] + eligible, key=lambda r: (float(r["ser"]),
                                                                abs(float(r["alpha"]) - current[0]) +
                                                                abs(float(r["beta"]) - current[1])))
@@ -620,8 +856,14 @@ class FDIDMAdaptiveMixin:
             "predicted_improvement_db": float(improvement_db if meaningful else 0.0),
             "predicted_snr_db": float(predicted_snr_db),
             "candidate_count": int(len(results)),
+            "rejected_candidate_count": int(len(rejected)),
             "search_seconds": float(time.time() - t0),
-            "search_mode": "diag_five_point" if diagonal_fast_path else "full_five_point",
+            "search_mode": (
+                "diag_global_grid" if global_explore
+                and diagonal_fast_path else
+                ("full_global_anchors" if global_explore else
+                 ("diag_five_point" if diagonal_fast_path else "full_five_point"))
+            ),
             "active_step": float(step),
             "next_active_step": float(next_step),
             "selected_direction": direction,
@@ -664,6 +906,10 @@ class FDIDMAdaptiveMixin:
                 if expected_seq != int(self._adaptive_ab_snapshot_seq):
                     # Alpha/beta or channel context changed during the search.
                     continue
+                validation = dict(getattr(self, "_adaptive_ab_validation", {}) or {})
+                if self._validation_active_state(str(validation.get("state", ""))):
+                    self._adaptive_ab_state = str(validation.get("state", "validating"))
+                    continue
                 fine = max(float(self.adaptive_alpha_beta_fine_step), 1e-9)
                 key = (int(round(float(result["recommended_alpha"]) / fine)),
                        int(round(float(result["recommended_beta"]) / fine)))
@@ -698,7 +944,9 @@ class FDIDMAdaptiveMixin:
 
     def _maybe_queue_alpha_beta_adaptation(self, h_tf_est: Any, htf_kind: str,
                                            htf_source: str, noise_var: float,
-                                           sync_metric: float, good_quality: bool):
+                                           sync_metric: float, good_quality: bool,
+                                           csi_trustworthy: bool = True,
+                                           csi_quality_reason: str = ""):
         if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
             return
         self._ensure_alpha_beta_adaptation_worker()
@@ -716,6 +964,11 @@ class FDIDMAdaptiveMixin:
             self._adaptive_ab_debug_skip(
                 f"sync_below_threshold({float(sync_metric):.3f} < {float(self.adaptive_alpha_beta_min_sync_metric):.3f})")
             return
+        if not bool(csi_trustworthy):
+            self._adaptive_ab_debug_skip(
+                f"csi_quality_gate({str(csi_quality_reason or 'untrusted CSI')})"
+            )
+            return
         if self.adaptive_alpha_beta_require_good_frame and not bool(good_quality):
             self._adaptive_ab_debug_skip("frame_quality_gate")
             return
@@ -723,12 +976,23 @@ class FDIDMAdaptiveMixin:
         frame_counter = int(getattr(self, "_frames_processed", 0))
         htf_identity = (str(htf_source), id(h_tf_est))
         with self._adaptive_ab_lock:
+            validation = dict(getattr(self, "_adaptive_ab_validation", {}) or {})
+            if self._validation_active_state(str(validation.get("state", ""))):
+                self._adaptive_ab_state = str(validation.get("state", "validating"))
+                self._adaptive_ab_debug_skip("validation_in_progress")
+                return
             force = bool(self._adaptive_ab_force_next)
             if (not force and str(htf_source) == "full_htf" and bool(getattr(self, "full_htf_once", False))
                     and htf_identity == self._adaptive_ab_last_htf_identity):
                 self._adaptive_ab_debug_skip("full_htf_once_reuse")
                 return
             if not force:
+                if frame_counter < int(getattr(self, "_adaptive_ab_failed_until_frame", -10**18)):
+                    self._adaptive_ab_state = "cooldown"
+                    self._adaptive_ab_debug_skip(
+                        f"real_link_regression_cooldown(until={self._adaptive_ab_failed_until_frame}, frame={frame_counter})"
+                    )
+                    return
                 if frame_counter - int(self._adaptive_ab_last_applied_frame) < int(self.adaptive_alpha_beta_cooldown_frames):
                     self._adaptive_ab_state = "cooldown"
                     self._adaptive_ab_debug_skip(
@@ -757,6 +1021,17 @@ class FDIDMAdaptiveMixin:
             return
 
         with self._adaptive_ab_lock:
+            context = self._alpha_beta_adaptation_context_key()
+            if context != getattr(self, "_adaptive_ab_rejected_context", None):
+                self._adaptive_ab_rejected_context = context
+                self._adaptive_ab_rejected_pairs = {}
+            rejections = dict(getattr(self, "_adaptive_ab_rejected_pairs", {}) or {})
+            # A previously regressed pair can be re-tested after a long dwell;
+            # a fresh run or changed objective clears it immediately.
+            self._adaptive_ab_rejected_pairs = {
+                pair: rejected_frame for pair, rejected_frame in rejections.items()
+                if frame_counter - int(rejected_frame) < 256
+            }
             self._adaptive_ab_snapshot_seq += 1
             snapshot = {
                 "snapshot_seq": int(self._adaptive_ab_snapshot_seq),
@@ -772,6 +1047,9 @@ class FDIDMAdaptiveMixin:
                 "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "rcond": float(self.adaptive_alpha_beta_rcond),
+                "stalled_evals": int(getattr(self, "_adaptive_ab_stable_count", 0)),
+                "stability_evals": int(self.adaptive_alpha_beta_stability_evals),
+                "rejected_pairs": tuple(sorted(self._adaptive_ab_rejected_pairs)),
             }
             self._adaptive_ab_snapshot = snapshot
             self._adaptive_ab_last_snapshot = snapshot
@@ -785,6 +1063,11 @@ class FDIDMAdaptiveMixin:
         """Request an immediate search using the latest H_TF, or the next valid frame."""
         if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):
             return False
+        with self._adaptive_ab_lock:
+            validation = dict(getattr(self, "_adaptive_ab_validation", {}) or {})
+            if self._validation_active_state(str(validation.get("state", ""))):
+                self._adaptive_ab_state = str(validation.get("state", "validating"))
+                return False
         self._ensure_alpha_beta_adaptation_worker()
         with self._adaptive_ab_lock:
             last = self._adaptive_ab_last_snapshot
@@ -804,6 +1087,9 @@ class FDIDMAdaptiveMixin:
             snap["integer_margin_db"] = float(self.adaptive_alpha_beta_integer_margin_db)
             snap["max_order"] = int(self.adaptive_alpha_beta_max_order)
             snap["rcond"] = float(self.adaptive_alpha_beta_rcond)
+            snap["global_explore"] = True
+            snap["stalled_evals"] = int(getattr(self, "_adaptive_ab_stable_count", 0))
+            snap["stability_evals"] = int(self.adaptive_alpha_beta_stability_evals)
             self._adaptive_ab_snapshot = snap
             self._adaptive_ab_last_snapshot = snap
             self._adaptive_ab_state = "queued"
@@ -852,6 +1138,8 @@ class FDIDMAdaptiveMixin:
                 "interval_frames": int(self.adaptive_alpha_beta_interval_frames),
                 "minimum_improvement_db": float(self.adaptive_alpha_beta_min_improvement_db),
                 "cooldown_frames": int(self.adaptive_alpha_beta_cooldown_frames),
+                "rejected_candidate_count": int(len(getattr(self, "_adaptive_ab_rejected_pairs", {}) or {})),
+                "rejected_candidate_pairs": [list(pair) for pair in sorted(getattr(self, "_adaptive_ab_rejected_pairs", {}) or {})],
                 "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "signaling_mode": str(getattr(self, "ALPHA_BETA_SIGNALING_MODE", "shared_memory")),
@@ -1067,7 +1355,7 @@ class FDIDMAdaptiveMixin:
 
         cell["target_sample_count"] = int(target)
         cell["sample_count"] = int(cell.get("sample_count", 0)) + 1
-        if bool(metrics.get("decode_ok", False)):
+        if bool(metrics.get("crc_ok", metrics.get("decode_ok", False))):
             cell["decode_ok_count"] = int(cell.get("decode_ok_count", 0)) + 1
         cell["last_frame_counter"] = int(getattr(self, "_frames_processed", 0))
         cell["last_wall"] = float(time.time())

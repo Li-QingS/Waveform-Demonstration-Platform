@@ -11,6 +11,7 @@ from waveform_sim.hardware.evidence import (
     classify_validation,
     create_power_contract,
     frame_structure_metrics,
+    measured_ser_gain_db,
     measure_known_symbols,
     measure_pilot_fit,
     scale_waveform_to_rms,
@@ -230,6 +231,57 @@ def test_validation_improved_when_exact_evidence_is_separated():
     assert result.outcome == "improved"
     assert result.measured_ser_gain_db > 0.25
     assert result.baseline_ser_interval[0] > result.candidate_ser_interval[1]
+
+
+def test_pilot_change_prevents_false_ab_waveform_regression_claim():
+    baseline = _window(0, 6400, evm=16.0)
+    candidate = _window(0, 6400, evm=30.0)
+    baseline.pilot_fit_nmse_values = [0.047] * 32
+    candidate.pilot_fit_nmse_values = [0.090] * 32
+    baseline.pilot_fitted_power_values = [0.1] * 32
+    candidate.pilot_fitted_power_values = [0.1] * 32
+
+    result = classify_validation(baseline, candidate)
+
+    assert result.outcome == "inconclusive"
+    assert "pilot fit changed" in result.reason
+
+
+def test_pilot_power_shift_prevents_false_ab_advantage_claim():
+    baseline = _window(640, 6400, evm=12.0)
+    candidate = _window(160, 6400, evm=9.0)
+    baseline.pilot_fit_nmse_values = [0.02] * 32
+    candidate.pilot_fit_nmse_values = [0.02] * 32
+    baseline.pilot_fitted_power_values = [0.1] * 32
+    candidate.pilot_fitted_power_values = [0.04] * 32
+
+    result = classify_validation(baseline, candidate)
+
+    assert result.outcome == "inconclusive"
+    assert "pilot received power shifted" in result.reason
+
+
+def test_validation_accepts_zero_error_candidate_when_ser_intervals_separate():
+    baseline = _window(480, 6144, frames=24, evm=12.0)
+    candidate = _window(0, 16384, frames=64, evm=5.0)
+    result = classify_validation(baseline, candidate)
+    assert result.outcome == "improved"
+    assert "SER improvement" in result.reason
+    assert math.isnan(result.measured_ser_gain_db)
+    assert 0.0 < result.ser_gain_lower_bound_db < 100.0
+
+
+def test_zero_error_ser_gain_has_no_arbitrary_floor():
+    assert math.isnan(measured_ser_gain_db(46 / 10624, 0 / 3984))
+    assert math.isnan(measured_ser_gain_db(0, 0))
+
+
+def test_validation_can_use_significant_evm_gain_on_error_free_link():
+    baseline = _window(0, 6400, frames=32, evm=8.0, crc_ratio=1.0)
+    candidate = _window(0, 6400, frames=32, evm=5.0, crc_ratio=1.0)
+    result = classify_validation(baseline, candidate)
+    assert result.outcome == "improved"
+    assert "EVM improvement" in result.reason
 
 
 def test_validation_inconclusive_for_sample_error_or_power_shortage():
