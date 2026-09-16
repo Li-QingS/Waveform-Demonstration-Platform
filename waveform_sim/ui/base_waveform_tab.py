@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QPushButton, QLabel,
-                             QComboBox, QDoubleSpinBox, QSplitter,
+                             QDoubleSpinBox, QSplitter,
                              QGridLayout, QSizePolicy, QPlainTextEdit, QScrollArea)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QTextCursor

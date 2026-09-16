@@ -793,8 +793,6 @@ class _LegacyAFDMHardwareTest:
         L = int(self.sync_half_len)
         if rx.size < Ls + 1:
             return np.zeros(1, dtype=np.float64)
-        n_out = rx.size - Ls + 1
-
         sync = self.sync_preamble.astype(np.complex128)
         cross_corr = np.correlate(rx, sync, mode="valid")
         cross_mag2 = np.abs(cross_corr) ** 2

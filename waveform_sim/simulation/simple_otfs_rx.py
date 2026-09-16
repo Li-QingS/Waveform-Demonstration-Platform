@@ -779,7 +779,6 @@ class _LegacyOTFSTransceiver:
         const_points = self._prepare_constellation_points(rx_syms)
         h_mag = np.abs(h_dd_est).astype(np.float32)
 
-        t_now = time.time() - self._t0
         with self._lock:
             self._latest_samples = recent_samples
             self._latest_constellation = const_points.astype(np.complex64)

@@ -893,23 +893,21 @@ class _LegacyOTFSHardwareTest:
         L = int(self.sync_half_len)
         if rx.size < Ls + 1:
             return np.zeros(1, dtype=np.float64)
-        N_out = rx.size - Ls + 1
-
         # (a) 已知前导互相关: |<sync, rx[s:s+Ls]>|^2 / (E_sync * E_seg)
         sync = self.sync_preamble.astype(np.complex128)
-        cross_corr = np.correlate(rx, sync, mode="valid")     # len = N_out
+        cross_corr = np.correlate(rx, sync, mode="valid")     # len = rx.size - Ls + 1
         cross_mag2 = np.abs(cross_corr) ** 2
 
         rx_abs2 = np.abs(rx) ** 2
         cum = np.concatenate([[0.0], np.cumsum(rx_abs2)])
-        seg_energy = cum[Ls:] - cum[: rx.size - Ls + 1]        # len = N_out
+        seg_energy = cum[Ls:] - cum[: rx.size - Ls + 1]        # len = rx.size - Ls + 1
         seg_energy = seg_energy + 1e-12
         m_cross = cross_mag2 / (self._sync_energy * seg_energy)
 
         # (b) SC 自相关: P(s) = sum_{k=0..L-1} rx[s+k].conj() * rx[s+k+L]
         prod = np.conj(rx[:-L]) * rx[L:]                       # len = rx.size - L
         prod_cum = np.concatenate([[0.0 + 0.0j], np.cumsum(prod)])
-        P = prod_cum[L:] - prod_cum[: prod.size - L + 1]       # len = rx.size - 2L + 1 = N_out
+        P = prod_cum[L:] - prod_cum[: prod.size - L + 1]       # len = rx.size - 2L + 1
         R_a = cum[L : rx.size - L + 1] - cum[: rx.size - 2 * L + 1]
         R_b = cum[2 * L : rx.size + 1] - cum[L : rx.size - L + 1]
         m_auto = (np.abs(P) ** 2) / (R_a * R_b + 1e-12)

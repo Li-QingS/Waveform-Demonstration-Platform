@@ -35,7 +35,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Tuple
 
 import numpy as np
 

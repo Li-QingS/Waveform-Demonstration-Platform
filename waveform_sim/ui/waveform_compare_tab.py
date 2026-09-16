@@ -24,7 +24,7 @@ import pyqtgraph as pg
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QWidget, QVBoxLayout, QLabel, QComboBox,
     QPushButton, QGroupBox, QGridLayout, QDoubleSpinBox,
     QSplitter, QTabWidget
 )

@@ -52,7 +52,6 @@ class OfdmTab(BaseWaveformTab):
         matlab_yellow = (237, 177, 32)
         matlab_purple = (126, 47, 142)
         axis_color = (60, 60, 60)
-        grid_color = (210, 210, 210)
         background_color = (250, 250, 250)
 
         for plot in (

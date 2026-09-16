@@ -17,19 +17,9 @@
   不读取当前实时后端的 BER。
 """
 
-import os
-import sys
 import threading
 import traceback
 import numpy as np
-import pyqtgraph as pg
-
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QPushButton, QGroupBox, QGridLayout, QDoubleSpinBox,
-    QSplitter, QTabWidget
-)
 
 
 
