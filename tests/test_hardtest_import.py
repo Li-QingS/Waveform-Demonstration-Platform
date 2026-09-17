@@ -93,6 +93,37 @@ def test_probe_reanchor_does_not_report_whole_run_as_new_samples():
     assert absolute == newly == 128
 
 
+def test_probe_reanchor_clears_the_previous_epoch_dedupe_marker():
+    """A new sample epoch must not keep rejecting frames as "already processed".
+
+    The de-duplication marker is written from the wall-clock estimate of the
+    previous epoch.  If a re-anchor leaves it in place, every candidate frame is
+    rejected until the new estimate climbs back to the stale value, which was
+    several seconds of a deaf receiver after each live waveform swap.
+    """
+    mod = importlib.import_module("waveform_sim.hardware.fdidm_hardtest")
+
+    class Probe:
+        def level(self):
+            return np.ones(128, dtype=np.complex64)
+
+    obj = object.__new__(mod._LegacyFDIDMHardwareTest)
+    obj._rx_probe = Probe()
+    obj._rx_probe_mode = "probe_signal_vc"
+    obj._rx_probe_last_fp = None
+    obj._rx_probe_reanchor_pending = True
+    obj._rx_probe_start_t = 1.0
+    obj._rx_samples_seen = 1_967_883
+    obj._last_processed_abs_start = 1_967_883
+    obj.sample_rate = 500_000.0
+    obj._debug = lambda *_args: None
+
+    obj._read_rx_probe_window(128)
+
+    assert obj._last_processed_abs_start == -10 ** 18
+    assert obj._rx_probe_reanchor_pending is False
+
+
 def test_refined_preamble_gate_rejects_noise_like_scores():
     mod = importlib.import_module("waveform_sim.hardware.fdidm_hardtest")
     obj = object.__new__(mod._LegacyFDIDMHardwareTest)
@@ -197,6 +228,8 @@ def test_live_waveform_sync_pauses_only_tx_graph():
     assert not obj._needs_top_block_rebuild
     # Only the TX graph was touched; the RX graph recorded nothing.
     assert rx_events == []
+    # The swap generation marks in-flight RX windows as non-comparable.
+    assert obj._tx_swap_generation == 1
 
 
 def test_live_waveform_sync_failure_is_not_reported_as_applied():
@@ -235,6 +268,8 @@ def test_live_waveform_sync_failure_is_not_reported_as_applied():
 
     assert events == ["stop", "wait", "set_data", "start"]
     assert obj._needs_top_block_rebuild
+    # A failed swap must not advertise a new waveform generation.
+    assert int(getattr(obj, "_tx_swap_generation", 0)) == 0
 
 
 def test_live_validation_swap_can_reset_rx_state_under_rx_lock(monkeypatch):

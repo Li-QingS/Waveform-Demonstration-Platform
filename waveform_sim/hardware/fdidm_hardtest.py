@@ -281,6 +281,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._frac_delay_magnitude = float("nan")
         self._frac_delay_applied = False
         self._frac_delay_corrections = 0
+        # Incremented on every live TX waveform swap.  A window that was read
+        # before the swap but decoded after it still mixes two waveforms, so
+        # the monitor excludes it from CSI and from adaptive A/B evidence.
+        self._tx_swap_generation = 0
         self._tx_pilot_reference = np.zeros(0, dtype=np.complex128)
         self._channel_mode_note = ""
         self.coding_scheme = self._normalize_coding_scheme(coding_scheme)
@@ -3370,6 +3374,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 tb_tx.start()
                 paused = False
                 self._debug("INFO", "live waveform sync: TX graph restarted")
+                self._tx_swap_generation = int(getattr(self, "_tx_swap_generation", 0)) + 1
             self._needs_top_block_rebuild = False
             self._reset_rx_runtime_state(reason=f"waveform_sync_{path.replace(' ', '_')}", reset_counters=False)
             self._debug("INFO", f"{path}: set_data() + rewind ok")
@@ -4118,6 +4123,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._rx_probe_last_delta = int(vec.size)
                 self._rx_probe_generation = int(getattr(self, "_rx_probe_generation", 0)) + 1
                 abs_est = max(1, int(vec.size))
+                # A re-anchor starts a new wall-clock sample epoch, so an
+                # absolute frame index recorded in the previous epoch is not
+                # comparable any more.  Leaving it in place made every
+                # candidate look "already processed" until the new estimate
+                # climbed back to the stale value - several seconds of a deaf
+                # receiver after each live waveform swap or gain change.
+                self._last_processed_abs_start = -10 ** 18
                 # Keep the first estimated endpoint explicit.  Without this
                 # assignment a fresh vector reports a valid ``abs_seen`` to
                 # the monitor but leaves the public continuity metadata at
@@ -4199,6 +4211,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         while not self._monitor_stop.is_set():
             try:
                 self._monitor_cycles += 1
+                swap_generation = int(getattr(self, "_tx_swap_generation", 0))
                 rx_window, abs_seen, rx_buf_size, rx_data_size = self._read_rx_probe_window(process_window_len)
                 tx_data = self.get_tx_waveform_preview(min(8192, max(1, self._tx_waveform.size)))
                 now = time.time()
@@ -4314,6 +4327,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     if now - self._last_process_t >= float(self.process_interval_sec):
                         self._last_process_t = now
                         rx_window = rx_window[-process_window_len:]
+                        # The TX waveform can change between reading the probe
+                        # and decoding the window.  Such a window holds two
+                        # waveforms, so it is dropped instead of being decoded:
+                        # publishing it would put a garbage EVM/SER spike on the
+                        # page and could leak into the adaptive A/B evidence.
+                        if int(getattr(self, "_tx_swap_generation", 0)) != swap_generation:
+                            self._debug(
+                                "DEBUG",
+                                "TX waveform changed while this RX window was in flight; "
+                                "dropping the straddling window",
+                            )
+                            if self._monitor_stop.wait(timeout=max(self.update_period, 0.03)):
+                                break
+                            continue
                         frames_before = int(self._frames_processed)
                         try:
                             self._try_process_rx_window(
