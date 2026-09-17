@@ -2903,15 +2903,22 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._needs_top_block_rebuild = True
             raise RuntimeError(self._runtime_unavailable_message())
 
-        old_tb = getattr(self, "_tb", None)
-        if old_tb is not None:
+        stopped_graphs = []
+        for graph_attr, graph in (
+            ("tx", getattr(self, "_tb_tx", None)),
+            ("rx", getattr(self, "_tb_rx", None)),
+            ("legacy", getattr(self, "_tb", None)),
+        ):
+            if graph is None or any(graph is stopped for stopped in stopped_graphs):
+                continue
+            stopped_graphs.append(graph)
             try:
-                old_tb.stop()
-                old_tb.wait()
-                self._debug("INFO", "old top_block stopped during rebuild")
+                graph.stop()
+                graph.wait()
+                self._debug("INFO", f"old {graph_attr} top_block stopped during rebuild")
             except Exception as e:
-                self._debug("WARN", f"old top_block.stop during rebuild: {type(e).__name__}: {e}")
-        for attr in ("_tb", "_vector_source", "_usrp_source", "_usrp_sink",
+                self._debug("WARN", f"old {graph_attr} top_block.stop during rebuild: {type(e).__name__}: {e}")
+        for attr in ("_tb", "_tb_tx", "_tb_rx", "_vector_source", "_usrp_source", "_usrp_sink",
                      "_tx_sink_vec", "_rx_sink_vec", "_rx_probe", "_rx_stream_to_vector",
                      "_tdl_channel_block", "_throttle_block", "_tx_gain_block"):
             if hasattr(self, attr):
@@ -2943,7 +2950,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         class _TopBlock(gr.top_block):
             pass
 
-        tb = _TopBlock("FDIDM Hardware Test v33", catch_exceptions=True)
+        tb = _TopBlock("FDIDM Hardware TX", catch_exceptions=True)
+        # TX and RX live in separate schedules on purpose.  Replacing the TX
+        # waveform used to stop the whole graph, which stopped the UHD RX
+        # source as well; the streamer kept receiving and UHD reported
+        # recurring "overflows occurred" for every alpha/beta swap.  With two
+        # graphs a live TX swap never interrupts the receive drain.
+        tb_rx = _TopBlock("FDIDM Hardware RX", catch_exceptions=True)
         vector_source = blocks.vector_source_c(self._tx_waveform.tolist(), True, 1, [])
         tx_gain_block = blocks.multiply_const_cc(1.0)
         tx_sink_vec = None
@@ -3016,7 +3029,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         if uses_tdl and self._tdl_before_rf_enabled():
             log_label = "software TDL pre-rendered into TX vector before USRP RF"
         elif uses_tdl:
-            tb.connect((usrp_source, 0), (tdl_channel_block, 0))
+            tb_rx.connect((usrp_source, 0), (tdl_channel_block, 0))
             rx_input = tdl_channel_block
             log_label = "USRP RF before software TDL"
 
@@ -3030,12 +3043,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._debug("WARN", f"TDL summary unavailable: {type(e).__name__}: {e}")
 
         if rx_stream_to_vector is not None:
-            tb.connect((rx_input, 0), (rx_stream_to_vector, 0))
-            tb.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
+            tb_rx.connect((rx_input, 0), (rx_stream_to_vector, 0))
+            tb_rx.connect((rx_stream_to_vector, 0), (rx_sink_vec, 0))
         else:
-            tb.connect((rx_input, 0), (rx_sink_vec, 0))
+            tb_rx.connect((rx_input, 0), (rx_sink_vec, 0))
 
-        self._tb = tb
+        # ``_tb`` stays the receive graph so existing RX-side lookups keep
+        # working; the transmit graph is addressed explicitly.
+        self._tb = tb_rx
+        self._tb_tx = tb
+        self._tb_rx = tb_rx
         self._usrp_source = usrp_source
         self._usrp_sink = usrp_sink
         self._tx_sink_vec = tx_sink_vec
@@ -3049,7 +3066,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._debug("INFO",
                     f"new top_block assembled, path={mode_text}, rx_mode={rx_probe_mode}, "
                     f"rx_probe_len={self._rx_probe_len}, "
-                    f"analog_bw={self._analog_bandwidth_actual:.0f}Hz(rx)/{usrp_tx_bandwidth:.0f}Hz(tx)")
+                    f"analog_bw={self._analog_bandwidth_actual:.0f}Hz(rx)/{usrp_tx_bandwidth:.0f}Hz(tx), "
+                    f"graphs=tx+rx")
         with self._lock:
             self._tx_buffer.clear()
             self._rx_buffer.clear()
@@ -3304,14 +3322,16 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
     def _sync_waveform_to_top_block(self):
         """Push the current TX vector into the GNU Radio source.
 
-        When stopped, update vector_source_c in place. While running, pause
-        the current flowgraph before replacing the repeating vector, then
-        restart that same graph. This avoids a UHD object rebuild and avoids
-        changing vector_source_c data concurrently with its scheduler work.
+        When stopped, update vector_source_c in place.  While running, pause
+        only the transmit graph before replacing the repeating vector, then
+        restart it.  The receive graph keeps draining the USRP, so a live
+        alpha/beta swap no longer makes UHD report RX overflows and no RX
+        samples are lost across the swap.
         """
 
-        if self._tb is None or self._vector_source is None:
-            self._debug("WARN", "_sync_waveform_to_top_block: no top_block/vector_source yet; queued rebuild")
+        tb_tx = getattr(self, "_tb_tx", None)
+        if tb_tx is None or self._vector_source is None:
+            self._debug("WARN", "_sync_waveform_to_top_block: no TX graph/vector_source yet; queued rebuild")
             self._needs_top_block_rebuild = True
             return
 
@@ -3326,13 +3346,13 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 # vector_source_c.set_data() is not safe to call while the
                 # scheduler is consuming its repeating vector. On B210 this
                 # blocked the first alpha/beta validation indefinitely. Keep
-                # the graph and UHD objects, but stop their streaming threads
-                # for the short waveform replacement.
-                self._debug("INFO", "live waveform sync: pausing top_block")
-                self._tb.stop()
+                # the UHD objects, but stop the TX streaming thread for the
+                # short waveform replacement.  RX is not stopped.
+                self._debug("INFO", "live waveform sync: pausing TX graph (RX keeps draining)")
+                tb_tx.stop()
                 paused = True
-                self._tb.wait()
-                self._debug("INFO", "live waveform sync: top_block paused")
+                tb_tx.wait()
+                self._debug("INFO", "live waveform sync: TX graph paused")
             try:
                 self._vector_source.set_data(data_list, [])
             except TypeError:
@@ -3347,17 +3367,17 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 except Exception:
                     pass
             if live:
-                self._tb.start()
+                tb_tx.start()
                 paused = False
-                self._debug("INFO", "live waveform sync: top_block restarted")
+                self._debug("INFO", "live waveform sync: TX graph restarted")
             self._needs_top_block_rebuild = False
             self._reset_rx_runtime_state(reason=f"waveform_sync_{path.replace(' ', '_')}", reset_counters=False)
             self._debug("INFO", f"{path}: set_data() + rewind ok")
         except Exception as e:
             if paused:
                 try:
-                    self._tb.start()
-                    self._debug("WARN", "live waveform sync failed; previous graph restarted")
+                    tb_tx.start()
+                    self._debug("WARN", "live waveform sync failed; previous TX graph restarted")
                 except Exception as restart_exc:
                     self._running = False
                     self._status = "stopped"
@@ -3946,7 +3966,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
     # Runtime
     # =========================================================
     def start(self):
-        if self._tb is None:
+        tb_tx = getattr(self, "_tb_tx", None)
+        tb_rx = getattr(self, "_tb_rx", None)
+        if tb_tx is None or tb_rx is None:
             if not bool(getattr(self, "_runtime_available", False)):
                 raise RuntimeError(self._runtime_unavailable_message())
             raise RuntimeError("top_block not built")
@@ -3980,7 +4002,11 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     f"ant={self.tx_antenna}->{self.rx_antenna}, "
                     f"tdl_prerender={self._tx_tdl_prerendered}, "
                     f"TDL_fd={self.tdl_doppler_hz:.1f} Hz")
-        self._tb.start()
+        # Start the receive drain first so the loopback is captured from the
+        # first transmitted sample, then start the transmitter.
+        tb_rx.start()
+        tb_tx.start()
+        self._debug("INFO", "start(): TX and RX graphs running")
         self._tx_preview_start_t = time.time()
         self._rx_probe_start_t = time.time()
         self._rx_probe_reanchor_pending = True
@@ -4022,11 +4048,20 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if self._monitor_thread.is_alive():
                 self._debug("WARN", "stop(): monitor thread did not exit within 3 s")
             self._monitor_thread = None
-        try:
-            self._tb.stop()
-            self._tb.wait()
-        except Exception as e:
-            self._debug("WARN", f"top_block stop error: {type(e).__name__}: {e}")
+        # Stop the transmitter first so nothing is radiated while the receive
+        # graph is being torn down.
+        stopped_graphs = []
+        for graph_name, graph in (("TX", getattr(self, "_tb_tx", None)),
+                                  ("RX", getattr(self, "_tb_rx", None)),
+                                  ("legacy", getattr(self, "_tb", None))):
+            if graph is None or any(graph is stopped for stopped in stopped_graphs):
+                continue
+            stopped_graphs.append(graph)
+            try:
+                graph.stop()
+                graph.wait()
+            except Exception as e:
+                self._debug("WARN", f"{graph_name} top_block stop error: {type(e).__name__}: {e}")
         # Give UHD a moment to actually release the USB endpoint before any restart.
         time.sleep(0.25)
         self._running = False
@@ -4239,7 +4274,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         f"{discontinuity_kind}: new={int(rx_data_size)}, "
                         f"window={int(rx_window.size)}, threshold={int(self._rx_overflow_threshold)}; "
                         + ("discarding this window from decode/CSI" if suppress_window else
-                           "latest probe vector is contiguous; decoding it but excluding the interval from evidence"),
+                           "latest probe vector is contiguous; decoding it but excluding the interval from evidence")
+                        + " (the UHD console 'O' / 'overflows occurred' markers refer to this window)",
                     )
                     if suppress_window:
                         # The callback ring has already advanced. Continue

@@ -139,9 +139,15 @@ def test_choose_cfo_discards_nonfinite_and_out_of_range_scored_candidates():
     assert reason in {"scan_best", "alias_best"}
 
 
-def test_live_waveform_sync_pauses_graph_before_replacing_vector():
+def test_live_waveform_sync_pauses_only_tx_graph():
+    """A live TX swap must not stop the RX graph.
+
+    Stopping both graphs made the UHD RX streamer report recurring
+    "overflows occurred" for every alpha/beta candidate swap.
+    """
     mod = importlib.import_module("waveform_sim.hardware.fdidm_hardtest")
     events = []
+    rx_events = []
 
     class TopBlock:
         def stop(self):
@@ -153,6 +159,16 @@ def test_live_waveform_sync_pauses_graph_before_replacing_vector():
         def start(self):
             events.append("start")
 
+    class RxTopBlock:
+        def stop(self):
+            rx_events.append("stop")
+
+        def wait(self):
+            rx_events.append("wait")
+
+        def start(self):
+            rx_events.append("start")
+
     class VectorSource:
         def set_data(self, data, tags):
             events.append("set_data")
@@ -163,7 +179,9 @@ def test_live_waveform_sync_pauses_graph_before_replacing_vector():
             events.append("rewind")
 
     obj = object.__new__(mod._LegacyFDIDMHardwareTest)
-    obj._tb = TopBlock()
+    obj._tb_tx = TopBlock()
+    obj._tb_rx = RxTopBlock()
+    obj._tb = obj._tb_rx
     obj._vector_source = VectorSource()
     obj._tx_waveform = np.array([1 + 2j], dtype=np.complex64)
     obj._tdl_channel_block = None
@@ -177,6 +195,8 @@ def test_live_waveform_sync_pauses_graph_before_replacing_vector():
 
     assert events == ["stop", "wait", "set_data", "rewind", "start", "reset"]
     assert not obj._needs_top_block_rebuild
+    # Only the TX graph was touched; the RX graph recorded nothing.
+    assert rx_events == []
 
 
 def test_live_waveform_sync_failure_is_not_reported_as_applied():
@@ -199,7 +219,9 @@ def test_live_waveform_sync_failure_is_not_reported_as_applied():
             raise ValueError("cannot replace vector")
 
     obj = object.__new__(mod._LegacyFDIDMHardwareTest)
-    obj._tb = TopBlock()
+    obj._tb_tx = TopBlock()
+    obj._tb_rx = TopBlock()
+    obj._tb = obj._tb_rx
     obj._vector_source = VectorSource()
     obj._tx_waveform = np.array([1 + 2j], dtype=np.complex64)
     obj._tdl_channel_block = None
@@ -240,7 +262,9 @@ def test_live_validation_swap_can_reset_rx_state_under_rx_lock(monkeypatch):
         def rewind(self):
             pass
 
-    obj._tb = TopBlock()
+    obj._tb_tx = TopBlock()
+    obj._tb_rx = TopBlock()
+    obj._tb = obj._tb_rx
     obj._vector_source = VectorSource()
     obj._running = True
     errors = []

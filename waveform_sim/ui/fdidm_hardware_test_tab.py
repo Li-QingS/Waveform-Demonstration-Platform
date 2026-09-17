@@ -2456,6 +2456,8 @@ class FDIDMHardwareTestTab(QWidget):
                 if frame.get("useful_data_ratio") is not None else None, ".1f")
         ser_k = int(status.get("ser_errors_total", 0) or 0)
         ser_n = int(status.get("ser_symbols_total", 0) or 0)
+        rx_gap = int(status.get("rx_processing_gap_count", 0) or 0)
+        rx_ovf = int(status.get("rx_overflow_count", 0) or 0)
         detail = (
             f"{'CRC通过' if ok else '未恢复'} | frames={int(status.get('frames_decode_ok',0))}/{int(status.get('frames_processed',0))}, "
             f"Sync={float(status.get('sync_metric',0.0)):.3f}, CFO={float(status.get('cfo_est_hz',0.0)):.1f}Hz/"
@@ -2472,14 +2474,20 @@ class FDIDMHardwareTestTab(QWidget):
             f"TDL注入设定SNR={injected_snr}dB, "
             f"const={status.get('constellation_source','none')}, "
             f"计时残差={frac_delay}采样/{frac_applied}(相关={frac_corr}), 模拟带宽={analog_bw}Hz, "
-            f"ABauto={status.get('adaptive_alpha_beta_state','off')}, RXoverflow={int(status.get('rx_overflow_count',0))}"
+            f"ABauto={status.get('adaptive_alpha_beta_state','off')}, "
+            f"RX断流排除={rx_gap}窗口, RX溢出排除={rx_ovf}窗口（控制台 O 标记在此计数）"
         )
         if not bool(status.get("preamble_reliable", True)):
             detail = "未检测到可靠 FDIDM 前导；" + detail
         if not bool(status.get("evm_valid", True)):
             detail = detail.replace(f"数据EVM={data_evm}%", "数据EVM=不可用%")
         self.decode_status_label.setText(detail)
-        self.decode_status_label.setToolTip(detail)
+        self.decode_status_label.setToolTip(
+            detail
+            + "\n\nUHD 控制台的 \"O\" / \"overflows occurred\" 指接收流送器出现断样。"
+              "这些窗口已被排除出 CRC、EVM 均值与自适应 A/B 证据，"
+              "不会把坏窗口算成一次解调或一次改善。"
+        )
 
     def _maybe_log_runtime(self, status, stats):
         now = time.monotonic()
@@ -2509,6 +2517,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"ABrec={float(status.get('adaptive_recommended_alpha',np.nan)):.2f}/"
             f"{float(status.get('adaptive_recommended_beta',np.nan)):.2f}, "
             f"ABgain={float(status.get('adaptive_predicted_improvement_db',np.nan)):.2f}dB"
+            f", RXgap={int(status.get('rx_processing_gap_count',0))}"
             f", RXoverflow={int(status.get('rx_overflow_count',0))}"
         )
 
