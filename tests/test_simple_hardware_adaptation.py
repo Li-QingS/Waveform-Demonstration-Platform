@@ -254,15 +254,25 @@ def test_validation_improved_keeps_candidate_after_exact_windows():
     assert validation["outcome"] == "improved"
     assert harness.alpha == 0.75 and harness.beta == 0.8
     assert not validation["rollback_pending"]
+    # The locked common-RMS contract is evidence-only.  An accepted candidate
+    # must be rebuilt at its ordinary operating target before tracking resumes.
+    assert validation["commit_complete"] is True
+    assert validation["power_contract_released"] is True
+    assert harness.commits[-1] == (0.75, 0.8, None, "")
+    assert harness._tx_power_metrics.cycle_rms == 0.25
 
 
 def test_validation_inconclusive_at_max_frames_rolls_back():
     harness = ValidationHarness()
     harness.apply_alpha_beta_candidate(0.75, 0.8)
-    _settle(harness)
-    _collect(harness, 24, errors=20, evm=10.0)
-    _settle(harness)
-    _collect(harness, 64, errors=20, evm=10.0)
+    # The validator now collects matched A/B blocks instead of keeping the
+    # first baseline alive until it accumulates an arbitrary error quota.
+    # Drive through bounded settle/collection transitions until it reaches the
+    # configured per-side limit without evidence of a gain.
+    for _ in range(180):
+        _validation_sample(harness, 20, evm=10.0)
+        if harness._adaptive_ab_validation["state"] == "inconclusive":
+            break
     validation = harness._adaptive_ab_validation
     assert validation["state"] == "inconclusive"
     assert validation["rollback_complete"]
@@ -270,6 +280,25 @@ def test_validation_inconclusive_at_max_frames_rolls_back():
     assert "overlap" in validation["result_reason"]
     assert (0.75, 0.8) in harness._adaptive_ab_rejected_pairs
     assert harness._adaptive_ab_failed_until_frame >= harness._frames_processed + 64
+
+
+def test_validation_extends_clean_link_in_matched_ab_blocks():
+    harness = ValidationHarness()
+    harness.apply_alpha_beta_candidate(0.75, 0.8)
+    _settle(harness)
+    _collect(harness, 24, errors=0, evm=10.0)
+    _settle(harness)
+    _collect(harness, 24, errors=0, evm=10.0)
+
+    validation = harness._adaptive_ab_validation
+    assert validation["state"] == "baseline_settling"
+    assert validation["comparison_round"] == 2
+    assert validation["baseline_target_frames"] == 32
+    assert validation["candidate_target_frames"] == 32
+    # It has already tested the candidate after 24 baseline frames; the old
+    # implementation held the baseline for up to 64 frames first.
+    assert validation["baseline_window"].valid_frames == 24
+    assert validation["candidate_window"].valid_frames == 24
 
 
 def test_validation_regressed_rolls_back():
@@ -440,6 +469,7 @@ def test_candidate_sync_loss_is_regression_and_arms_cooldown():
 
 
 def test_rollback_applying_is_a_single_flight_busy_state():
+    assert FDIDMAdaptiveMixin._validation_active_state("commit_applying") is True
     assert FDIDMAdaptiveMixin._validation_active_state("rollback_applying") is True
     assert FDIDMAdaptiveMixin._validation_active_state("rollback_failed") is True
 

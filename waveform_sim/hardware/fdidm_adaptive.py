@@ -1,4 +1,4 @@
-"""FDIDM ????????? fdidm_hardtest.py ????? 6c??"""
+"""FDIDM 硬件 α/β 自适应、实链路 A/B 验证与安全回滚。"""
 from __future__ import annotations
 
 import math
@@ -186,12 +186,28 @@ class FDIDMAdaptiveMixin:
                 "settle_remaining": 0,
                 "min_frames": 24,
                 "max_frames": 64,
+                # Start with a short, symmetric A→B pass.  On a clean link
+                # waiting for 100 baseline errors before even exercising the
+                # candidate made one adaptation take tens of seconds and let
+                # RF drift dominate the comparison.  Inconclusive evidence is
+                # extended in matched blocks (A→B→A→B), not by stretching only
+                # the first baseline window.
+                "baseline_target_frames": 24,
+                "candidate_target_frames": 24,
+                "validation_block_frames": 8,
+                "comparison_round": 1,
                 "min_errors_for_improvement": 100,
                 "contract": contract,
                 "context_key": context_key,
                 "baseline_window": baseline_window,
                 "candidate_window": candidate_window,
                 "apply_generation": 0,
+                # The equal-power contract applies only to the evidence
+                # windows.  These fields make the handoff back to the normal
+                # selected-waveform power explicit in status/export data.
+                "commit_pending": False,
+                "commit_complete": False,
+                "power_contract_released": False,
                 "rollback_pending": False,
                 "rollback_complete": False,
                 "result_reason": "",
@@ -215,6 +231,11 @@ class FDIDMAdaptiveMixin:
         return str(state) in {
             "prepare_contract", "baseline_applying", "baseline_settling", "baseline_collecting",
             "candidate_applying", "candidate_settling", "candidate_collecting",
+            # A successful A/B window is not fully committed until the
+            # candidate has been rebuilt at its normal (non-comparison) power.
+            # Keep this single-flight state visible so a fresh optimizer result
+            # cannot replace it halfway through the live waveform transition.
+            "commit_applying",
             "rollback_applying", "rollback_failed",
         }
 
@@ -303,11 +324,23 @@ class FDIDMAdaptiveMixin:
                 beta = float(validation["candidate_beta"])
                 forced_rms = float(contract.locked_rms)
                 contract_id = contract.contract_id
-            else:
+            elif side == "commit":
+                # The equal-power contract is evidence for the A/B decision,
+                # not the candidate's permanent operating point.  Leaving the
+                # accepted waveform at ``locked_rms`` made the next adaptive
+                # cycle and the displayed steady-state EVM use a different
+                # transmit-power policy from an ordinary selected waveform.
+                alpha = float(validation["candidate_alpha"])
+                beta = float(validation["candidate_beta"])
+                forced_rms = None
+                contract_id = ""
+            elif side == "rollback":
                 alpha = float(validation["old_alpha"])
                 beta = float(validation["old_beta"])
                 forced_rms = None
                 contract_id = ""
+            else:
+                raise ValueError(f"unsupported validation waveform side: {side}")
         try:
             # Hold the generation lock across the state-changing commit. This
             # makes invalidation and waveform publication mutually exclusive;
@@ -355,6 +388,11 @@ class FDIDMAdaptiveMixin:
                 validation["invalid_attempts"] = 0
                 validation["last_invalid_reason"] = ""
                 self._adaptive_ab_state = str(validation["state"])
+            elif side == "commit":
+                validation["commit_pending"] = False
+                validation["commit_complete"] = True
+                validation["power_contract_released"] = True
+                self._complete_validation_transition_locked("improved")
             else:
                 validation["rollback_pending"] = False
                 validation["rollback_complete"] = True
@@ -376,6 +414,11 @@ class FDIDMAdaptiveMixin:
             if side in {"baseline", "candidate"}:
                 validation["state"] = f"{side}_applying"
                 self._adaptive_ab_state = str(validation["state"])
+            elif side == "commit":
+                validation["commit_pending"] = True
+                validation["state"] = "commit_applying"
+                validation["phase_started_wall"] = time.monotonic()
+                self._adaptive_ab_state = "commit_applying"
             else:
                 validation["rollback_pending"] = True
                 validation["state"] = "rollback_applying"
@@ -392,6 +435,7 @@ class FDIDMAdaptiveMixin:
         ).start()
 
     def _finish_alpha_beta_validation(self, decision: ValidationDecision) -> None:
+        commit = False
         rollback = False
         with self._adaptive_ab_lock:
             validation = getattr(self, "_adaptive_ab_validation", {})
@@ -408,8 +452,16 @@ class FDIDMAdaptiveMixin:
             validation["terminal_outcome"] = decision.outcome
             validation["measured"] = decision.as_dict()
             validation["result_reason"] = decision.reason
-            rollback = decision.outcome != "improved" and isinstance(validation.get("contract"), TxPowerContract)
-            if rollback:
+            contract_available = isinstance(validation.get("contract"), TxPowerContract)
+            commit = decision.outcome == "improved" and contract_available
+            rollback = decision.outcome != "improved" and contract_available
+            if commit:
+                # Keep the accepted waveform, but release the temporary
+                # equal-power A/B contract before returning to tracking.
+                validation["state"] = "commit_applying"
+                validation["commit_pending"] = True
+                self._adaptive_ab_state = "commit_applying"
+            elif rollback:
                 validation["state"] = "rollback_applying"
                 validation["rollback_pending"] = True
                 self._adaptive_ab_state = "rollback_applying"
@@ -420,7 +472,9 @@ class FDIDMAdaptiveMixin:
             f"alpha/beta validation {decision.outcome}: measured_SER_gain={decision.measured_ser_gain_db:.3f}dB, "
             f"EVM_delta={decision.evm_delta_pp:.3f}pp, reason={decision.reason}",
         )
-        if rollback:
+        if commit:
+            self._queue_validation_waveform("commit")
+        elif rollback:
             self._queue_validation_waveform("rollback")
 
     def _watchdog_alpha_beta_validation(self, *, attempted: bool = False, reason: str = "") -> None:
@@ -453,7 +507,8 @@ class FDIDMAdaptiveMixin:
             if not timed_out and not too_many_invalid:
                 return
 
-            side = "candidate" if state.startswith("candidate") else "baseline"
+            side = ("commit" if state.startswith("commit") else
+                    ("candidate" if state.startswith("candidate") else "baseline"))
             trigger = "deadline" if timed_out else "invalid-frame budget"
             last_reason = str(validation.get("last_invalid_reason", "no valid frame"))
             validation["watchdog_triggered"] = True
@@ -461,7 +516,12 @@ class FDIDMAdaptiveMixin:
             baseline = validation.get("baseline_window")
             min_frames = int(validation.get("min_frames", 24))
             baseline_ready = isinstance(baseline, EvidenceWindow) and baseline.valid_frames >= min_frames
-            if side == "candidate" and baseline_ready:
+            if side == "commit":
+                decision = ValidationDecision(
+                    "inconclusive",
+                    reason=f"accepted candidate could not restore nominal TX power ({trigger}: {last_reason})",
+                )
+            elif side == "candidate" and baseline_ready:
                 decision = ValidationDecision(
                     "regressed",
                     reason=f"candidate lost reliable synchronization ({trigger}: {last_reason})",
@@ -537,12 +597,16 @@ class FDIDMAdaptiveMixin:
         max_frames = int(validation.get("max_frames", 64))
         min_errors = int(validation.get("min_errors_for_improvement", 100))
         if side == "baseline":
-            if window.valid_frames >= min_frames and (window.ser_errors >= min_errors or window.valid_frames >= max_frames):
+            target = int(validation.get("baseline_target_frames", min_frames))
+            target = max(min_frames, min(target, max_frames))
+            if window.valid_frames >= target:
                 self._queue_validation_waveform("candidate")
             return
 
         baseline = validation.get("baseline_window")
-        if not isinstance(baseline, EvidenceWindow) or window.valid_frames < min_frames:
+        target = int(validation.get("candidate_target_frames", min_frames))
+        target = max(min_frames, min(target, max_frames))
+        if not isinstance(baseline, EvidenceWindow) or window.valid_frames < target:
             return
         mean_baseline_rms = float(np.mean(baseline.power_rms_values)) if baseline.power_rms_values else float("nan")
         mean_candidate_rms = float(np.mean(window.power_rms_values)) if window.power_rms_values else float("nan")
@@ -562,8 +626,29 @@ class FDIDMAdaptiveMixin:
             min_ser_gain_db=float(getattr(self, "adaptive_alpha_beta_min_improvement_db", 0.5)),
         )
         pilot_instability = decision.outcome == "inconclusive" and "pilot" in decision.reason
-        if decision.outcome != "inconclusive" or pilot_instability or window.valid_frames >= max_frames:
+        if decision.outcome != "inconclusive" or pilot_instability:
             self._finish_alpha_beta_validation(decision)
+            return
+
+        # No conclusion after a matched A/B pass.  Extend both sides by the
+        # same bounded amount and return to the baseline first.  This makes
+        # clean-link EVM evidence available promptly while preserving an
+        # equal temporal footprint when SER needs more samples.
+        baseline_frames = int(baseline.valid_frames)
+        candidate_frames = int(window.valid_frames)
+        if baseline_frames >= max_frames and candidate_frames >= max_frames:
+            self._finish_alpha_beta_validation(decision)
+            return
+        block = max(1, int(validation.get("validation_block_frames", 8)))
+        next_target = min(max_frames, max(baseline_frames, candidate_frames) + block)
+        validation["baseline_target_frames"] = int(next_target)
+        validation["candidate_target_frames"] = int(next_target)
+        validation["comparison_round"] = int(validation.get("comparison_round", 1)) + 1
+        validation["result_reason"] = (
+            f"first A/B pass inconclusive; collecting matched extension "
+            f"to {next_target} frames per side"
+        )
+        self._queue_validation_waveform("baseline")
 
     def _ensure_alpha_beta_adaptation_worker(self):
         if not bool(getattr(self, "adaptive_alpha_beta_enable", False)):

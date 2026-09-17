@@ -462,10 +462,13 @@ def test_adaptive_state_row_shows_observability(app):
     status["adaptive_alpha_observable"] = False
     status["adaptive_beta_observable"] = True
     tab._update_adaptive_state_row(status)
-    assert "自适应过程" in tab.adaptive_state_label.text()
+    label = tab.adaptive_state_label.text()
+    # The one-line row is decision-oriented; the raw enums live in the tooltip.
+    assert "自适应" in label
+    assert "α×" in label and "β✓" in label
     tip = tab.adaptive_state_label.toolTip()
-    assert "α可观测=False" in tip and "β可观测=True" in tip
-    assert "搜索状态=monitoring" in tip
+    assert "α可观测=×" in tip and "β可观测=✓" in tip
+    assert "搜索状态=监测中（monitoring）" in tip
 
 
 def test_idle_validation_does_not_hide_optimizer_state(app):
@@ -477,7 +480,10 @@ def test_idle_validation_does_not_hide_optimizer_state(app):
         "adaptive_validation_state": "idle",
     })
     tab._update_adaptive_state_row(status)
-    assert "optimizing" in tab.adaptive_state_label.text()
+    # An idle validation must not hide the optimizer state: it stays visible in
+    # the row as the readable term and in the tooltip as the raw enum.
+    assert "搜索中" in tab.adaptive_state_label.text()
+    assert "optimizing" in tab.adaptive_state_label.toolTip()
 
 
 def test_advantage_cards_use_exact_backend_validation_windows(app):

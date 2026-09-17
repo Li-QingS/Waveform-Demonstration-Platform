@@ -18,6 +18,12 @@ from .stream import SampleRing as _SampleRing
 from .channel import NTNTDLChannel as _NTNTDLChannel
 from .fec import FECMixin
 from .fdidm_adaptive import FDIDMAdaptiveMixin
+from .timing import (
+    DEFAULT_MIN_ABS_DELAY,
+    FractionalDelayEstimate,
+    estimate_fractional_delay,
+    fractional_delay_correct,
+)
 from .evidence import (
     KnownSymbolMetrics,
     PilotFitMetrics,
@@ -151,6 +157,18 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             log_to_stdout: bool = False,
             log_file_path: Optional[str] = None,
             debug_log_max_entries: int = 5000,
+            # A bench RF link adds a group delay that is not an integer number
+            # of samples.  Preamble correlation resolves the integer part; the
+            # residual fraction is measured against the known pilot and
+            # removed before channel estimation.
+            enable_fractional_timing: bool = True,
+            fractional_timing_min_abs: float = DEFAULT_MIN_ABS_DELAY,
+            fractional_timing_half_taps: int = 16,
+            # None keeps the UHD automatic analog filter choice.  An explicit
+            # value removes a session-to-session non-determinism observed on
+            # the B210, where the same 500 kS/s request produced a 56 MHz
+            # analog bandwidth in one run and 1 MHz in the next.
+            analog_bandwidth_hz: Optional[float] = None,
             tdl_rms_delay_spread_ns: float = 1000.0,
             tdl_doppler_hz: float = 0.0,             # common satellite Doppler shift applied to all taps
             tdl_doppler_spread_hz: float = 0.0,      # local scattering Doppler spread for Rayleigh taps
@@ -252,6 +270,18 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.log_to_stdout = bool(log_to_stdout)
         self.log_file_path = str(log_file_path or "")
         self.debug_log_max_entries = int(max(500, min(int(debug_log_max_entries), 100000)))
+        self.enable_fractional_timing = bool(enable_fractional_timing)
+        self.fractional_timing_min_abs = float(max(0.0, min(float(fractional_timing_min_abs), 0.5)))
+        self.fractional_timing_half_taps = int(max(2, min(int(fractional_timing_half_taps), 64)))
+        bandwidth = float(analog_bandwidth_hz) if analog_bandwidth_hz is not None else 0.0
+        if not math.isfinite(bandwidth) or bandwidth < 0.0:
+            raise ValueError("analog_bandwidth_hz must be a non-negative finite value")
+        self.analog_bandwidth_hz = bandwidth if bandwidth > 0.0 else None
+        self._frac_delay_samples = float("nan")
+        self._frac_delay_magnitude = float("nan")
+        self._frac_delay_applied = False
+        self._frac_delay_corrections = 0
+        self._tx_pilot_reference = np.zeros(0, dtype=np.complex128)
         self._channel_mode_note = ""
         self.coding_scheme = self._normalize_coding_scheme(coding_scheme)
         self.coding_interleaver = bool(coding_interleaver)
@@ -501,6 +531,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.last_residual_cfo_phase_std_rad = float("nan")
         self.last_residual_cfo_accepted = False
         self.last_residual_cfo_reject_reason = "not_estimated"
+        self.last_frac_delay_samples = float("nan")
+        self.last_frac_delay_fractional = float("nan")
+        self.last_frac_delay_magnitude = float("nan")
+        self.last_frac_delay_applied = False
         self.last_evm_instant_percent = float("nan")
         self.last_evm_average_percent = float("nan")
         self.last_residual_gain_abs = float("nan")
@@ -1168,6 +1202,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._tx_x_cross = result.first_x_cross.copy()
         self._tx_x_tf = result.first_x_tf.copy()
         self._tx_waveform = result.tx_waveform.copy()
+        self._refresh_tx_pilot_reference()
         self._tx_power_metrics = result.power_metrics
         self._tx_peak_limited = bool(result.power_metrics.peak_limited)
         if not contract_id:
@@ -2958,6 +2993,23 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         usrp_sink.set_antenna(self.tx_antenna, 0)
         usrp_sink.set_gain(self.tx_gain, 0)
 
+        if self.analog_bandwidth_hz:
+            # An explicit analog bandwidth keeps the front-end filter, and
+            # therefore its group delay, identical between runs.  Left to
+            # UHD auto-selection the same 500 kS/s request produced a 56 MHz
+            # analog bandwidth in one session and 1 MHz in the next.
+            usrp_source.set_bandwidth(float(self.analog_bandwidth_hz), 0)
+            usrp_sink.set_bandwidth(float(self.analog_bandwidth_hz), 0)
+        try:
+            self._analog_bandwidth_actual = float(usrp_source.get_bandwidth(0))
+        except Exception:
+            self._analog_bandwidth_actual = 0.0
+        usrp_tx_bandwidth = 0.0
+        try:
+            usrp_tx_bandwidth = float(usrp_sink.get_bandwidth(0))
+        except Exception:
+            usrp_tx_bandwidth = 0.0
+
         tb.connect((tx_gain_block, 0), (usrp_sink, 0))
         rx_input = usrp_source
         log_label = "USRP RF only"
@@ -2996,7 +3048,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._tx_gain_block = tx_gain_block
         self._debug("INFO",
                     f"new top_block assembled, path={mode_text}, rx_mode={rx_probe_mode}, "
-                    f"rx_probe_len={self._rx_probe_len}")
+                    f"rx_probe_len={self._rx_probe_len}, "
+                    f"analog_bw={self._analog_bandwidth_actual:.0f}Hz(rx)/{usrp_tx_bandwidth:.0f}Hz(tx)")
         with self._lock:
             self._tx_buffer.clear()
             self._rx_buffer.clear()
@@ -3052,6 +3105,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._rx_overflow_reason = ""
             self._last_processed_abs_start = -10 ** 18
             self._diag_csi_smooth = None
+            self._frac_delay_samples = float("nan")
+            self._frac_delay_magnitude = float("nan")
+            self._frac_delay_applied = False
             self._cfo_smooth_hz = float("nan")
             self._rx_tracking_locked = False
             self._rx_tracking_failures = 0
@@ -3059,6 +3115,33 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if hasattr(self, "_adaptive_active_step"):
                 self._adaptive_active_step = float(getattr(self, "adaptive_alpha_beta_coarse_step", 0.25))
         self._needs_top_block_rebuild = False
+
+    def _refresh_tx_pilot_reference(self) -> None:
+        """Cache the transmitted pilot block used for sub-sample timing.
+
+        The FDIDM frame is deterministic, so the pilot region of the first TX
+        cycle is exactly what the receiver expects to see apart from gain,
+        phase and a small timing offset.
+        """
+
+        waveform = np.asarray(self._tx_waveform, dtype=np.complex128).reshape(-1)
+        start = int(getattr(self, "_off_pilot", 0))
+        stop = int(getattr(self, "_off_data", start))
+        if stop <= start or waveform.size < stop:
+            self._tx_pilot_reference = np.zeros(0, dtype=np.complex128)
+            return
+        self._tx_pilot_reference = waveform[start:stop].copy()
+
+    def _tx_pilot_reference_samples(self) -> np.ndarray:
+        reference = np.asarray(
+            getattr(self, "_tx_pilot_reference", np.zeros(0)), dtype=np.complex128
+        )
+        if reference.size == 0:
+            self._refresh_tx_pilot_reference()
+            reference = np.asarray(
+                getattr(self, "_tx_pilot_reference", np.zeros(0)), dtype=np.complex128
+            )
+        return reference
 
     def _current_cfo_mode_key(self) -> str:
         return (
@@ -3400,6 +3483,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
 
         rebuild_waveform = False
         rebuild_top_block = False
+        gain_step_live = False
         alpha_beta_changed = False
         adaptive_config_changed = False
         tdl_live_reconfigure = False
@@ -3469,6 +3553,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     self._usrp_sink.set_gain(self.tx_gain, 0)
                 except Exception:
                     pass
+            gain_step_live = True
         if rx_gain is not None and new_rx_gain != self.rx_gain:
             self.rx_gain = new_rx_gain
             if getattr(self, "_usrp_source", None) is not None:
@@ -3476,6 +3561,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     self._usrp_source.set_gain(self.rx_gain, 0)
                 except Exception:
                     pass
+            gain_step_live = True
         if mod_order is not None and str(mod_order).upper() != self.mod_order:
             self.mod_order = str(mod_order).upper()
             self.bits_per_symbol = self._get_bits_per_symbol(self.mod_order)
@@ -3847,6 +3933,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._needs_top_block_rebuild = True
                 self._last_error = self._runtime_unavailable_message()
                 self._debug("WARN", f"configure(): top_block rebuild deferred; {self._last_error}")
+        elif gain_step_live and bool(getattr(self, "_running", False)):
+            # The live gain was already pushed to the USRP above, so the probe
+            # ring still holds samples from the previous link level.  Drop the
+            # next fresh vectors and the smoothed CSI instead of letting frames
+            # that span the gain step reach CRC, the EVM average or A/B proof.
+            self._arm_live_transition()
+            with self._lock:
+                self._diag_csi_smooth = None
 
     # =========================================================
     # Runtime
@@ -4370,6 +4464,61 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     data_samples = frame[self._off_data:self._off_end]
 
             htf_cache_refreshing = False
+            # Sub-sample timing.  The integer frame position is chosen by
+            # preamble correlation, but a bench RF link still leaves a
+            # fraction of a sample that spreads energy across FDIDM cells.
+            # The pilot is a known block, so its residual fraction is measured
+            # directly and removed before channel estimation.
+            frac_delay = FractionalDelayEstimate(float("nan"), 0, float("nan"), float("nan"), False)
+            frac_delay_applied = False
+            # The known pilot only matches the received pilot when the software
+            # channel is absent or pre-rendered into the TX vector.  With a
+            # post-RF TDL the reference is filtered by an unknown channel and
+            # the measurement would follow multipath instead of timing.
+            timing_reference_valid = not self._tdl_after_rf_enabled()
+            if self.enable_fractional_timing and timing_reference_valid:
+                try:
+                    reference = self._tx_pilot_reference_samples()
+                    if reference.size > 0 and reference.size == pilot_samples.size:
+                        # The measurement only needs a short coherent window;
+                        # capping it keeps the FFT cost independent of the
+                        # pilot geometry.
+                        window = int(min(reference.size, 8192))
+                        measured = estimate_fractional_delay(
+                            pilot_samples[:window], reference[:window],
+                            half_taps=self.fractional_timing_half_taps,
+                        )
+                        if measured.reliable:
+                            value = float(measured.fractional_samples)
+                            previous = float(getattr(self, "_frac_delay_samples", float("nan")))
+                            if np.isfinite(previous) and abs(value - previous) < 0.25:
+                                value = 0.5 * previous + 0.5 * value
+                            frac_delay = FractionalDelayEstimate(
+                                delay_samples=value,
+                                integer_lag=int(measured.integer_lag),
+                                fractional_samples=value,
+                                magnitude=float(measured.magnitude),
+                                reliable=True,
+                            )
+                            self._frac_delay_samples = float(value)
+                            self._frac_delay_magnitude = float(measured.magnitude)
+                            correction = frac_delay.correction_samples(
+                                self.fractional_timing_min_abs
+                            )
+                            if correction != 0.0:
+                                frame = fractional_delay_correct(
+                                    frame, correction, self.fractional_timing_half_taps
+                                )
+                                pilot_samples = frame[self._off_pilot:self._off_data]
+                                data_samples = frame[self._off_data:self._off_end]
+                                frac_delay_applied = True
+                                self._frac_delay_applied = True
+                                self._frac_delay_corrections += 1
+                except Exception as exc:
+                    self._debug(
+                        "WARN",
+                        f"fractional timing correction skipped: {type(exc).__name__}: {exc}",
+                    )
             htf_candidate_cache = None
             candidate_pilot_fit = PilotFitMetrics()
             candidate_diag_csi = None
@@ -4505,6 +4654,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 residual_cfo_phase_std_rad=float(getattr(self, "last_residual_cfo_phase_std_rad", float("nan"))),
                 residual_cfo_accepted=bool(getattr(self, "last_residual_cfo_accepted", False)),
                 residual_cfo_reject_reason=str(getattr(self, "last_residual_cfo_reject_reason", "")),
+                frac_delay_samples=float(frac_delay.delay_samples),
+                frac_delay_fractional=float(frac_delay.fractional_samples),
+                frac_delay_magnitude=float(frac_delay.magnitude),
+                frac_delay_applied=bool(frac_delay_applied),
                 adaptive_htf=(candidate_diag_csi
                               if not (self.use_full_htf or self.use_tdl_param_htf) else h_tf_est),
                 adaptive_htf_kind=("full" if (self.use_full_htf or self.use_tdl_param_htf) else "diag"),
@@ -4606,6 +4759,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self.last_residual_cfo_phase_std_rad = float(best.get("residual_cfo_phase_std_rad", float("nan")))
             self.last_residual_cfo_accepted = bool(best.get("residual_cfo_accepted", False))
             self.last_residual_cfo_reject_reason = str(best.get("residual_cfo_reject_reason", ""))
+            self.last_frac_delay_samples = float(best.get("frac_delay_samples", float("nan")))
+            self.last_frac_delay_fractional = float(best.get("frac_delay_fractional", float("nan")))
+            self.last_frac_delay_magnitude = float(best.get("frac_delay_magnitude", float("nan")))
+            self.last_frac_delay_applied = bool(best.get("frac_delay_applied", False))
             self._last_pilot_fit_metrics = best.get("pilot_fit_metrics", PilotFitMetrics())
             self._last_measured_ser = float(known_metrics.ser)
             self._ser_errors_total += int(known_metrics.ser_errors)
@@ -4775,6 +4932,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             f"TDLfit={float(getattr(self, '_last_tdl_param_fit_nmse', float('nan'))):.2e}/"
             f"{int(getattr(self, 'last_tdl_param_path_count', 0))}p, "
             f"decode_ok={best['decode_ok']}, match={best['match_bytes']}/{len(self._tx_payload)}"
+            f", fracDelay={float(best.get('frac_delay_fractional', float('nan'))):+.3f}smpl"
+            f"(corr={float(best.get('frac_delay_magnitude', float('nan'))):.3f},"
+            f"applied={bool(best.get('frac_delay_applied', False))})"
         )
 
 
@@ -4859,6 +5019,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._usrp_sink.set_gain(self.tx_gain, 0)
             except Exception:
                 pass
+        if changed and bool(getattr(self, "_running", False)):
+            # A live gain step leaves the probe ring holding samples from the
+            # previous gain, so the next frames mix two link levels.  Drop two
+            # fresh vectors and the smoothed CSI instead of letting those
+            # mixed frames reach CRC, the EVM average or the A/B validator.
+            self._arm_live_transition()
+            with self._lock:
+                self._diag_csi_smooth = None
 
     def set_rx_gain(self, value: float):
         gain = validate_fdidm_gain(value, name="RX gain")
@@ -4871,6 +5039,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._usrp_source.set_gain(self.rx_gain, 0)
             except Exception:
                 pass
+        if changed and bool(getattr(self, "_running", False)):
+            self._arm_live_transition()
+            with self._lock:
+                self._diag_csi_smooth = None
 
     def set_mod_order(self, mod_order: str):
         was_running = bool(self._running)
@@ -5228,6 +5400,15 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "evm_average_count": len(self._evm_history),
                 "residual_gain_abs": float(self.last_residual_gain_abs),
                 "residual_phase_deg": float(self.last_residual_phase_deg),
+                # Sub-sample RX timing residual and whether this frame was
+                # interpolated.  A bench link leaves up to half a sample of
+                # group delay that the integer preamble search cannot remove.
+                "frac_delay_samples": float(getattr(self, "last_frac_delay_samples", float("nan"))),
+                "frac_delay_fractional": float(getattr(self, "last_frac_delay_fractional", float("nan"))),
+                "frac_delay_magnitude": float(getattr(self, "last_frac_delay_magnitude", float("nan"))),
+                "frac_delay_applied": bool(getattr(self, "last_frac_delay_applied", False)),
+                "frac_delay_correction_count": int(getattr(self, "_frac_delay_corrections", 0)),
+                "analog_bandwidth_hz": float(getattr(self, "_analog_bandwidth_actual", 0.0) or 0.0),
                 "training_probe_guard_len": int(self.training_probe_guard_len),
                 "evm_average_frames": int(self.evm_average_frames),
                 "rx_samples_seen": int(self._rx_samples_seen),
@@ -5365,6 +5546,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
     def get_status(self) -> Dict[str, Any]:
         snap = self.get_debug_snapshot()
         stats = self.get_decode_stats()
+        # Before the first decoded frame there is no measured CFO yet, but the
+        # preamble geometry already defines a finite unambiguous CFO range.
+        # Do not expose the reset sentinel (NaN) to the UI/log summary.
+        cfo_unambiguous_hz = float(getattr(self, "_last_cfo_unambiguous_hz", float("nan")))
+        if not np.isfinite(cfo_unambiguous_hz):
+            cfo_unambiguous_hz = float(self._preamble_cfo_unambiguous_hz())
         return {
             "status": self._status,
             "waveform": "FDIDM_STRICT_PAPER",
@@ -5520,7 +5707,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "cfo_source": snap.get("cfo_source", "preamble"),
             "cfo_alias_hz": float(snap.get("cfo_alias_hz", getattr(self, "_last_cfo_alias_hz", float("nan")))),
             "cfo_scan_score": float(snap.get("cfo_scan_score", getattr(self, "_last_cfo_scan_score", float("nan")))),
-            "cfo_unambiguous_hz": float(getattr(self, "_last_cfo_unambiguous_hz", self._preamble_cfo_unambiguous_hz())),
+            "cfo_unambiguous_hz": cfo_unambiguous_hz,
             "residual_cfo_hz": float(snap.get("residual_cfo_hz", getattr(self, "last_residual_cfo_hz", 0.0))),
             "residual_cfo_confidence": float(snap.get("residual_cfo_confidence", getattr(self, "last_residual_cfo_confidence", 0.0))),
             "residual_cfo_pair_count": int(snap.get("residual_cfo_pair_count", getattr(self, "last_residual_cfo_pair_count", 0))),
@@ -5580,6 +5767,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "constellation_tf_points": int(snap.get("constellation_tf_points", 0)),
             "residual_gain_abs": snap["residual_gain_abs"],
             "residual_phase_deg": snap["residual_phase_deg"],
+            "frac_delay_samples": float(snap.get("frac_delay_samples", float("nan"))),
+            "frac_delay_fractional": float(snap.get("frac_delay_fractional", float("nan"))),
+            "frac_delay_magnitude": float(snap.get("frac_delay_magnitude", float("nan"))),
+            "frac_delay_applied": bool(snap.get("frac_delay_applied", False)),
+            "frac_delay_correction_count": int(snap.get("frac_delay_correction_count", 0)),
+            "analog_bandwidth_hz": float(snap.get("analog_bandwidth_hz", 0.0)),
             "training_probe_guard_len": snap["training_probe_guard_len"],
             # v17.1 - visible "is the worker alive?" counters
             "frames_processed": snap["frames_processed"],

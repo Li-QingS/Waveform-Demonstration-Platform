@@ -49,6 +49,10 @@ def test_fdidm_constructor_and_runtime_gain_limits_are_reported(monkeypatch):
     assert status["gain_limits_db"] == {
         "tx_min": 0.0, "tx_max": 45.0, "rx_min": 0.0, "rx_max": 45.0,
     }
+    # Geometry is known before RX starts; the initial status must not leak the
+    # internal NaN reset sentinel into the operator-facing summary.
+    assert np.isfinite(status["cfo_unambiguous_hz"])
+    assert status["cfo_unambiguous_hz"] > 0.0
     with pytest.raises(ValueError):
         obj.set_tx_gain(45.1)
     with pytest.raises(ValueError):

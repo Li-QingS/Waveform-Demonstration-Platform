@@ -503,7 +503,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.observation_evm_label.setStyleSheet("color:#555555; font-size: 14px;")
         self.observation_note_label = QLabel("")
         self.observation_note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.adaptive_state_label = QLabel("α/β：— | 搜索：— | 验证：— | α可观测：— | β可观测：—")
+        self.adaptive_state_label = QLabel("自适应：等待硬件测试")
         self.adaptive_state_label.setStyleSheet("color:#555555; font-size: 12px;")
         self.adaptive_state_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         result_grid.addWidget(self.observation_badge_label, 2, 0, 1, 2)
@@ -1510,6 +1510,19 @@ class FDIDMHardwareTestTab(QWidget):
         ys = [p[1] for p in self._timeline_apply_points]
         self.timeline_apply_scatter.setData(x=xs, y=ys)
 
+    def _set_observation_note(self, text):
+        """Keep the result strip legible while preserving the full evidence.
+
+        The observation header is deliberately one line tall so it never steals
+        height from the four plots.  A validation reason can be much longer
+        than that row, therefore its unabridged form belongs in the tooltip and
+        exported report rather than being silently clipped by Qt.
+        """
+        full_text = str(text or "")
+        compact_text = full_text if len(full_text) <= 46 else f"{full_text[:45]}…"
+        self.observation_note_label.setText(compact_text)
+        self.observation_note_label.setToolTip(full_text)
+
     def _update_adaptive_state_row(self, status):
         a = float(status.get("alpha", np.nan))
         b = float(status.get("beta", np.nan))
@@ -1525,36 +1538,36 @@ class FDIDMHardwareTestTab(QWidget):
             except Exception:
                 pass
         def yn(v):
-            return "—" if v is None else ("是" if bool(v) else "否")
+            return "—" if v is None else ("✓" if bool(v) else "×")
         search_name = {
             "disabled": "关闭", "idle": "等待有效信道", "monitoring": "监测中",
-            "optimizing": "搜索中", "waiting_channel": "等待可信信道",
-            "ready": "候选已就绪", "error": "异常",
+            "queued": "等待评估", "optimizing": "搜索中", "waiting_channel": "等待可信信道",
+            "ready": "候选已就绪", "tracking": "持续跟踪", "cooldown": "冷却中", "error": "异常",
         }.get(search, search)
         valid_name = {
-            "idle": "未验证", "baseline_collecting": "采集 OFF 基线",
-            "candidate_collecting": "采集 ON 候选", "rollback_applying": "回滚基线",
+            "idle": "未验证", "prepare_contract": "准备对比", "baseline_applying": "切换 OFF 基线",
+            "baseline_settling": "OFF 基线稳定", "baseline_collecting": "采集 OFF 基线",
+            "candidate_applying": "切换 ON 候选", "candidate_settling": "ON 候选稳定",
+            "candidate_collecting": "采集 ON 候选", "commit_applying": "提交候选",
+            "rollback_applying": "回滚基线",
             "improved": "已确认改善", "regressed": "已确认退化",
             "inconclusive": "暂不可归因", "rollback_failed": "回滚失败",
             "aborted": "验证中断",
         }.get(valid, valid)
-        # Keep the backend enum in parentheses for diagnostics and export
-        # correlation, while making the inline row readable to an operator.
-        search_display = search_name if search_name == search else f"{search_name}（{search}）"
-        valid_display = valid_name if valid_name == valid else f"{valid_name}（{valid}）"
-        txt = (f"自适应过程 | α/β={a:.2f}/{b:.2f} | 搜索:{search_display} | "
-               f"验证:{valid_display} | α可观测:{yn(alpha_obs)} | β可观测:{yn(beta_obs)}")
-        if valid == "aborted":
-            txt += " | 验证中断"
-        elif valid == "rollback_failed":
-            txt += " | 回滚失败"
+        index_text = "—" if not (np.isfinite(a) and np.isfinite(b)) else f"{a:.2f}/{b:.2f}"
+        # Keep the visible row decision-oriented.  The raw enums and reason
+        # remain available on hover for diagnosis/export correlation.
+        stage = valid_name if valid not in {"", "idle", "disabled"} else search_name
+        txt = f"自适应：α/β={index_text} · {stage} · 可观测 α{yn(alpha_obs)} β{yn(beta_obs)}"
         reason = str(status.get("adaptive_validation_reason", "") or "")
-        if reason:
-            txt += f" | {reason[:60]}"
         self.adaptive_state_label.setText(txt)
-        self.adaptive_state_label.setToolTip(
-            f"α可观测={bool(alpha_obs)}；β可观测={bool(beta_obs)}；搜索状态={search}；验证状态={valid}"
+        detail = (
+            f"当前 α/β={index_text}；搜索状态={search_name}（{search}）；"
+            f"验证状态={valid_name}（{valid}）；α可观测={yn(alpha_obs)}；β可观测={yn(beta_obs)}"
         )
+        if reason:
+            detail += f"；验证说明：{reason}"
+        self.adaptive_state_label.setToolTip(detail)
 
     def _update_observation_display(self, *_args):
         status = _args[0] if _args and isinstance(_args[0], dict) else {}
@@ -1663,7 +1676,7 @@ class FDIDMHardwareTestTab(QWidget):
                     f"真实 A/B 窗口 · OFF {base_frames} 帧 / ON {cand_frames} 帧 · 最少 {min_frames} 帧")
                 self.observation_badge_label.setStyleSheet("color:#555555; font-weight:600;")
                 if validation_reason:
-                    self.observation_note_label.setText(validation_reason)
+                    self._set_observation_note(validation_reason)
         if pair is None:
             if not validation_display_applied:
                 self.observation_before_label.setText("局部 OFF 基线：—")
@@ -1673,7 +1686,7 @@ class FDIDMHardwareTestTab(QWidget):
                     "font-size: 15px; font-weight: 600; color:#555555;")
                 self.observation_badge_label.setText("可信度：—")
                 self.observation_badge_label.setStyleSheet("")
-                self.observation_note_label.setText(
+                self._set_observation_note(
                     "等待同一信道上下文中的相邻 OFF→ON 窗口；不使用启动时固定基线")
             if not exact_windows_applied:
                 self.observation_before_label.setToolTip("")
@@ -1759,7 +1772,7 @@ class FDIDMHardwareTestTab(QWidget):
             notes.append(pair.validation_reason)
         if validation_reason and validation_reason not in notes:
             notes.append(validation_reason)
-        self.observation_note_label.setText("；".join(notes))
+        self._set_observation_note("；".join(notes))
         self._update_observation_stats(validation)
 
     def _update_observation_stats(self, validation=None):
@@ -2427,6 +2440,10 @@ class FDIDMHardwareTestTab(QWidget):
         residual_sinr = readable(status.get("pilot_residual_sinr_db"), ".2f")
         pilot_nmse = readable(status.get("pilot_fit_nmse"), ".2e")
         injected_snr = readable(status.get("tdl_injected_snr_db", status.get("tdl_snr_db")), ".1f")
+        frac_delay = readable(status.get("frac_delay_fractional"), "+.3f")
+        frac_corr = readable(status.get("frac_delay_magnitude"), ".3f")
+        frac_applied = "已补偿" if bool(status.get("frac_delay_applied", False)) else "未补偿"
+        analog_bw = readable(status.get("analog_bandwidth_hz"), ".4g")
         frame = dict(status.get("frame_structure", {}) or {})
         frame_text = "不可用"
         useful_text = "不可用"
@@ -2454,6 +2471,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"mode={status.get('channel_estimator','')}, ch={status.get('channel_mode','')}, code={status.get('coding_scheme','')}, "
             f"TDL注入设定SNR={injected_snr}dB, "
             f"const={status.get('constellation_source','none')}, "
+            f"计时残差={frac_delay}采样/{frac_applied}(相关={frac_corr}), 模拟带宽={analog_bw}Hz, "
             f"ABauto={status.get('adaptive_alpha_beta_state','off')}, RXoverflow={int(status.get('rx_overflow_count',0))}"
         )
         if not bool(status.get("preamble_reliable", True)):
