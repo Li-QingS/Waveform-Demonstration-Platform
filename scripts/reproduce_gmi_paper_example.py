@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Iterable, Sequence, Tuple
 
 import numpy as np
@@ -23,6 +25,7 @@ SPECTRUM = np.asarray([1.9, 1.4, 1.0, 0.6], dtype=np.float64)
 RADIUS = 0.04
 CHARGED_SAMPLES = 18
 EVALUATION_POINTS = 33
+DEFAULT_FIGURE = PROJECT_ROOT / "artifacts" / "gmi_paper_example.png"
 
 
 def _raw_fdit(alpha: float, beta: float) -> np.ndarray:
@@ -146,10 +149,180 @@ def reproduce_paper_example(evaluation_points: int = EVALUATION_POINTS) -> dict:
     }
 
 
+def _validated_figure_rows(report: dict) -> list[dict]:
+    results = report.get("results")
+    if not isinstance(results, list) or len(results) != 2:
+        raise ValueError("paper figure requires exactly two rho result rows")
+    required = {
+        "curvature_diagonal",
+        "equal_grid",
+        "equal_sampled_regret",
+        "n_alpha",
+        "n_beta",
+        "quadratic_sampled_regret",
+        "relative_improvement_percent",
+        "rho",
+    }
+    rows = []
+    for raw in results:
+        if not isinstance(raw, dict) or not required.issubset(raw):
+            missing = sorted(required.difference(raw if isinstance(raw, dict) else {}))
+            raise ValueError(f"paper figure result is missing fields: {', '.join(missing)}")
+        row = dict(raw)
+        curvature = np.asarray(row["curvature_diagonal"], dtype=np.float64).reshape(-1)
+        equal_grid = np.asarray(row["equal_grid"], dtype=np.int64).reshape(-1)
+        numeric = np.asarray(
+            [
+                row["rho"],
+                row["equal_sampled_regret"],
+                row["quadratic_sampled_regret"],
+                row["relative_improvement_percent"],
+                row["n_alpha"],
+                row["n_beta"],
+            ],
+            dtype=np.float64,
+        )
+        if curvature.size != 2 or equal_grid.size != 2:
+            raise ValueError("paper figure requires two curvature axes and a two-axis equal grid")
+        if not np.all(np.isfinite(curvature)) or np.any(curvature <= 0.0):
+            raise ValueError("paper figure curvature must be positive and finite")
+        if not np.all(np.isfinite(numeric)):
+            raise ValueError("paper figure values must be finite")
+        if min(float(row["equal_sampled_regret"]), float(row["quadratic_sampled_regret"])) <= 0.0:
+            raise ValueError("paper figure regret must be positive")
+        if min(int(row["n_alpha"]), int(row["n_beta"]), int(equal_grid[0]), int(equal_grid[1])) <= 0:
+            raise ValueError("paper figure grid counts must be positive")
+        row["curvature_diagonal"] = curvature
+        row["equal_grid"] = equal_grid
+        rows.append(row)
+    return sorted(rows, key=lambda item: float(item["rho"]))
+
+
+def _draw_periodic_grid(axis, n_alpha: int, n_beta: int, *, color: str, title: str) -> None:
+    alpha = (2.0 * np.arange(int(n_alpha)) + 1.0) / float(n_alpha)
+    beta = (2.0 * np.arange(int(n_beta)) + 1.0) / float(n_beta)
+    aa, bb = np.meshgrid(alpha, beta, indexing="ij")
+    axis.scatter(aa.reshape(-1), bb.reshape(-1), s=34, color=color, edgecolors="white", linewidths=0.5)
+    axis.set(xlim=(0.0, 2.0), ylim=(0.0, 2.0), xlabel=r"$\alpha$", ylabel=r"$\beta$", title=title)
+    axis.set_xticks([0.0, 0.5, 1.0, 1.5, 2.0])
+    axis.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0])
+    axis.set_aspect("equal", adjustable="box")
+    axis.grid(True, alpha=0.22)
+
+
+def render_paper_figure(report: dict, output_path: str | os.PathLike[str]) -> Path:
+    """Render the paper reproduction summary to an atomic, headless PNG."""
+    rows = _validated_figure_rows(report)
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(16.0, 10.0), dpi=120)
+    grid = fig.add_gridspec(2, 3, height_ratios=(1.0, 1.08))
+    curvature_axis = fig.add_subplot(grid[0, 0])
+    equal_axis = fig.add_subplot(grid[0, 1])
+    adaptive_axis = fig.add_subplot(grid[0, 2])
+    regret_axis = fig.add_subplot(grid[1, :])
+
+    x = np.arange(len(rows), dtype=np.float64)
+    width = 0.34
+    alpha_values = np.asarray([row["curvature_diagonal"][0] for row in rows], dtype=np.float64)
+    beta_values = np.asarray([row["curvature_diagonal"][1] for row in rows], dtype=np.float64)
+    alpha_bars = curvature_axis.bar(x - width / 2.0, alpha_values, width, label=r"$Q_{\alpha\alpha}$", color="#3976af")
+    beta_bars = curvature_axis.bar(x + width / 2.0, beta_values, width, label=r"$Q_{\beta\beta}$", color="#e1812c")
+    curvature_axis.set_yscale("log")
+    curvature_axis.set_xticks(x, [rf"$\rho={float(row['rho']):g}$" for row in rows])
+    curvature_axis.set_ylabel("Receiver-dependent curvature")
+    curvature_axis.set_title("Local GMI sensitivity")
+    curvature_axis.grid(True, axis="y", which="both", alpha=0.22)
+    curvature_axis.legend(frameon=False)
+    for bars in (alpha_bars, beta_bars):
+        curvature_axis.bar_label(bars, fmt="%.3g", padding=3, fontsize=9)
+
+    equal_grid = rows[0]["equal_grid"]
+    _draw_periodic_grid(
+        equal_axis,
+        int(equal_grid[0]),
+        int(equal_grid[1]),
+        color="#777777",
+        title=f"Equal allocation: {int(equal_grid[0])} x {int(equal_grid[1])} = 36",
+    )
+    _draw_periodic_grid(
+        adaptive_axis,
+        int(rows[0]["n_alpha"]),
+        int(rows[0]["n_beta"]),
+        color="#2a9d67",
+        title=f"Receiver-dependent: {int(rows[0]['n_alpha'])} x {int(rows[0]['n_beta'])} = 36",
+    )
+
+    equal_regret = np.asarray([row["equal_sampled_regret"] for row in rows], dtype=np.float64)
+    adaptive_regret = np.asarray([row["quadratic_sampled_regret"] for row in rows], dtype=np.float64)
+    equal_bars = regret_axis.bar(x - width / 2.0, equal_regret, width, label="Equal 6 x 6", color="#777777")
+    adaptive_bars = regret_axis.bar(x + width / 2.0, adaptive_regret, width, label="Receiver-dependent 4 x 9", color="#2a9d67")
+    regret_axis.set_yscale("log")
+    regret_axis.set_xticks(x, [rf"$\rho={float(row['rho']):g}$" for row in rows])
+    regret_axis.set_ylabel("Maximum sampled regret (nat/sample, log scale)")
+    regret_axis.set_title("Same 36-token budget: lower worst-case regret")
+    regret_axis.grid(True, axis="y", which="both", alpha=0.22)
+    regret_axis.legend(frameon=False, loc="upper left")
+    for bars in (equal_bars, adaptive_bars):
+        regret_axis.bar_label(bars, labels=[f"{bar.get_height():.3e}" for bar in bars], padding=4, fontsize=9)
+    for index, row in enumerate(rows):
+        top = max(equal_regret[index], adaptive_regret[index])
+        regret_axis.annotate(
+            f"{float(row['relative_improvement_percent']):.2f}% lower",
+            xy=(index, top),
+            xytext=(0, 24),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            fontweight="bold",
+            color="#176b43",
+        )
+
+    evaluation_grid = report.get("evaluation_grid", ["?", "?"])
+    spectrum = report.get("spectrum", [])
+    fig.suptitle("Receiver-Dependent GMI Geometry for a Finite Transceiver Library", fontsize=18, fontweight="bold")
+    fig.text(
+        0.5,
+        0.018,
+        f"Library budget: {report.get('library_budget', '?')} | Evaluation grid: {evaluation_grid[0]} x {evaluation_grid[1]} | "
+        f"Spectrum: {spectrum} | Periodic domain: [0, 2) x [0, 2)",
+        ha="center",
+        fontsize=10,
+        color="#444444",
+    )
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.085, top=0.90, hspace=0.26, wspace=0.25)
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.stem}.", suffix=".png", dir=str(target.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        fig.savefig(temporary, format="png", dpi=120, facecolor="white")
+        if temporary.stat().st_size < 1024 or temporary.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+            raise RuntimeError("renderer did not produce a valid PNG")
+        os.replace(temporary, target)
+    finally:
+        plt.close(fig)
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evaluation-points", type=int, default=EVALUATION_POINTS)
     parser.add_argument("--json", type=Path, help="optional output JSON path")
+    figure_group = parser.add_mutually_exclusive_group()
+    figure_group.add_argument("--figure", type=Path, help=f"PNG output path (default: {DEFAULT_FIGURE})")
+    figure_group.add_argument("--no-figure", action="store_true", help="print numeric results without generating a PNG")
     args = parser.parse_args(argv)
     result = reproduce_paper_example(args.evaluation_points)
     encoded = json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2)
@@ -157,6 +330,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(encoded + "\n", encoding="utf-8")
+    if not args.no_figure:
+        output = render_paper_figure(result, args.figure or DEFAULT_FIGURE)
+        print(f"Figure: {output}")
     return 0
 
 

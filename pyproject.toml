@@ -9,6 +9,7 @@ description = "FDIDM/OFDM/OTFS/AFDM 波形原型验证演示平台"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24,<3.0",
+  "matplotlib>=3.7,<4.0",
   "PyQt5>=5.15,<6.0",
   "pyqtgraph>=0.13,<0.14",
 ]

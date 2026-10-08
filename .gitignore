@@ -31,6 +31,7 @@ runs/
 /legend_*.png
 /pair_*.png
 /tmp_check.png
+/artifacts/gmi_paper_example.png
 /commit_ui.py
 /head_ui.py
 /orig_ui.py
