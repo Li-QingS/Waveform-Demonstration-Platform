@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import threading
 import time
@@ -14,10 +15,13 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 
+from waveform_sim.gmi.model import ChannelState, ExperimentResources, ReceiverSpec
+from waveform_sim.gmi.selector import RobustnessProfile
+
 from .stream import SampleRing as _SampleRing
 from .channel import NTNTDLChannel as _NTNTDLChannel
 from .fec import FECMixin
-from .fdidm_adaptive import FDIDMAdaptiveMixin
+from .fdidm_adaptive import FDIDMAdaptiveMixin, GMIAdaptiveController
 from .timing import (
     DEFAULT_MIN_ABS_DELAY,
     FractionalDelayEstimate,
@@ -194,11 +198,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             adaptive_alpha_beta_min_improvement_db: float = 0.5,
             adaptive_alpha_beta_stability_evals: int = 2,
             adaptive_alpha_beta_cooldown_frames: int = 16,
-            adaptive_alpha_beta_integer_margin_db: float = 0.10,
             adaptive_alpha_beta_max_order: int = 512,
             adaptive_alpha_beta_min_sync_metric: float = 0.30,
             adaptive_alpha_beta_require_good_frame: bool = False,
             adaptive_alpha_beta_rcond: float = 1e-6,
+            gmi_adaptive_enable: bool = False,
+            gmi_receiver_mode: str = "diagonal",
+            gmi_catalogue_cap: int = 16,
+            gmi_robustness_profile: str = "standard",
             **_legacy_ignored: Any,
     ):
         self.carrier_freq = float(carrier_freq)
@@ -335,12 +342,21 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self.adaptive_alpha_beta_min_improvement_db = float(max(0.0, min(float(adaptive_alpha_beta_min_improvement_db), 30.0)))
         self.adaptive_alpha_beta_stability_evals = int(max(1, min(int(adaptive_alpha_beta_stability_evals), 16)))
         self.adaptive_alpha_beta_cooldown_frames = int(max(0, min(int(adaptive_alpha_beta_cooldown_frames), 4096)))
-        self.adaptive_alpha_beta_integer_margin_db = float(max(0.0, min(float(adaptive_alpha_beta_integer_margin_db), 6.0)))
         self.adaptive_alpha_beta_max_order = int(max(16, min(int(adaptive_alpha_beta_max_order), 4096)))
         self.adaptive_alpha_beta_min_sync_metric = float(max(0.0, min(float(adaptive_alpha_beta_min_sync_metric), 1.0)))
         self.adaptive_alpha_beta_require_good_frame = bool(adaptive_alpha_beta_require_good_frame)
         self.adaptive_alpha_beta_rcond = float(max(1e-12, min(float(adaptive_alpha_beta_rcond), 1e-1)))
         self._adaptive_active_step = float(self.adaptive_alpha_beta_coarse_step)
+
+        self.gmi_adaptive_enable = bool(gmi_adaptive_enable)
+        self.gmi_receiver_mode = str(gmi_receiver_mode).strip().lower()
+        if self.gmi_receiver_mode not in {"diagonal", "full_matched"}:
+            raise ValueError("gmi_receiver_mode must be 'diagonal' or 'full_matched'")
+        self.gmi_catalogue_cap = int(gmi_catalogue_cap)
+        if self.gmi_catalogue_cap not in {1, 4, 16, 25, 36, 49, 64}:
+            raise ValueError("gmi_catalogue_cap must be one of 1, 4, 16, 25, 36, 49, 64")
+        self.gmi_robustness_profile = str(gmi_robustness_profile).strip().lower()
+        RobustnessProfile.named(self.gmi_robustness_profile)
 
         self._estimator_auto_note = ""
         self._resolve_effective_channel_estimator()
@@ -429,16 +445,17 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._rx_probe_reanchor_pending = True
         self._rx_probe_continuity = "unknown"
         self._rx_probe_continuity_reason = "probe metadata unavailable"
-        # A probe_signal_vc exposes only the newest vector, not a cumulative
-        # UHD sample counter.  Keep an explicit continuity verdict so a vector
-        # that is internally well-formed is not mistaken for a proven stream
-        # continuation after a scheduler/USB queue jump.
+        # A probe_signal_vc exposes only the newest stream_to_vector block, not
+        # a cumulative UHD sample counter.  Continuity therefore describes the
+        # samples *inside that block*; wall-clock time between two polls cannot
+        # prove that UHD dropped samples and is tracked only for de-duplication.
         self._rx_probe_last_update_wall = 0.0
         self._rx_probe_last_abs_est = 0
         self._rx_probe_last_delta = 0
         self._rx_probe_last_vector_size = 0
         self._rx_probe_continuity = "unknown"
         self._rx_probe_generation = 0
+        self._rx_acquisition_epoch = 0
         self._rx_probe_stale_count = 0
         # Full-H_TF cache: first accepted CSI is reused until cleared or reconfigured.
         self._cached_htf_full: Optional[np.ndarray] = None
@@ -606,7 +623,6 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._adaptive_ab_recommendation: Dict[str, Any] = {}
         self._adaptive_ab_last_skip_reason = ""
         self._adaptive_ab_last_skip_log_wall = 0.0
-        self._adaptive_ab_recent_metrics = deque(maxlen=12)
         self._adaptive_ab_validation = {
             "state": "idle", "old_alpha": float(self.alpha), "old_beta": float(self.beta),
             "candidate_alpha": float(self.alpha), "candidate_beta": float(self.beta),
@@ -615,6 +631,10 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "min_frames": 24, "max_frames": 64,
             "result_reason": "", "outcome": "",
         }
+        self._gmi_controller: Optional[GMIAdaptiveController] = None
+        self._gmi_last_publish_wall = -1.0e30
+        self._gmi_publish_interval_sec = 2.0
+        self._rebuild_gmi_controller()
 
         self._set_tx_text_internal(tx_text)
         # GNU Radio/UHD is optional for offline construction and deterministic
@@ -656,6 +676,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                         f"coarse={self.adaptive_alpha_beta_coarse_step:.2f}, "
                         f"fine={self.adaptive_alpha_beta_fine_step:.2f}, "
                         f"interval={self.adaptive_alpha_beta_interval_frames} frame(s)")
+        if self.gmi_adaptive_enable and self._gmi_controller is not None:
+            self._gmi_controller.start()
 
 
     # =========================================================
@@ -791,6 +813,156 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._estimator_forced_reason = "" if effective == requested else reason
         self._estimator_auto_note = "" if reason == "as_requested" else reason
         return old_effective != effective
+
+    # =========================================================
+    # Receiver-dependent GMI adaptation
+    # =========================================================
+    def _compute_gmi_resources(self) -> ExperimentResources:
+        signal_dimension = int(self.M * self.N)
+        data_guard = max(0, int(getattr(self, "data_frame_len", signal_dimension)) - signal_dimension)
+        guard_samples = data_guard + int(getattr(self, "pre_guard_len", 0)) + int(getattr(self, "post_guard_len", 0))
+        training_samples = int(getattr(self, "sync_len", 0)) + int(getattr(self, "pilot_frame_len", 0))
+        return ExperimentResources(
+            signal_dimension=signal_dimension,
+            grid_rows=int(self.M),
+            grid_cols=int(self.N),
+            guard_samples=guard_samples,
+            training_samples=training_samples,
+            catalogue_cap=int(self.gmi_catalogue_cap),
+            sample_rate_hz=float(self.sample_rate),
+            bandwidth_hz=float(getattr(self, "_analog_bandwidth_actual", 0.0) or self.sample_rate),
+            target_rms=float(getattr(self, "_tx_rms_target", 0.35)),
+            peak_limit=float(getattr(self, "_tx_peak_limit", 0.9)),
+            pilot_rule="shared_constant_modulus_tf_v18",
+            receiver_rule="gmi_projection_v1",
+        )
+
+    def _gmi_resources(self) -> ExperimentResources:
+        """Return the immutable resource contract of the active library.
+
+        UHD may report its actual analogue bandwidth only after the controller
+        has been built, and A/B validation temporarily locks a different TX
+        RMS.  Neither runtime observation is permission to redefine the
+        experiment while a candidate is being validated.
+        """
+        controller = getattr(self, "_gmi_controller", None)
+        resources = getattr(controller, "resources", None)
+        return resources if isinstance(resources, ExperimentResources) else self._compute_gmi_resources()
+
+    def _rebuild_gmi_controller(self) -> None:
+        previous = getattr(self, "_gmi_controller", None)
+        if previous is not None:
+            previous.stop(timeout=1.0)
+        resources = self._compute_gmi_resources()
+        receiver = ReceiverSpec(
+            str(self.gmi_receiver_mode),
+            None if str(self.gmi_receiver_mode) == "full_matched" else 0,
+        )
+        self._gmi_controller = GMIAdaptiveController(
+            resources,
+            receiver,
+            current_alpha=float(self.alpha),
+            current_beta=float(self.beta),
+            robustness_profile=str(self.gmi_robustness_profile),
+            channel_estimator=str(self.channel_estimator),
+            equalizer=str(self.equalizer),
+        )
+        self._gmi_last_publish_wall = -1.0e30
+        if bool(getattr(self, "gmi_adaptive_enable", False)):
+            self._gmi_controller.start()
+
+    def _gmi_context_id(self) -> str:
+        payload = repr((self._alpha_beta_adaptation_context_key(), self._gmi_resources().resource_id)).encode("utf-8")
+        return f"gmi-ctx-{hashlib.sha256(payload).hexdigest()[:16]}"
+
+    def _publish_gmi_channel_state(
+        self,
+        *,
+        h_tf_est: Any,
+        htf_kind: str,
+        noise_var: float,
+        sync_metric: float,
+        csi_trustworthy: bool,
+        processing_gap: bool,
+    ) -> bool:
+        if not bool(getattr(self, "gmi_adaptive_enable", False)):
+            return False
+        controller = getattr(self, "_gmi_controller", None)
+        if controller is None or h_tf_est is None:
+            return False
+        # Dense 16x16 library scoring is intentionally off the RX thread but
+        # can still take longer than one decode interval.  Admit a new CSI
+        # snapshot only when the worker has finished the prior one and at a
+        # bounded cadence; otherwise a continuously refreshed latest-state
+        # slot would invalidate every result before it becomes actionable.
+        controller_state = str(controller.status().get("state", ""))
+        now = time.monotonic()
+        if controller_state in {"queued", "scoring"}:
+            return False
+        if now - float(getattr(self, "_gmi_last_publish_wall", -1.0e30)) < float(
+            getattr(self, "_gmi_publish_interval_sec", 2.0)
+        ):
+            return False
+        raw = np.asarray(h_tf_est, dtype=np.complex128)
+        dimension = int(self.M * self.N)
+        if str(htf_kind) == "diag" or raw.size == dimension:
+            channel = np.diag(raw.reshape(-1, order="F")[:dimension])
+        elif raw.size == dimension * dimension:
+            channel = raw.reshape((dimension, dimension))
+        else:
+            return False
+        if not np.all(np.isfinite(channel.real)) or not np.all(np.isfinite(channel.imag)):
+            return False
+        noise = float(noise_var)
+        if not math.isfinite(noise) or noise <= 0.0:
+            return False
+        continuity = bool(
+            csi_trustworthy
+            and not processing_gap
+            and str(getattr(self, "_rx_probe_continuity", "unknown")) == "contiguous"
+        )
+        pilot_nmse = float(getattr(self._last_pilot_fit_metrics, "fit_nmse", float("nan")))
+        uncertainty = 0.0 if not math.isfinite(pilot_nmse) else min(0.05, max(0.0, pilot_nmse) * 0.01)
+        state = ChannelState(
+            context_id=self._gmi_context_id(),
+            epoch=int(getattr(self, "_rx_probe_generation", 0)),
+            timestamp=float(time.time()),
+            h_tf=channel,
+            noise_variance=noise,
+            symbol_power=1.0,
+            sync_metric=float(sync_metric),
+            effective_cfo_hz=float(getattr(self, "last_cfo_est_hz", 0.0)),
+            pilot_nmse=pilot_nmse if math.isfinite(pilot_nmse) else 0.0,
+            pilot_power=max(float(getattr(self._last_pilot_fit_metrics, "fitted_power", 0.0)), 1e-15),
+            continuity=continuity,
+            # ``_rx_last_overflow_samples`` is a historical diagnostic and is
+            # intentionally not a latch.  The overflowing window is discarded
+            # before CSI publication; a later contiguous window must be able
+            # to recover instead of remaining fail-closed forever.  A local
+            # processing discontinuity is represented by ``continuity=False``
+            # above, not misreported as a UHD overflow.
+            overflow=False,
+            state_uncertainty_nats=uncertainty,
+        )
+        controller.publish(state)
+        self._gmi_last_publish_wall = now
+        return True
+
+    def request_gmi_evaluation(self) -> bool:
+        controller = getattr(self, "_gmi_controller", None)
+        return bool(controller is not None and self.gmi_adaptive_enable and controller.request_evaluation())
+
+    def get_gmi_adaptation_status(self) -> Dict[str, Any]:
+        controller = getattr(self, "_gmi_controller", None)
+        if controller is None:
+            return {"enabled": False, "state": "uninitialized", "reason": "controller_unavailable"}
+        status = controller.status()
+        status["enabled"] = bool(self.gmi_adaptive_enable)
+        status["active_library_size"] = int(status.get("library_size", 0)) if self.gmi_adaptive_enable else 1
+        if not self.gmi_adaptive_enable:
+            status["state"] = "disabled"
+            status["switch_allowed"] = False
+        return status
 
     # =========================================================
     # Parameter limit / link budget helpers
@@ -3122,6 +3294,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             self._rx_probe_last_delta = 0
             self._rx_probe_last_vector_size = 0
             self._rx_probe_generation = 0
+            self._rx_acquisition_epoch = 0
             self._rx_probe_stale_count = 0
             self._rx_last_overflow_samples = 0
             self._rx_overflow_reason = ""
@@ -3459,11 +3632,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             adaptive_alpha_beta_min_improvement_db: Optional[float] = None,
             adaptive_alpha_beta_stability_evals: Optional[int] = None,
             adaptive_alpha_beta_cooldown_frames: Optional[int] = None,
-            adaptive_alpha_beta_integer_margin_db: Optional[float] = None,
             adaptive_alpha_beta_max_order: Optional[int] = None,
             adaptive_alpha_beta_min_sync_metric: Optional[float] = None,
             adaptive_alpha_beta_require_good_frame: Optional[bool] = None,
             adaptive_alpha_beta_rcond: Optional[float] = None,
+            gmi_adaptive_enable: Optional[bool] = None,
+            gmi_receiver_mode: Optional[str] = None,
+            gmi_catalogue_cap: Optional[int] = None,
+            gmi_robustness_profile: Optional[str] = None,
             **_ignored: Any,
     ):
 
@@ -3511,6 +3687,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         gain_step_live = False
         alpha_beta_changed = False
         adaptive_config_changed = False
+        gmi_config_changed = False
         tdl_live_reconfigure = False
         tdl_metadata_only_changed = False
 
@@ -3605,6 +3782,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             alpha_beta_changed = True
         if alpha_beta_changed:
             self._note_alpha_beta_changed_for_adaptation(reason="configure_alpha_beta_changed")
+            if getattr(self, "_gmi_controller", None) is not None:
+                self._gmi_controller.set_current_waveform(self.alpha, self.beta)
         if fdidm_m is not None:
             new_m = int(max(4, min(int(fdidm_m), 64)))
             if new_m != self.M:
@@ -3753,10 +3932,6 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             v = int(max(0, min(int(adaptive_alpha_beta_cooldown_frames), 4096)))
             if v != self.adaptive_alpha_beta_cooldown_frames:
                 self.adaptive_alpha_beta_cooldown_frames = v; adaptive_config_changed = True
-        if adaptive_alpha_beta_integer_margin_db is not None:
-            v = float(max(0.0, min(float(adaptive_alpha_beta_integer_margin_db), 6.0)))
-            if v != self.adaptive_alpha_beta_integer_margin_db:
-                self.adaptive_alpha_beta_integer_margin_db = v; adaptive_config_changed = True
         if adaptive_alpha_beta_max_order is not None:
             v = int(max(16, min(int(adaptive_alpha_beta_max_order), 4096)))
             if v != self.adaptive_alpha_beta_max_order:
@@ -3781,6 +3956,32 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             else:
                 with self._adaptive_ab_lock:
                     self._adaptive_ab_state = "disabled"
+
+        if gmi_adaptive_enable is not None:
+            value = bool(gmi_adaptive_enable)
+            if value != self.gmi_adaptive_enable:
+                self.gmi_adaptive_enable = value
+                gmi_config_changed = True
+        if gmi_receiver_mode is not None:
+            value = str(gmi_receiver_mode).strip().lower()
+            if value not in {"diagonal", "full_matched"}:
+                raise ValueError("gmi_receiver_mode must be 'diagonal' or 'full_matched'")
+            if value != self.gmi_receiver_mode:
+                self.gmi_receiver_mode = value
+                gmi_config_changed = True
+        if gmi_catalogue_cap is not None:
+            value = int(gmi_catalogue_cap)
+            if value not in {1, 4, 16, 25, 36, 49, 64}:
+                raise ValueError("gmi_catalogue_cap must be one of 1, 4, 16, 25, 36, 49, 64")
+            if value != self.gmi_catalogue_cap:
+                self.gmi_catalogue_cap = value
+                gmi_config_changed = True
+        if gmi_robustness_profile is not None:
+            value = str(gmi_robustness_profile).strip().lower()
+            RobustnessProfile.named(value)
+            if value != self.gmi_robustness_profile:
+                self.gmi_robustness_profile = value
+                gmi_config_changed = True
 
         # Channel settings. Every mode traverses USRP RF; optional TDL stages either
         # run after RX or are pre-rendered before TX. Any change invalidates CSI.
@@ -3929,6 +4130,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 self._rx_probe_last_delta = 0
                 self._rx_probe_last_vector_size = 0
                 self._rx_probe_generation = 0
+                self._rx_acquisition_epoch = 0
                 self._rx_probe_stale_count = 0
                 self._tx_preview_start_t = time.time()
             if getattr(self, "_estimator_auto_note", ""):
@@ -3967,6 +4169,9 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             with self._lock:
                 self._diag_csi_smooth = None
 
+        if gmi_config_changed or rebuild_waveform:
+            self._rebuild_gmi_controller()
+
     # =========================================================
     # Runtime
     # =========================================================
@@ -3990,6 +4195,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 raise
         self._run_id = int(getattr(self, "_run_id", 0)) + 1
         self._invalidate_alpha_beta_adaptation(reason=f"start_run_{self._run_id}", cooldown=False)
+        if self.gmi_adaptive_enable and self._gmi_controller is not None:
+            self._gmi_controller.start()
         self._reset_rx_runtime_state(reason=f"start_run_{self._run_id}", reset_counters=True)
         if bool(getattr(self, "enable_realtime_scheduling", True)):
             try:
@@ -4026,6 +4233,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
         self._rx_probe_last_delta = 0
         self._rx_probe_last_vector_size = 0
         self._rx_probe_generation = 0
+        self._rx_acquisition_epoch = 0
         self._rx_probe_stale_count = 0
         self._running = True
         self._status = "running"
@@ -4045,6 +4253,8 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                     f"stop(): tearing down, frames_processed={self._frames_processed}, "
                     f"frames_decode_ok={self._frames_decode_ok}, rx_samples_seen={self._rx_samples_seen}")
         self._invalidate_alpha_beta_adaptation(reason="hardware_stop", cooldown=False)
+        if self._gmi_controller is not None:
+            self._gmi_controller.stop(timeout=2.0)
         # Order is important: stop the monitor before tearing down the GR sinks,
         # otherwise the monitor can call .data() on a half-destructed vector sink.
         self._monitor_stop.set()
@@ -4116,6 +4326,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if bool(getattr(self, "_rx_probe_reanchor_pending", False)):
                 self._rx_probe_start_t = now
                 self._rx_probe_reanchor_pending = False
+                self._rx_acquisition_epoch = int(getattr(self, "_rx_acquisition_epoch", 0)) + 1
                 self._rx_probe_continuity = "unknown"
                 self._rx_probe_continuity_reason = "probe vector has no monotonic sample metadata"
                 self._rx_probe_last_update_wall = now
@@ -4142,30 +4353,19 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             if abs_est <= int(self._rx_samples_seen):
                 abs_est = int(self._rx_samples_seen) + max(1, int(vec.size))
             newly = int(max(0, abs_est - int(self._rx_samples_seen)))
-            previous_wall = float(getattr(self, "_rx_probe_last_update_wall", 0.0))
             previous_size = int(getattr(self, "_rx_probe_last_vector_size", 0))
-            dt = now - previous_wall if previous_wall > 0.0 else float("nan")
-            expected = dt * max(float(self.sample_rate), 1.0) if np.isfinite(dt) and dt > 0.0 else float("nan")
             self._rx_probe_last_delta = int(newly)
             self._rx_probe_last_update_wall = now
             self._rx_probe_last_vector_size = int(vec.size)
             self._rx_probe_last_abs_est = int(abs_est)
             self._rx_probe_generation = int(getattr(self, "_rx_probe_generation", 0)) + 1
-            if not np.isfinite(expected) or expected <= 0.0:
-                self._rx_probe_continuity = "unknown"
-                self._rx_probe_continuity_reason = "wall-clock interval unavailable"
-            elif newly <= 0:
+            if newly <= 0:
                 self._rx_probe_continuity = "stale"
                 self._rx_probe_continuity_reason = "non-advancing wall-clock sample estimate"
-            elif expected > 0.0 and (newly < 0.25 * expected or newly > 4.0 * expected):
-                self._rx_probe_continuity = "gap"
-                self._rx_probe_continuity_reason = (
-                    f"sample delta {newly} differs from wall-clock estimate {expected:.0f}"
-                )
             else:
                 self._rx_probe_continuity = "contiguous"
                 self._rx_probe_continuity_reason = (
-                    f"sample delta {newly}, wall-clock estimate {expected:.0f}, prior vector {previous_size}"
+                    f"fresh contiguous probe block; estimated advance {newly}, prior vector {previous_size}"
                 )
             return vec, abs_est, int(vec.size), newly
 
@@ -4260,9 +4460,12 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                             break
                         continue
                 discontinuity_window = bool(
-                    (self._rx_probe_mode == "probe_signal_vc" and continuity == "gap") or
-                    rx_data_size > int(getattr(self, "_rx_overflow_threshold", 0))
-                    and rx_data_size > max(4 * int(rx_window.size), 65536)
+                    (self._rx_probe_mode == "probe_signal_vc" and continuity == "gap")
+                    or (
+                        self._rx_probe_mode != "probe_signal_vc"
+                        and rx_data_size > int(getattr(self, "_rx_overflow_threshold", 0))
+                        and rx_data_size > max(4 * int(rx_window.size), 65536)
+                    )
                 )
                 if discontinuity_window:
                     with self._lock:
@@ -4923,8 +5126,29 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "crc_success_ratio": float(bool(best.get("decode_ok", False))),
                 "decode_ok": bool(best.get("decode_ok", False)),
                 "sync_valid": bool(self._refined_preamble_is_reliable(best.get("cfo_scan_score", float("nan")))),
+                "sync_metric": float(best.get("sync_metric", float("nan"))),
+                "effective_cfo_hz": float(best.get("cfo_hz", float("nan"))),
+                "residual_cfo_hz": float(getattr(self, "last_residual_cfo_hz", float("nan"))),
                 "pilot_fit_nmse": float(getattr(best.get("pilot_fit_metrics", PilotFitMetrics()), "fit_nmse", float("nan"))),
                 "pilot_fitted_power": float(getattr(best.get("pilot_fit_metrics", PilotFitMetrics()), "fitted_power", float("nan"))),
+                "rx_input_rms": float(getattr(self, "_rx_input_rms", float("nan"))),
+                "rx_input_peak": float(getattr(self, "_rx_input_peak", float("nan"))),
+                "probe_continuity": str(getattr(self, "_rx_probe_continuity", "unknown")) == "contiguous",
+                # One epoch spans all fresh probe vectors between receiver
+                # re-anchors.  Using the per-vector generation made the
+                # stability gate mathematically impossible to satisfy.
+                "acquisition_epoch": int(getattr(self, "_rx_acquisition_epoch", 0)),
+                "context_id": self._gmi_context_id(),
+                "resource_id": self._gmi_resources().resource_id,
+                "gmi_nats_per_sample": next(
+                    (
+                        float(score.get("gmi_nats_per_sample", float("nan")))
+                        for score in self.get_gmi_adaptation_status().get("scores", [])
+                        if str(score.get("token_id", ""))
+                        == str(self.get_gmi_adaptation_status().get("current_token_id", ""))
+                    ),
+                    float("nan"),
+                ),
                 # The newest probe vector itself may be contiguous, but a
                 # processing gap makes this A/B observation non-comparable.
                 "overflow": bool(processing_gap),
@@ -4977,6 +5201,14 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 good_quality=bool(good_quality),
                 csi_trustworthy=not csi_reasons,
                 csi_quality_reason="; ".join(csi_reasons),
+            )
+            self._publish_gmi_channel_state(
+                h_tf_est=best.get("adaptive_htf"),
+                htf_kind=str(best.get("adaptive_htf_kind", "full")),
+                noise_var=float(best.get("noise_var", float("nan"))),
+                sync_metric=float(best.get("sync_metric", 0.0)),
+                csi_trustworthy=not csi_reasons,
+                processing_gap=bool(processing_gap),
             )
 
         self._debug(
@@ -5414,6 +5646,41 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             # status before acquiring _lock can deadlock against a frame that
             # is publishing evidence while it waits for the adaptive lock.
             adaptive_ab = self.get_alpha_beta_adaptation_status()
+            gmi_adaptation = self.get_gmi_adaptation_status()
+            validation = dict(adaptive_ab.get("validation", {}) or {})
+            gmi_evidence = {
+                "objective": "gmi_receiver_dependent"
+                if bool(gmi_adaptation.get("enabled", False)) else "legacy_ser",
+                "theory": {
+                    "receiver_mode": str(gmi_adaptation.get("receiver_mode", self.gmi_receiver_mode)),
+                    "receiver_id": str(gmi_adaptation.get("receiver_id", "")),
+                    "resource_id": str(gmi_adaptation.get("resource_id", "")),
+                    "library_id": str(gmi_adaptation.get("library_id", "")),
+                    "catalogue_cap": int(gmi_adaptation.get("catalogue_cap", 0) or 0),
+                    "library_size": int(gmi_adaptation.get("library_size", 0) or 0),
+                    "active_library_size": int(gmi_adaptation.get("active_library_size", 0) or 0),
+                    "scores": list(gmi_adaptation.get("scores", []) or []),
+                },
+                "selection": {
+                    "state": str(gmi_adaptation.get("state", "disabled")),
+                    "state_epoch": int(gmi_adaptation.get("state_epoch", -1)),
+                    "sequence": int(gmi_adaptation.get("sequence", 0) or 0),
+                    "current_token_id": str(gmi_adaptation.get("current_token_id", "")),
+                    "candidate_token_id": str(gmi_adaptation.get("candidate_token_id", "")),
+                    "gain_lower_nats": float(gmi_adaptation.get("gain_lower_nats", 0.0)),
+                    "threshold_nats": float(gmi_adaptation.get("threshold_nats", 0.0)),
+                    "switch_allowed": bool(gmi_adaptation.get("switch_allowed", False)),
+                    "robustness_profile": str(gmi_adaptation.get("robustness_profile", "")),
+                    "reason": str(gmi_adaptation.get("reason", "")),
+                },
+                "hardware_validation": validation,
+                "legacy_ser": {
+                    "diagnostic_only": True,
+                    "state": str(adaptive_ab.get("state", "disabled")),
+                    "predicted_ser_current": float(adaptive_ab.get("predicted_ser_current", float("nan"))),
+                    "predicted_ser_best": float(adaptive_ab.get("predicted_ser_best", float("nan"))),
+                },
+            }
             return {
                 "frame_ok": bool(self.last_frame_ok),
                 "reason": str(self.last_bad_reason),
@@ -5491,6 +5758,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "rx_probe_last_delta": int(getattr(self, "_rx_probe_last_delta", 0)),
                 "rx_probe_last_vector_size": int(getattr(self, "_rx_probe_last_vector_size", 0)),
                 "rx_probe_generation": int(getattr(self, "_rx_probe_generation", 0)),
+                "rx_acquisition_epoch": int(getattr(self, "_rx_acquisition_epoch", 0)),
                 "rx_probe_stale_count": int(getattr(self, "_rx_probe_stale_count", 0)),
                 # Explicit quality tiers.  ``decode_ok``/``frame_ok`` remain
                 # compatibility aliases, while these fields distinguish CRC,
@@ -5526,6 +5794,17 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
                 "adaptive_alpha_beta_state": str(adaptive_ab.get("state", "disabled")),
                 "adaptive_alpha_beta_ready": bool(adaptive_ab.get("ready", False)),
                 "adaptive_alpha_beta_pending": bool(adaptive_ab.get("pending", False)),
+                "gmi_adaptation": gmi_adaptation,
+                "gmi_evidence": gmi_evidence,
+                "gmi_adaptive_enabled": bool(gmi_adaptation.get("enabled", False)),
+                "gmi_receiver_mode": str(gmi_adaptation.get("receiver_mode", self.gmi_receiver_mode)),
+                "gmi_resource_id": str(gmi_adaptation.get("resource_id", "")),
+                "gmi_library_id": str(gmi_adaptation.get("library_id", "")),
+                "gmi_current_token_id": str(gmi_adaptation.get("current_token_id", "")),
+                "gmi_candidate_token_id": str(gmi_adaptation.get("candidate_token_id", "")),
+                "gmi_gain_lower_nats": float(gmi_adaptation.get("gain_lower_nats", 0.0)),
+                "gmi_threshold_nats": float(gmi_adaptation.get("threshold_nats", 0.0)),
+                "gmi_decision_reason": str(gmi_adaptation.get("reason", "")),
                 "adaptive_recommendation_seq": int(adaptive_ab.get("recommendation_seq", 0)),
                 "adaptive_recommended_alpha": float(adaptive_ab.get("recommended_alpha", float("nan"))),
                 "adaptive_recommended_beta": float(adaptive_ab.get("recommended_beta", float("nan"))),
@@ -5650,6 +5929,17 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "adaptive_alpha_beta_state": str(snap.get("adaptive_alpha_beta_state", "disabled")),
             "adaptive_alpha_beta_ready": bool(snap.get("adaptive_alpha_beta_ready", False)),
             "adaptive_alpha_beta_pending": bool(snap.get("adaptive_alpha_beta_pending", False)),
+            "gmi_adaptation": dict(snap.get("gmi_adaptation", {}) or {}),
+            "gmi_evidence": dict(snap.get("gmi_evidence", {}) or {}),
+            "gmi_adaptive_enabled": bool(snap.get("gmi_adaptive_enabled", False)),
+            "gmi_receiver_mode": str(snap.get("gmi_receiver_mode", "diagonal")),
+            "gmi_resource_id": str(snap.get("gmi_resource_id", "")),
+            "gmi_library_id": str(snap.get("gmi_library_id", "")),
+            "gmi_current_token_id": str(snap.get("gmi_current_token_id", "")),
+            "gmi_candidate_token_id": str(snap.get("gmi_candidate_token_id", "")),
+            "gmi_gain_lower_nats": float(snap.get("gmi_gain_lower_nats", 0.0)),
+            "gmi_threshold_nats": float(snap.get("gmi_threshold_nats", 0.0)),
+            "gmi_decision_reason": str(snap.get("gmi_decision_reason", "")),
             "adaptive_recommendation_seq": int(snap.get("adaptive_recommendation_seq", 0)),
             "adaptive_recommended_alpha": float(snap.get("adaptive_recommended_alpha", float("nan"))),
             "adaptive_recommended_beta": float(snap.get("adaptive_recommended_beta", float("nan"))),
@@ -5707,6 +5997,7 @@ class _LegacyFDIDMHardwareTest(FECMixin, FDIDMAdaptiveMixin):
             "rx_processing_gap_count": int(snap.get("rx_processing_gap_count", 0)),
             "rx_last_processing_gap_samples": int(snap.get("rx_last_processing_gap_samples", 0)),
             "rx_processing_gap_reason": str(snap.get("rx_processing_gap_reason", "")),
+            "rx_acquisition_epoch": int(snap.get("rx_acquisition_epoch", 0)),
             "rx_input_rms": float(snap.get("rx_input_rms", float("nan"))),
             "rx_input_peak": float(snap.get("rx_input_peak", float("nan"))),
             "constellation_quality": str(snap.get("constellation_quality", "unknown")),

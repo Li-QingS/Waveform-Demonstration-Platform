@@ -1,10 +1,12 @@
 import numpy as np
 import threading
 import time
+from types import SimpleNamespace
 
 from scripts.validate_alpha_beta_adaptation import AdaptiveKernel
 from waveform_sim.hardware.evidence import TxPowerContract, TxPowerMetrics
 from waveform_sim.hardware.fdidm_adaptive import FDIDMAdaptiveMixin
+from waveform_sim.gmi.model import ExperimentResources
 
 
 def _snapshot(htf, alpha=1.0, beta=1.0):
@@ -225,6 +227,97 @@ def _settle(harness):
 def _collect(harness, count, errors, evm=10.0):
     for _ in range(count):
         _validation_sample(harness, errors, evm=evm)
+
+
+class _DummyGMIController:
+    def __init__(self):
+        self.resources = ExperimentResources(256, catalogue_cap=16, grid_rows=16, grid_cols=16)
+        self.validation = False
+        self.current = None
+
+    def set_validation_in_progress(self, active):
+        self.validation = bool(active)
+
+    def set_current_waveform(self, alpha, beta):
+        self.current = (float(alpha), float(beta))
+
+
+def _gmi_sample(harness, errors=0, evm=10.0, epoch=1, **overrides):
+    payload = {
+        "ser_errors": errors,
+        "ser_symbols": 200,
+        "data_aided_evm_percent": evm,
+        "decision_directed_evm_percent": evm,
+        "raw_bit_ber": errors / 200.0,
+        "fec_bit_ber": 0.0,
+        "decode_ok": True,
+        "crc_ok": True,
+        "sync_valid": True,
+        "sync_metric": 0.95,
+        "effective_cfo_hz": 10.0,
+        "residual_cfo_hz": 0.2,
+        "pilot_fit_nmse": 0.02,
+        "pilot_fitted_power": 0.1,
+        "rx_input_rms": 0.2,
+        "rx_input_peak": 0.5,
+        "probe_continuity": True,
+        "acquisition_epoch": epoch,
+        "context_id": "ctx",
+        "resource_id": harness._gmi_controller.resources.resource_id,
+        "overflow": False,
+        "tx_power_contract_id": harness._tx_power_metrics.contract_id,
+        "tx_cycle_rms": harness._tx_power_metrics.cycle_rms,
+        "context_key": harness._alpha_beta_adaptation_context_key(),
+        "gmi_nats_per_sample": 0.1,
+    }
+    payload.update(overrides)
+    harness._record_alpha_beta_validation_sample_locked(payload)
+
+
+def _gmi_settle(harness, epoch):
+    for _ in range(3):
+        _gmi_sample(harness, epoch=epoch)
+
+
+def test_gmi_abba_state_machine_uses_a_b_b_a_without_reapplying_b():
+    harness = ValidationHarness()
+    harness.gmi_adaptive_enable = True
+    harness.gmi_robustness_profile = "fast"
+    harness._gmi_controller = _DummyGMIController()
+    result = harness.apply_alpha_beta_candidate(
+        0.75,
+        0.8,
+        gmi_gain_lower_nats=0.01,
+        gmi_threshold_nats=0.001,
+        current_token_id="a",
+        candidate_token_id="b",
+    )
+    assert result["validation_scheme"] == "abba_gmi"
+    assert harness._adaptive_ab_validation["state"] == "a1_settling"
+
+    _gmi_settle(harness, 1)
+    for _ in range(8):
+        _gmi_sample(harness, errors=2, evm=10.0, epoch=1)
+    assert harness._adaptive_ab_validation["state"] == "b1_settling"
+
+    _gmi_settle(harness, 2)
+    for _ in range(8):
+        _gmi_sample(harness, errors=1, evm=9.0, epoch=2)
+    assert harness._adaptive_ab_validation["state"] == "b2_collecting"
+    candidate_apply_count = sum(1 for alpha, beta, forced, contract in harness.commits if (alpha, beta) == (0.75, 0.8) and forced is not None)
+    assert candidate_apply_count == 1
+
+    for _ in range(8):
+        _gmi_sample(harness, errors=1, evm=9.0, epoch=2)
+    assert harness._adaptive_ab_validation["state"] == "a2_settling"
+    _gmi_settle(harness, 3)
+    for _ in range(8):
+        _gmi_sample(harness, errors=2, evm=10.0, epoch=3)
+
+    assert harness._adaptive_ab_validation["state"] == "improved"
+    assert harness._adaptive_ab_validation["abba_decision"]["gmi_confirmed"] is True
+    assert (harness.alpha, harness.beta) == (0.75, 0.8)
+    assert harness._gmi_controller.validation is False
 
 
 def test_validation_state_collects_common_power_baseline_after_settling():

@@ -107,7 +107,12 @@ class EvidenceWindow(_Serializable):
     power_rms_values: list[float] = field(default_factory=list)
     pilot_fit_nmse_values: list[float] = field(default_factory=list)
     pilot_fitted_power_values: list[float] = field(default_factory=list)
+    gmi_nats_values: list[float] = field(default_factory=list)
     contract_id: str = ""
+    resource_id: str = ""
+    context_id: str = ""
+    acquisition_epoch: Optional[int] = None
+    continuity: bool = True
     context_key: Any = None
     dropped_overflow: int = 0
     dropped_sync: int = 0
@@ -126,6 +131,7 @@ class EvidenceWindow(_Serializable):
         power_rms: Any = None,
         pilot_fit_nmse: Any = None,
         pilot_fitted_power: Any = None,
+        gmi_nats_per_sample: Any = None,
     ) -> None:
         self.valid_frames += 1
         self.ser_errors += max(0, int(ser_errors))
@@ -138,6 +144,7 @@ class EvidenceWindow(_Serializable):
             (self.power_rms_values, power_rms),
             (self.pilot_fit_nmse_values, pilot_fit_nmse),
             (self.pilot_fitted_power_values, pilot_fitted_power),
+            (self.gmi_nats_values, gmi_nats_per_sample),
         ):
             finite = _finite_or_none(value)
             if finite is not None:
@@ -205,6 +212,80 @@ class ValidationDecision(_Serializable):
     baseline_ser_interval: Tuple[float, float] = (float("nan"), float("nan"))
     candidate_ser_interval: Tuple[float, float] = (float("nan"), float("nan"))
     evm_delta_pp: float = float("nan")
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class AcquisitionFingerprint(_Serializable):
+    """Acquisition state that must settle before evidence is admitted."""
+
+    effective_cfo_hz: float
+    sync_metric: float
+    residual_cfo_hz: float
+    pilot_nmse: float
+    pilot_fitted_power: float
+    rx_rms: float
+    rx_peak: float
+    continuity: bool
+    overflow: bool
+    acquisition_epoch: int
+    context_id: str = ""
+    resource_id: str = ""
+    contract_id: str = ""
+
+    def validity_reason(self) -> str:
+        values = (
+            self.effective_cfo_hz,
+            self.sync_metric,
+            self.residual_cfo_hz,
+            self.pilot_nmse,
+            self.pilot_fitted_power,
+            self.rx_rms,
+            self.rx_peak,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            return "non_finite_fingerprint"
+        if self.overflow:
+            return "overflow"
+        if not self.continuity:
+            return "probe_gap"
+        if self.sync_metric <= 0.0 or self.pilot_fitted_power <= 0.0 or self.rx_rms <= 0.0:
+            return "untrusted_fingerprint"
+        if self.rx_peak < self.rx_rms:
+            return "invalid_rx_peak"
+        return ""
+
+
+@dataclass(frozen=True)
+class FingerprintStability(_Serializable):
+    stable: bool
+    reason: str
+    sample_count: int
+    acquisition_epoch: Optional[int]
+
+
+@dataclass(frozen=True)
+class ABBAEvidence(_Serializable):
+    a1: EvidenceWindow
+    b1: EvidenceWindow
+    b2: EvidenceWindow
+    a2: EvidenceWindow
+    baseline: EvidenceWindow
+    candidate: EvidenceWindow
+    comparable: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class ABBAValidationDecision(_Serializable):
+    outcome: str
+    gmi_confirmed: bool
+    hardware_non_regressing: bool
+    gain_lower_nats: float
+    threshold_nats: float
+    evm_delta_pp: float = float("nan")
+    ser_delta: float = float("nan")
+    crc_delta: float = float("nan")
     reason: str = ""
 
 
@@ -685,8 +766,230 @@ def classify_validation(
     return decision("inconclusive", reason)
 
 
+_FINGERPRINT_PROFILES: Dict[str, Dict[str, float]] = {
+    "fast": {
+        "min_samples": 3,
+        "cfo_span_hz": 50.0,
+        "residual_cfo_span_hz": 250.0,
+        "sync_relative_span": 0.40,
+        "pilot_nmse_relative_span": 4.00,
+        "pilot_power_span_db": 3.0,
+        "rx_rms_span_db": 4.0,
+    },
+    "standard": {
+        "min_samples": 4,
+        # On a same-B210 TX/RX link the physical CFO is close to zero, while
+        # frame-wise estimators jitter by several hertz (and the residual
+        # estimate by tens of hertz).  These bounds reject a genuine
+        # reacquisition jump without demanding impossible estimator precision.
+        "cfo_span_hz": 20.0,
+        "residual_cfo_span_hz": 100.0,
+        "sync_relative_span": 0.25,
+        "pilot_nmse_relative_span": 3.00,
+        "pilot_power_span_db": 1.5,
+        "rx_rms_span_db": 2.0,
+    },
+    "conservative": {
+        "min_samples": 5,
+        "cfo_span_hz": 10.0,
+        "residual_cfo_span_hz": 75.0,
+        "sync_relative_span": 0.15,
+        "pilot_nmse_relative_span": 1.50,
+        "pilot_power_span_db": 1.0,
+        "rx_rms_span_db": 1.5,
+    },
+}
+
+
+def _positive_span_db(values: Sequence[float]) -> float:
+    array = _finite_array(values)
+    if array.size == 0 or np.any(array <= 0.0):
+        return float("inf")
+    return float(20.0 * math.log10(float(np.max(array)) / float(np.min(array))))
+
+
+def fingerprints_stable(
+    samples: Sequence[AcquisitionFingerprint],
+    profile: str = "standard",
+) -> FingerprintStability:
+    """Require a consecutive, finite acquisition run from one epoch.
+
+    Only ``effective_cfo_hz`` is used.  A raw/coarse CFO alias is deliberately
+    absent from :class:`AcquisitionFingerprint`.
+    """
+    try:
+        limits = _FINGERPRINT_PROFILES[str(profile).lower()]
+    except KeyError as exc:
+        raise ValueError(f"unknown fingerprint profile: {profile}") from exc
+    min_samples = int(limits["min_samples"])
+    if len(samples) < min_samples:
+        return FingerprintStability(False, "insufficient_stable_fingerprints", len(samples), None)
+    # Settlement means a *recent consecutive run* is stable.  Including up to
+    # eight older samples made one re-anchor outlier poison every later check
+    # even after the receiver had demonstrably recovered.
+    samples = tuple(samples[-min_samples:])
+    epochs = {int(sample.acquisition_epoch) for sample in samples}
+    if len(epochs) != 1:
+        return FingerprintStability(False, "acquisition_epoch_changed", len(samples), None)
+    epoch = next(iter(epochs))
+    for sample in samples:
+        reason = sample.validity_reason()
+        if reason:
+            return FingerprintStability(False, reason, len(samples), epoch)
+    for field_name in ("context_id", "resource_id", "contract_id"):
+        values = {str(getattr(sample, field_name)) for sample in samples if str(getattr(sample, field_name))}
+        if len(values) > 1:
+            return FingerprintStability(False, f"{field_name}_changed", len(samples), epoch)
+    effective_cfo = np.asarray([sample.effective_cfo_hz for sample in samples], dtype=np.float64)
+    residual_cfo = np.asarray([sample.residual_cfo_hz for sample in samples], dtype=np.float64)
+    if float(np.ptp(effective_cfo)) > limits["cfo_span_hz"]:
+        return FingerprintStability(False, "effective_cfo_not_stable", len(samples), epoch)
+    if float(np.ptp(residual_cfo)) > limits["residual_cfo_span_hz"]:
+        return FingerprintStability(False, "residual_cfo_not_stable", len(samples), epoch)
+    sync = np.asarray([sample.sync_metric for sample in samples], dtype=np.float64)
+    if float(np.ptp(sync)) > limits["sync_relative_span"] * max(float(np.mean(np.abs(sync))), 1e-12):
+        return FingerprintStability(False, "sync_metric_not_stable", len(samples), epoch)
+    pilot_nmse = np.asarray([sample.pilot_nmse for sample in samples], dtype=np.float64)
+    if float(np.ptp(pilot_nmse)) > limits["pilot_nmse_relative_span"] * max(float(np.mean(np.abs(pilot_nmse))), 1e-3):
+        return FingerprintStability(False, "pilot_nmse_not_stable", len(samples), epoch)
+    if _positive_span_db([sample.pilot_fitted_power for sample in samples]) > limits["pilot_power_span_db"]:
+        return FingerprintStability(False, "pilot_power_not_stable", len(samples), epoch)
+    if _positive_span_db([sample.rx_rms for sample in samples]) > limits["rx_rms_span_db"]:
+        return FingerprintStability(False, "rx_rms_not_stable", len(samples), epoch)
+    return FingerprintStability(True, "stable", len(samples), epoch)
+
+
+def _merge_evidence(first: EvidenceWindow, second: EvidenceWindow) -> EvidenceWindow:
+    merged = EvidenceWindow(
+        valid_frames=int(first.valid_frames) + int(second.valid_frames),
+        ser_errors=int(first.ser_errors) + int(second.ser_errors),
+        ser_symbols=int(first.ser_symbols) + int(second.ser_symbols),
+        data_aided_evm_values=list(first.data_aided_evm_values) + list(second.data_aided_evm_values),
+        crc_ok_frames=int(first.crc_ok_frames) + int(second.crc_ok_frames),
+        raw_ber_values=list(first.raw_ber_values) + list(second.raw_ber_values),
+        fec_ber_values=list(first.fec_ber_values) + list(second.fec_ber_values),
+        power_rms_values=list(first.power_rms_values) + list(second.power_rms_values),
+        pilot_fit_nmse_values=list(first.pilot_fit_nmse_values) + list(second.pilot_fit_nmse_values),
+        pilot_fitted_power_values=list(first.pilot_fitted_power_values) + list(second.pilot_fitted_power_values),
+        gmi_nats_values=list(first.gmi_nats_values) + list(second.gmi_nats_values),
+        contract_id=first.contract_id,
+        resource_id=first.resource_id,
+        context_id=first.context_id,
+        acquisition_epoch=None,
+        continuity=bool(first.continuity and second.continuity),
+        context_key=first.context_key,
+        dropped_overflow=int(first.dropped_overflow) + int(second.dropped_overflow),
+        dropped_sync=int(first.dropped_sync) + int(second.dropped_sync),
+        dropped_context=int(first.dropped_context) + int(second.dropped_context),
+        dropped_power=int(first.dropped_power) + int(second.dropped_power),
+    )
+    return merged
+
+
+def combine_abba_windows(
+    a1: EvidenceWindow,
+    b1: EvidenceWindow,
+    b2: EvidenceWindow,
+    a2: EvidenceWindow,
+) -> ABBAEvidence:
+    blocks = (a1, b1, b2, a2)
+    counts = {int(block.valid_frames) for block in blocks}
+    reasons: list[str] = []
+    if len(counts) != 1 or not counts or next(iter(counts)) <= 0:
+        reasons.append("ABBA blocks must have equal positive frame counts")
+    if any(not block.continuity or block.dropped_overflow > 0 for block in blocks):
+        reasons.append("ABBA contains overflow or probe gap")
+    for field_name in ("contract_id", "resource_id", "context_id"):
+        values = {str(getattr(block, field_name)) for block in blocks}
+        if "" in values or len(values) != 1:
+            reasons.append(f"ABBA {field_name} is missing or changed")
+    if any(block.context_key != a1.context_key for block in blocks[1:]):
+        reasons.append("ABBA channel context changed")
+    baseline = _merge_evidence(a1, a2)
+    candidate = _merge_evidence(b1, b2)
+    comparable, power_reason, _ = assess_power_comparability(
+        baseline.contract_id,
+        _mean(baseline.power_rms_values),
+        candidate.contract_id,
+        _mean(candidate.power_rms_values),
+    )
+    if not comparable:
+        reasons.append(power_reason)
+    return ABBAEvidence(a1, b1, b2, a2, baseline, candidate, not reasons, "; ".join(dict.fromkeys(reasons)))
+
+
+def classify_abba_validation(
+    evidence: ABBAEvidence,
+    *,
+    gain_lower_nats: float,
+    threshold_nats: float,
+    evm_regression_tolerance_pp: float = 2.0,
+    crc_regression_tolerance: float = 0.05,
+    pilot_symmetry_tolerance_db: float = 3.0,
+) -> ABBAValidationDecision:
+    gain = float(gain_lower_nats)
+    threshold = float(threshold_nats)
+    baseline = evidence.baseline
+    candidate = evidence.candidate
+    baseline_evm = baseline.data_aided_evm_mean
+    candidate_evm = candidate.data_aided_evm_mean
+    evm_delta = candidate_evm - baseline_evm if math.isfinite(baseline_evm) and math.isfinite(candidate_evm) else float("nan")
+    ser_delta = candidate.ser - baseline.ser if math.isfinite(candidate.ser) and math.isfinite(baseline.ser) else float("nan")
+    baseline_crc = baseline.crc_success_ratio
+    candidate_crc = candidate.crc_success_ratio
+    crc_delta = candidate_crc - baseline_crc if math.isfinite(candidate_crc) and math.isfinite(baseline_crc) else float("nan")
+
+    def result(outcome: str, gmi: bool, hardware: bool, reason: str) -> ABBAValidationDecision:
+        return ABBAValidationDecision(outcome, gmi, hardware, gain, threshold, evm_delta, ser_delta, crc_delta, reason)
+
+    if not evidence.comparable:
+        return result("inconclusive", False, False, evidence.reason)
+    if not (math.isfinite(gain) and math.isfinite(threshold)):
+        return result("inconclusive", False, False, "non-finite GMI decision")
+    if gain <= threshold:
+        return result("inconclusive", False, True, "GMI improvement lower bound does not exceed threshold")
+
+    # Symmetric A1/A2 and B1/B2 averaging cancels a linear time trend.  A
+    # large same-waveform endpoint change, or remaining A-vs-B pilot-power
+    # separation, is evidence that drift is too nonlinear/large to attribute.
+    for label, first, second in (
+        ("A1/A2", evidence.a1, evidence.a2),
+        ("B1/B2", evidence.b1, evidence.b2),
+    ):
+        first_power = _mean(first.pilot_fitted_power_values)
+        second_power = _mean(second.pilot_fitted_power_values)
+        if first_power > 0.0 and second_power > 0.0:
+            endpoint_shift = abs(10.0 * math.log10(second_power / first_power))
+            if endpoint_shift > float(pilot_symmetry_tolerance_db):
+                return result(
+                    "inconclusive",
+                    True,
+                    False,
+                    f"{label} pilot power changed by {endpoint_shift:.2f} dB",
+                )
+    a_power = _mean(baseline.pilot_fitted_power_values)
+    b_power = _mean(candidate.pilot_fitted_power_values)
+    if a_power > 0.0 and b_power > 0.0:
+        shift = abs(10.0 * math.log10(b_power / a_power))
+        if shift > float(pilot_symmetry_tolerance_db):
+            return result("inconclusive", True, False, f"nonlinear RF drift left {shift:.2f} dB ABBA pilot asymmetry")
+    if math.isfinite(evm_delta) and evm_delta > float(evm_regression_tolerance_pp):
+        return result("regressed", True, False, f"EVM regressed by {evm_delta:.3f} percentage points")
+    if math.isfinite(crc_delta) and crc_delta < -float(crc_regression_tolerance):
+        return result("regressed", True, False, "CRC success ratio regressed")
+    b_low, b_high = baseline.wilson_interval
+    c_low, c_high = candidate.wilson_interval
+    if math.isfinite(b_high) and math.isfinite(c_low) and c_low > b_high:
+        return result("regressed", True, False, "candidate SER is significantly worse")
+    return result("improved", True, True, "GMI gain confirmed and hardware metrics did not regress")
+
+
 __all__ = [
+    "ABBAEvidence",
+    "ABBAValidationDecision",
+    "AcquisitionFingerprint",
     "EvidenceWindow",
+    "FingerprintStability",
     "KnownSymbolMetrics",
     "PilotFitMetrics",
     "TxPowerContract",
@@ -695,8 +998,11 @@ __all__ = [
     "analyze_unscaled_power",
     "assess_power_comparability",
     "classify_validation",
+    "classify_abba_validation",
+    "combine_abba_windows",
     "create_power_contract",
     "frame_structure_metrics",
+    "fingerprints_stable",
     "measure_known_symbols",
     "measure_pilot_fit",
     "measured_ser_gain_db",

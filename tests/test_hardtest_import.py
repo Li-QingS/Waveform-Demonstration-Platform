@@ -124,6 +124,40 @@ def test_probe_reanchor_clears_the_previous_epoch_dedupe_marker():
     assert obj._rx_probe_reanchor_pending is False
 
 
+def test_fresh_probe_block_remains_contiguous_after_slow_host_poll(monkeypatch):
+    """Host scheduling latency is not evidence of a UHD sample discontinuity."""
+    mod = importlib.import_module("waveform_sim.hardware.fdidm_hardtest")
+
+    class Probe:
+        value = 1.0
+
+        def level(self):
+            return np.full(128, self.value, dtype=np.complex64)
+
+    probe = Probe()
+    obj = object.__new__(mod._LegacyFDIDMHardwareTest)
+    obj._rx_probe = probe
+    obj._rx_probe_mode = "probe_signal_vc"
+    obj._rx_probe_last_fp = None
+    obj._rx_probe_reanchor_pending = False
+    obj._rx_probe_start_t = 10.0
+    obj._rx_probe_last_update_wall = 10.0
+    obj._rx_probe_last_vector_size = 128
+    obj._rx_probe_generation = 0
+    obj._rx_acquisition_epoch = 3
+    obj._rx_samples_seen = 128
+    obj.sample_rate = 500_000.0
+    obj._debug = lambda *_args: None
+    monkeypatch.setattr(mod.time, "time", lambda: 12.0)
+
+    _vec, _absolute, _available, newly = obj._read_rx_probe_window(128)
+
+    assert newly > 4 * 128
+    assert obj._rx_probe_continuity == "contiguous"
+    assert "fresh contiguous probe block" in obj._rx_probe_continuity_reason
+    assert obj._rx_acquisition_epoch == 3
+
+
 def test_refined_preamble_gate_rejects_noise_like_scores():
     mod = importlib.import_module("waveform_sim.hardware.fdidm_hardtest")
     obj = object.__new__(mod._LegacyFDIDMHardwareTest)

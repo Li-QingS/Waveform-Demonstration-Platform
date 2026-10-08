@@ -8,13 +8,245 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from waveform_sim.gmi.geometry import allocate_axis_counts, anisotropic_periodic_grid
+from waveform_sim.gmi.model import (
+    ChannelState,
+    ExperimentResources,
+    ReceiverSpec,
+    SelectionDecision,
+    TransceiverLibrary,
+    WaveformToken,
+)
+from waveform_sim.gmi.selector import RobustnessProfile, SingleFlightSelector
+
 from .evidence import (
+    AcquisitionFingerprint,
     EvidenceWindow,
     TxPowerContract,
     ValidationDecision,
     assess_power_comparability,
+    classify_abba_validation,
     classify_validation,
+    combine_abba_windows,
+    fingerprints_stable,
 )
+
+
+class GMIAdaptiveController:
+    """Latest-state-only GMI selection worker with no hardware side effects."""
+
+    def __init__(
+        self,
+        resources: ExperimentResources,
+        receiver: ReceiverSpec,
+        *,
+        current_alpha: float,
+        current_beta: float,
+        robustness_profile: str = "standard",
+        channel_estimator: str = "diag_tf",
+        equalizer: str = "receiver_projection",
+    ) -> None:
+        self.resources = resources
+        self.receiver = receiver
+        self.robustness_profile = RobustnessProfile.named(robustness_profile)
+        self.channel_estimator = str(channel_estimator)
+        self.equalizer = str(equalizer)
+        self.library = self._default_library(current_alpha, current_beta)
+        self.current_token_id = self._nearest_token(current_alpha, current_beta).token_id
+        self._lock = threading.RLock()
+        self._event = threading.Event()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._latest_state: Optional[ChannelState] = None
+        self._last_state: Optional[ChannelState] = None
+        self._state_generation = 0
+        self._selector = SingleFlightSelector()
+        self._decision: Optional[SelectionDecision] = None
+        self._sequence = 0
+        self._state = "idle"
+        self._last_error = ""
+        self._validation_in_progress = False
+
+    @staticmethod
+    def _distance(alpha: float, beta: float, token: WaveformToken) -> float:
+        da = min(abs((float(alpha) % 2.0) - token.alpha), 2.0 - abs((float(alpha) % 2.0) - token.alpha))
+        db = min(abs((float(beta) % 2.0) - token.beta), 2.0 - abs((float(beta) % 2.0) - token.beta))
+        return math.hypot(da, db)
+
+    def _nearest_token(self, alpha: float, beta: float) -> WaveformToken:
+        return min(self.library.tokens, key=lambda token: (self._distance(alpha, beta, token), token.token_id))
+
+    def _default_library(self, current_alpha: float, current_beta: float) -> TransceiverLibrary:
+        cap = int(self.resources.catalogue_cap)
+        # The paper example has q_beta/q_alpha around 3.5.  This fixed offline
+        # prior only lays out candidates; online scores still use measured CSI.
+        counts = allocate_axis_counts(np.diag([1.0, 3.5]), cap)
+        coordinates = list(anisotropic_periodic_grid(*counts))
+        current = (float(current_alpha) % 2.0, float(current_beta) % 2.0)
+        ordered = [current] + [pair for pair in coordinates if self._distance(current[0], current[1], WaveformToken.create(pair[0], pair[1], self.resources, self.receiver, channel_estimator=self.channel_estimator, equalizer=self.equalizer)) > 1e-12]
+        tokens = tuple(
+            WaveformToken.create(
+                alpha,
+                beta,
+                self.resources,
+                self.receiver,
+                channel_estimator=self.channel_estimator,
+                equalizer=self.equalizer,
+                implementation_mode="hardware_candidate",
+            )
+            for alpha, beta in ordered[:cap]
+        )
+        return TransceiverLibrary(
+            self.resources,
+            self.receiver,
+            tokens,
+            created_from="receiver_curvature_prior",
+            construction={"axis_counts": list(counts), "online_metric": "measured_csi_gmi"},
+        )
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._worker, name=f"fdidm-gmi-{id(self):x}", daemon=True)
+            self._thread.start()
+            self._state = "waiting_channel"
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        self._event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(0.0, float(timeout)))
+        with self._lock:
+            self._thread = None
+            self._latest_state = None
+            self._last_state = None
+            self._state_generation += 1
+            self._state = "stopped"
+
+    def publish(self, state: ChannelState) -> None:
+        with self._lock:
+            self._latest_state = state
+            self._last_state = state
+            self._state_generation += 1
+            self._state = "queued"
+        self._event.set()
+
+    def request_evaluation(self) -> bool:
+        with self._lock:
+            if self._last_state is None:
+                self._state = "waiting_channel"
+                return False
+            self._latest_state = self._last_state
+            self._state_generation += 1
+            self._state = "queued"
+        self._event.set()
+        return True
+
+    def set_current_waveform(self, alpha: float, beta: float) -> None:
+        with self._lock:
+            self.current_token_id = self._nearest_token(alpha, beta).token_id
+            self._sequence += 1
+            self._state_generation += 1
+            self._decision = None
+            self._state = "waiting_channel"
+
+    def set_validation_in_progress(self, active: bool) -> None:
+        with self._lock:
+            self._validation_in_progress = bool(active)
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            self._event.wait(0.25)
+            self._event.clear()
+            if self._stop.is_set():
+                break
+            with self._lock:
+                state = self._latest_state
+                if state is None:
+                    continue
+                self._latest_state = None
+                current = self.current_token_id
+                validation = self._validation_in_progress
+                generation = self._state_generation
+                self._sequence += 1
+                sequence = self._sequence
+                self._state = "scoring"
+            try:
+                decision = self._selector.select(
+                    state,
+                    self.library,
+                    current,
+                    self.robustness_profile,
+                    sequence=sequence,
+                    validation_in_progress=validation,
+                )
+                with self._lock:
+                    if self._stop.is_set():
+                        return
+                    if generation != self._state_generation or current != self.current_token_id:
+                        # A newer CSI snapshot or a manual/validated waveform
+                        # change supersedes this result.  The single latest
+                        # slot will be consumed on the next worker iteration.
+                        self._state = "queued" if self._latest_state is not None else "waiting_channel"
+                        continue
+                    self._decision = decision
+                    self._state = "candidate_ready" if decision.switch_allowed else "tracking"
+                    self._last_error = ""
+            except Exception as exc:
+                with self._lock:
+                    if self._stop.is_set():
+                        return
+                    if generation != self._state_generation:
+                        self._state = "queued" if self._latest_state is not None else "waiting_channel"
+                        continue
+                    self._state = "error"
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            decision = self._decision
+            token_by_id = {token.token_id: token for token in self.library.tokens}
+            candidate = token_by_id.get(decision.candidate_token_id) if decision is not None else None
+            scores = [] if decision is None else [
+                {
+                    "token_id": score.token_id,
+                    "valid": score.valid,
+                    "reason": score.reason,
+                    "gmi_nats_per_sample": score.gmi_nats_per_sample,
+                    "lower_bound_nats": score.lower_bound_nats,
+                    "upper_bound_nats": score.upper_bound_nats,
+                    "uncertainty_nats": score.uncertainty_nats,
+                    "implementation_penalty_nats": score.implementation_penalty_nats,
+                    "switch_cost_nats": score.switch_cost_nats,
+                }
+                for score in decision.scores
+            ]
+            return {
+                "enabled": True,
+                "state": self._state,
+                "receiver_mode": self.receiver.mode,
+                "receiver_id": self.receiver.receiver_id,
+                "resource_id": self.resources.resource_id,
+                "library_id": self.library.library_id,
+                "catalogue_cap": self.resources.catalogue_cap,
+                "library_size": len(self.library.tokens),
+                "robustness_profile": self.robustness_profile.name,
+                "current_token_id": self.current_token_id,
+                "candidate_token_id": "" if decision is None else decision.candidate_token_id,
+                "candidate_alpha": float("nan") if candidate is None else candidate.alpha,
+                "candidate_beta": float("nan") if candidate is None else candidate.beta,
+                "gain_lower_nats": 0.0 if decision is None else decision.gain_lower_nats,
+                "threshold_nats": self.robustness_profile.minimum_gain_nats if decision is None else decision.threshold_nats,
+                "switch_allowed": False if decision is None else decision.switch_allowed,
+                "reason": "waiting_for_csi" if decision is None else decision.reason,
+                "state_epoch": -1 if decision is None else decision.state_epoch,
+                "sequence": self._sequence,
+                "scores": scores,
+                "last_error": self._last_error,
+            }
 
 
 class FDIDMAdaptiveMixin:
@@ -121,7 +353,15 @@ class FDIDMAdaptiveMixin:
 
     def apply_alpha_beta_candidate(self, alpha: float, beta: float,
                                    predicted_improvement_db: float = float("nan"),
-                                   recommendation_seq: int = 0) -> Dict[str, Any]:
+                                   recommendation_seq: int = 0,
+                                   gmi_gain_lower_nats: float = float("nan"),
+                                   gmi_threshold_nats: float = float("nan"),
+                                   current_token_id: str = "",
+                                   candidate_token_id: str = "",
+                                   gmi_receiver_mode: str = "",
+                                   gmi_receiver_id: str = "",
+                                   gmi_resource_id: str = "",
+                                   gmi_library_id: str = "") -> Dict[str, Any]:
         """Start a power-comparable, multi-frame real-link validation."""
         # A validation owns the live waveform until it reaches a terminal
         # outcome.  Previously every new optimizer recommendation replaced
@@ -157,8 +397,19 @@ class FDIDMAdaptiveMixin:
             return self._validation_public_state(self._adaptive_ab_validation)
 
         context_key = self._alpha_beta_adaptation_context_key()
-        baseline_window = EvidenceWindow(contract_id=contract.contract_id, context_key=context_key)
-        candidate_window = EvidenceWindow(contract_id=contract.contract_id, context_key=context_key)
+        gmi_mode = bool(getattr(self, "gmi_adaptive_enable", False)) and math.isfinite(float(gmi_gain_lower_nats))
+        resource_id = ""
+        if gmi_mode and getattr(self, "_gmi_controller", None) is not None:
+            resource_id = self._gmi_controller.resources.resource_id
+        window_kwargs = {
+            "contract_id": contract.contract_id,
+            "resource_id": resource_id,
+            "context_id": repr(context_key),
+            "context_key": context_key,
+        }
+        baseline_window = EvidenceWindow(**window_kwargs)
+        candidate_window = EvidenceWindow(**window_kwargs)
+        abba_windows = {name: EvidenceWindow(**window_kwargs) for name in ("a1", "b1", "b2", "a2")}
         started_wall = time.monotonic()
         with self._adaptive_ab_lock:
             recommendation = getattr(self, "_adaptive_ab_recommendation", None)
@@ -174,6 +425,15 @@ class FDIDMAdaptiveMixin:
                 "candidate_beta": candidate_beta,
                 "predicted_improvement_db": float(predicted_improvement_db),
                 "recommendation_seq": int(recommendation_seq),
+                "validation_scheme": "abba_gmi" if gmi_mode else "ab_legacy",
+                "gmi_gain_lower_nats": float(gmi_gain_lower_nats) if math.isfinite(float(gmi_gain_lower_nats)) else 0.0,
+                "gmi_threshold_nats": float(gmi_threshold_nats) if math.isfinite(float(gmi_threshold_nats)) else 0.0,
+                "current_token_id": str(current_token_id),
+                "candidate_token_id": str(candidate_token_id),
+                "receiver_mode": str(gmi_receiver_mode),
+                "receiver_id": str(gmi_receiver_id),
+                "resource_id": str(gmi_resource_id or resource_id),
+                "library_id": str(gmi_library_id),
                 "start_frame": int(getattr(self, "_frames_processed", 0)),
                 "started_wall": started_wall,
                 "phase_started_wall": started_wall,
@@ -201,6 +461,12 @@ class FDIDMAdaptiveMixin:
                 "context_key": context_key,
                 "baseline_window": baseline_window,
                 "candidate_window": candidate_window,
+                "a1_window": abba_windows["a1"],
+                "b1_window": abba_windows["b1"],
+                "b2_window": abba_windows["b2"],
+                "a2_window": abba_windows["a2"],
+                "abba_block_frames": 8,
+                "acquisition_fingerprints": [],
                 "apply_generation": 0,
                 # The equal-power contract applies only to the evidence
                 # windows.  These fields make the handoff back to the normal
@@ -223,14 +489,43 @@ class FDIDMAdaptiveMixin:
             decision = ValidationDecision("inconclusive", reason=contract.reason or "invalid power contract")
             self._finish_alpha_beta_validation(decision)
         else:
-            self._queue_validation_waveform("baseline")
+            self._queue_validation_waveform("a1" if gmi_mode else "baseline")
         return self._validation_public_state(self._adaptive_ab_validation)
+
+    def apply_gmi_candidate(self) -> Dict[str, Any]:
+        controller = getattr(self, "_gmi_controller", None)
+        if controller is None or not bool(getattr(self, "gmi_adaptive_enable", False)):
+            return {"state": "disabled", "outcome": "", "result_reason": "GMI adaptation is disabled"}
+        status = controller.status()
+        if not bool(status.get("switch_allowed", False)):
+            return {
+                "state": str(status.get("state", "tracking")),
+                "outcome": "",
+                "result_reason": str(status.get("reason", "no robust GMI candidate")),
+            }
+        controller.set_validation_in_progress(True)
+        return self.apply_alpha_beta_candidate(
+            float(status["candidate_alpha"]),
+            float(status["candidate_beta"]),
+            recommendation_seq=int(status.get("sequence", 0)),
+            gmi_gain_lower_nats=float(status.get("gain_lower_nats", 0.0)),
+            gmi_threshold_nats=float(status.get("threshold_nats", 0.0)),
+            current_token_id=str(status.get("current_token_id", "")),
+            candidate_token_id=str(status.get("candidate_token_id", "")),
+            gmi_receiver_mode=str(status.get("receiver_mode", "")),
+            gmi_receiver_id=str(status.get("receiver_id", "")),
+            gmi_resource_id=str(status.get("resource_id", "")),
+            gmi_library_id=str(status.get("library_id", "")),
+        )
 
     @staticmethod
     def _validation_active_state(state: str) -> bool:
         return str(state) in {
             "prepare_contract", "baseline_applying", "baseline_settling", "baseline_collecting",
             "candidate_applying", "candidate_settling", "candidate_collecting",
+            "a1_applying", "a1_settling", "a1_collecting",
+            "b1_applying", "b1_settling", "b1_collecting", "b2_collecting",
+            "a2_applying", "a2_settling", "a2_collecting",
             # A successful A/B window is not fully committed until the
             # candidate has been rebuilt at its normal (non-comparison) power.
             # Keep this single-flight state visible so a fresh optimizer result
@@ -241,16 +536,22 @@ class FDIDMAdaptiveMixin:
 
     @staticmethod
     def _validation_public_state(validation: Dict[str, Any]) -> Dict[str, Any]:
+        def public(value: Any) -> Any:
+            if hasattr(value, "as_dict") and callable(value.as_dict):
+                return public(value.as_dict())
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {str(key): public(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [public(item) for item in value]
+            return value
+
         result: Dict[str, Any] = {}
         for key, value in dict(validation or {}).items():
-            if isinstance(value, EvidenceWindow):
-                result[key] = value.as_dict()
-            elif isinstance(value, (TxPowerContract, ValidationDecision)):
-                result[key] = value.as_dict()
-            elif key != "context_key":
-                result[key] = value
-            else:
-                result[key] = repr(value)
+            result[key] = repr(value) if key == "context_key" else public(value)
         return result
 
     def _complete_validation_transition_locked(self, final_state: str) -> None:
@@ -305,6 +606,10 @@ class FDIDMAdaptiveMixin:
         self._adaptive_ab_last_htf_identity = None
         self._adaptive_ab_force_next = False
         self._adaptive_ab_state = str(final_state)
+        controller = getattr(self, "_gmi_controller", None)
+        if controller is not None:
+            controller.set_validation_in_progress(False)
+            controller.set_current_waveform(float(getattr(self, "alpha", 0.0)), float(getattr(self, "beta", 0.0)))
 
     def _publish_validation_waveform(self, side: str, generation: int) -> None:
         with self._adaptive_ab_lock:
@@ -314,12 +619,12 @@ class FDIDMAdaptiveMixin:
             contract = validation.get("contract")
             if not isinstance(contract, TxPowerContract):
                 return
-            if side == "baseline":
+            if side in {"baseline", "a1", "a2"}:
                 alpha = float(validation["old_alpha"])
                 beta = float(validation["old_beta"])
                 forced_rms: Optional[float] = float(contract.locked_rms)
                 contract_id = contract.contract_id
-            elif side == "candidate":
+            elif side in {"candidate", "b1"}:
                 alpha = float(validation["candidate_alpha"])
                 beta = float(validation["candidate_beta"])
                 forced_rms = float(contract.locked_rms)
@@ -381,9 +686,10 @@ class FDIDMAdaptiveMixin:
             validation = getattr(self, "_adaptive_ab_validation", {})
             if generation != int(validation.get("apply_generation", -1)):
                 return
-            if side in {"baseline", "candidate"}:
+            if side in {"baseline", "candidate", "a1", "b1", "a2"}:
                 validation["state"] = f"{side}_settling"
                 validation["settle_remaining"] = int(validation.get("settle_frames", 3))
+                validation["acquisition_fingerprints"] = []
                 validation["phase_started_wall"] = time.monotonic()
                 validation["invalid_attempts"] = 0
                 validation["last_invalid_reason"] = ""
@@ -411,7 +717,7 @@ class FDIDMAdaptiveMixin:
                 return
             validation["apply_generation"] = int(validation.get("apply_generation", 0)) + 1
             generation = int(validation["apply_generation"])
-            if side in {"baseline", "candidate"}:
+            if side in {"baseline", "candidate", "a1", "b1", "a2"}:
                 validation["state"] = f"{side}_applying"
                 self._adaptive_ab_state = str(validation["state"])
             elif side == "commit":
@@ -507,8 +813,11 @@ class FDIDMAdaptiveMixin:
             if not timed_out and not too_many_invalid:
                 return
 
-            side = ("commit" if state.startswith("commit") else
-                    ("candidate" if state.startswith("candidate") else "baseline"))
+            side = (
+                "commit"
+                if state.startswith("commit")
+                else ("candidate" if state.startswith(("candidate", "b1", "b2")) else "baseline")
+            )
             trigger = "deadline" if timed_out else "invalid-frame budget"
             last_reason = str(validation.get("last_invalid_reason", "no valid frame"))
             validation["watchdog_triggered"] = True
@@ -539,6 +848,127 @@ class FDIDMAdaptiveMixin:
         if not isinstance(validation, dict):
             return
         state = str(validation.get("state", ""))
+        if str(validation.get("validation_scheme", "")) == "abba_gmi":
+            phase = state.split("_", 1)[0]
+            if phase not in {"a1", "b1", "b2", "a2"}:
+                return
+            if state.endswith("_settling"):
+                samples = validation.setdefault("acquisition_fingerprints", [])
+                if bool(metrics.get("overflow", False)) or not bool(metrics.get("probe_continuity", True)):
+                    samples.clear()
+                    validation["last_invalid_reason"] = "overflow" if bool(metrics.get("overflow", False)) else "probe_gap"
+                    return
+                fingerprint = AcquisitionFingerprint(
+                    effective_cfo_hz=float(metrics.get("effective_cfo_hz", 0.0)),
+                    sync_metric=float(metrics.get("sync_metric", 0.0)),
+                    residual_cfo_hz=float(metrics.get("residual_cfo_hz", 0.0)),
+                    pilot_nmse=float(metrics.get("pilot_fit_nmse", float("nan"))),
+                    pilot_fitted_power=float(metrics.get("pilot_fitted_power", float("nan"))),
+                    rx_rms=float(metrics.get("rx_input_rms", float("nan"))),
+                    rx_peak=float(metrics.get("rx_input_peak", float("nan"))),
+                    continuity=True,
+                    overflow=False,
+                    acquisition_epoch=int(metrics.get("acquisition_epoch", 0)),
+                    context_id=str(metrics.get("context_id", "")),
+                    resource_id=str(metrics.get("resource_id", "")),
+                    contract_id=str(metrics.get("tx_power_contract_id", "")),
+                )
+                if fingerprint.validity_reason():
+                    samples.clear()
+                    validation["last_invalid_reason"] = fingerprint.validity_reason()
+                    return
+                samples.append(fingerprint)
+                samples[:] = samples[-8:]
+                stability = fingerprints_stable(samples, str(getattr(self, "gmi_robustness_profile", "standard")))
+                validation["fingerprint_stability"] = stability.as_dict()
+                if stability.stable:
+                    validation["state"] = f"{phase}_collecting"
+                    validation["acquisition_fingerprints"] = []
+                    self._adaptive_ab_state = str(validation["state"])
+                return
+            if not state.endswith("_collecting"):
+                return
+            window = validation.get(f"{phase}_window")
+            contract = validation.get("contract")
+            if not isinstance(window, EvidenceWindow) or not isinstance(contract, TxPowerContract):
+                self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason="ABBA validation state is incomplete"))
+                return
+            if bool(metrics.get("overflow", False)) or not bool(metrics.get("probe_continuity", True)):
+                window.drop("overflow")
+                self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason="ABBA evidence contains overflow or probe gap"))
+                return
+            if not bool(metrics.get("sync_valid", True)):
+                window.drop("sync")
+                return
+            if metrics.get("context_key") != validation.get("context_key"):
+                window.drop("context")
+                self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason="channel context changed"))
+                return
+            contract_id = str(metrics.get("tx_power_contract_id", ""))
+            tx_rms = metrics.get("tx_cycle_rms", float("nan"))
+            power_ok, power_reason, _ = assess_power_comparability(
+                contract.contract_id,
+                contract.locked_rms,
+                contract_id,
+                tx_rms,
+                tolerance_db=contract.tolerance_db,
+            )
+            if not power_ok:
+                window.drop("power")
+                self._finish_alpha_beta_validation(ValidationDecision("inconclusive", reason=power_reason))
+                return
+            ser_symbols = int(metrics.get("ser_symbols", 0) or 0)
+            if ser_symbols <= 0:
+                return
+            window.add_sample(
+                ser_errors=int(metrics.get("ser_errors", 0) or 0),
+                ser_symbols=ser_symbols,
+                data_aided_evm_percent=metrics.get("data_aided_evm_percent"),
+                crc_ok=bool(metrics.get("crc_ok", metrics.get("decode_ok", False))),
+                raw_ber=metrics.get("raw_bit_ber"),
+                fec_ber=metrics.get("fec_bit_ber"),
+                power_rms=tx_rms,
+                pilot_fit_nmse=metrics.get("pilot_fit_nmse"),
+                pilot_fitted_power=metrics.get("pilot_fitted_power"),
+                gmi_nats_per_sample=metrics.get("gmi_nats_per_sample"),
+            )
+            target = int(validation.get("abba_block_frames", 8))
+            if window.valid_frames < target:
+                return
+            if phase == "a1":
+                self._queue_validation_waveform("b1")
+                return
+            if phase == "b1":
+                # B1->B2 is a logical block boundary, not a second waveform
+                # publication.  This avoids a needless RF/receiver transient.
+                validation["state"] = "b2_collecting"
+                validation["phase_started_wall"] = time.monotonic()
+                self._adaptive_ab_state = "b2_collecting"
+                return
+            if phase == "b2":
+                self._queue_validation_waveform("a2")
+                return
+            evidence = combine_abba_windows(
+                validation["a1_window"],
+                validation["b1_window"],
+                validation["b2_window"],
+                validation["a2_window"],
+            )
+            abba_decision = classify_abba_validation(
+                evidence,
+                gain_lower_nats=float(validation.get("gmi_gain_lower_nats", 0.0)),
+                threshold_nats=float(validation.get("gmi_threshold_nats", 0.0)),
+            )
+            validation["abba_evidence"] = evidence.as_dict()
+            validation["abba_decision"] = abba_decision.as_dict()
+            self._finish_alpha_beta_validation(
+                ValidationDecision(
+                    abba_decision.outcome,
+                    evm_delta_pp=abba_decision.evm_delta_pp,
+                    reason=abba_decision.reason,
+                )
+            )
+            return
         if state in {"baseline_settling", "candidate_settling"}:
             remaining = max(0, int(validation.get("settle_remaining", 0)) - 1)
             validation["settle_remaining"] = remaining
@@ -708,13 +1138,6 @@ class FDIDMAdaptiveMixin:
         vals.extend([0.0, 1.0, 2.0])
         return np.asarray(sorted(set(round(float(v), 9) for v in vals if -1e-9 <= v <= 2.0 + 1e-9)),
                           dtype=np.float64)
-
-    @staticmethod
-    def _adaptive_canonical_index(value: float) -> float:
-        v = ((float(value) + 2.0) % 4.0) - 2.0
-        if v <= -2.0 + 1e-12:
-            v = 2.0
-        return float(abs(v))
 
     def _adaptive_prepare_base(self, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
         """Prepare the exact paper SER objective in a transform-efficient form.
@@ -1129,7 +1552,6 @@ class FDIDMAdaptiveMixin:
                 "coarse_step": float(self.adaptive_alpha_beta_coarse_step),
                 "fine_step": float(self.adaptive_alpha_beta_fine_step),
                 "min_improvement_db": float(self.adaptive_alpha_beta_min_improvement_db),
-                "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "rcond": float(self.adaptive_alpha_beta_rcond),
                 "stalled_evals": int(getattr(self, "_adaptive_ab_stable_count", 0)),
@@ -1169,7 +1591,6 @@ class FDIDMAdaptiveMixin:
             snap["coarse_step"] = float(self.adaptive_alpha_beta_coarse_step)
             snap["fine_step"] = float(self.adaptive_alpha_beta_fine_step)
             snap["min_improvement_db"] = float(self.adaptive_alpha_beta_min_improvement_db)
-            snap["integer_margin_db"] = float(self.adaptive_alpha_beta_integer_margin_db)
             snap["max_order"] = int(self.adaptive_alpha_beta_max_order)
             snap["rcond"] = float(self.adaptive_alpha_beta_rcond)
             snap["global_explore"] = True
@@ -1225,7 +1646,6 @@ class FDIDMAdaptiveMixin:
                 "cooldown_frames": int(self.adaptive_alpha_beta_cooldown_frames),
                 "rejected_candidate_count": int(len(getattr(self, "_adaptive_ab_rejected_pairs", {}) or {})),
                 "rejected_candidate_pairs": [list(pair) for pair in sorted(getattr(self, "_adaptive_ab_rejected_pairs", {}) or {})],
-                "integer_margin_db": float(self.adaptive_alpha_beta_integer_margin_db),
                 "max_order": int(self.adaptive_alpha_beta_max_order),
                 "signaling_mode": str(getattr(self, "ALPHA_BETA_SIGNALING_MODE", "shared_memory")),
                 "validation": validation,
