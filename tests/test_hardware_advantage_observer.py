@@ -231,12 +231,14 @@ def test_export_dict_is_json_serializable():
     session = run_pair()
     data = session.to_export_dict()
     text = json.dumps(data, ensure_ascii=False)
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert len(data["toggle_events"]) == 1
     assert data["toggle_events"][0]["enabled"] is True
     assert any(w["mode"] == MODE_OFF for w in data["windows"])
     assert data["latest_pair"]["before"]["ser"] is not None
     assert "excluded_window_count" in data
+    assert data["objective"] == "legacy_ser"
+    assert data["legacy_ser"]["diagnostic_only"] is True
 
 
 def feed_exact(session, clock, n, ser, *, state="", power_rms=0.2,

@@ -266,40 +266,48 @@ class FDIDMHardwareTestTab(QWidget):
         layout.addWidget(self.advanced_group)
 
 
-        adapt_group = QGroupBox("α/β 信道自适应（论文SER）")
+        adapt_group = QGroupBox("接收机相关 GMI 自适应")
         adapt = QGridLayout(adapt_group)
         adapt.setHorizontalSpacing(6)
         adapt.setVerticalSpacing(6)
-        self.adaptive_enable_check = QCheckBox("启用信道自适应")
+        self.adaptive_enable_check = QCheckBox("启用 GMI 自适应")
         # The demo starts in fixed mode so the operator can explicitly enable
         # adaptation and observe the before/after change.
         self.adaptive_enable_check.setChecked(False)
-        self.adaptive_auto_apply_check = QCheckBox("自动应用稳定推荐")
-        self.adaptive_auto_apply_check.setChecked(True)
-        self.adaptive_coarse_spin = self._dspin(0.05, 1.0, 0.25, 2, "", 0.05)
-        self.adaptive_fine_spin = self._dspin(0.01, 0.50, 0.05, 2, "", 0.01)
-        self.adaptive_interval_spin = self._spin(1, 1024, 8)
-        self.adaptive_stability_spin = self._spin(1, 16, 2)
-        self.adaptive_min_gain_spin = self._dspin(0.0, 30.0, 0.5, 2, " dB", 0.1)
-        self.adaptive_cooldown_spin = self._spin(0, 4096, 16)
+        self.adaptive_enable_check.setToolTip("启用后，满足鲁棒门限的候选会自动进入 A-B-B-A 真链路验证。")
+        self.gmi_receiver_combo = self._combo([
+            ("对角接收机 K=0", "diagonal"),
+            ("完整匹配（对照）", "full_matched"),
+        ], chars=14)
+        self.gmi_catalogue_combo = self._combo([
+            ("4", 4), ("16（推荐）", 16), ("36", 36),
+        ], chars=10)
+        self.gmi_catalogue_combo.setCurrentIndex(1)
+        self.gmi_robustness_combo = self._combo([
+            ("标准", "standard"), ("快速", "fast"), ("保守", "conservative"),
+        ], chars=8)
         self.btn_adaptive_evaluate = QPushButton("立即评估")
-        self.btn_adaptive_evaluate.setToolTip("使用最近一次有效 H_TF 立即运行论文SER搜索；尚无CSI时会等待下一有效帧。")
+        self.btn_adaptive_evaluate.setToolTip("使用最近一次可信 CSI 对有限波形库计算接收机相关 GMI；没有可信 CSI 时等待下一帧。")
         self.adaptive_status_label = QLabel("自适应：关闭")
         self.adaptive_status_label.setWordWrap(True)
         self.adaptive_status_label.setStyleSheet("color: #444444;")
-        adapt.addWidget(self.adaptive_enable_check, 0, 0, 1, 2)
-        adapt.addWidget(self.adaptive_auto_apply_check, 0, 2, 1, 2)
-        adapt.addWidget(QLabel("粗步长"), 1, 0); adapt.addWidget(self.adaptive_coarse_spin, 1, 1)
-        adapt.addWidget(QLabel("细步长"), 1, 2); adapt.addWidget(self.adaptive_fine_spin, 1, 3)
-        adapt.addWidget(QLabel("评估间隔/帧"), 2, 0); adapt.addWidget(self.adaptive_interval_spin, 2, 1)
-        adapt.addWidget(QLabel("稳定次数"), 2, 2); adapt.addWidget(self.adaptive_stability_spin, 2, 3)
-        adapt.addWidget(QLabel("最小预测增益"), 3, 0); adapt.addWidget(self.adaptive_min_gain_spin, 3, 1)
-        adapt.addWidget(QLabel("切换冷却/帧"), 3, 2); adapt.addWidget(self.adaptive_cooldown_spin, 3, 3)
-        adapt.addWidget(self.btn_adaptive_evaluate, 4, 0, 1, 2)
-        adapt.addWidget(self.adaptive_status_label, 4, 2, 2, 2)
-        adapt_note = QLabel("基于实测 H_TF 与噪声方差计算论文 Eq.(40)/(44)/(46) 的预测SER，在 [0,2] 内粗到细搜索；同一进程同时更新收发端 α/β。")
+        adapt.addWidget(self.adaptive_enable_check, 0, 0, 1, 4)
+        adapt.addWidget(QLabel("GMI 接收机"), 1, 0); adapt.addWidget(self.gmi_receiver_combo, 1, 1)
+        adapt.addWidget(QLabel("波形库预算"), 1, 2); adapt.addWidget(self.gmi_catalogue_combo, 1, 3)
+        adapt.addWidget(QLabel("鲁棒等级"), 2, 0); adapt.addWidget(self.gmi_robustness_combo, 2, 1)
+        adapt.addWidget(self.btn_adaptive_evaluate, 2, 2, 1, 2)
+        adapt.addWidget(self.adaptive_status_label, 3, 0, 1, 4)
+        adapt_note = QLabel("净 GMI 负责选择；EVM/SER/CRC 只做 A-B-B-A 非回归验证。")
         adapt_note.setWordWrap(True)
-        adapt.addWidget(adapt_note, 6, 0, 1, 4)
+        adapt_note.setToolTip(
+            "候选只由公共 CSI 和接收机模型计算的净 GMI 下界产生；"
+            "payload、EVM、SER、CRC 不参与在线选择，只用于真链路提交保护。"
+        )
+        adapt.addWidget(adapt_note, 4, 0, 1, 4)
+        # Keep the default rail decision-oriented; the methodology remains on
+        # hover and in exported evidence instead of occupying another row.
+        adapt_note.setVisible(False)
+        adapt_group.setToolTip(adapt_note.toolTip())
         self.adapt_group = adapt_group
         layout.addWidget(adapt_group)
 
@@ -392,9 +400,6 @@ class FDIDMHardwareTestTab(QWidget):
             self.fd_group,
             [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17],
             "FDIDM/信道高级参数")
-        self._advanced_adapt_group = _move_grid_rows(
-            self.adapt_group, [1, 2, 3, 6], "自适应搜索高级参数")
-
         # Remove optional editor groups from the main layout before parenting
         # them under the collapsed group.  They are reinserted automatically
         # when the operator checks “显示高级参数”.
@@ -437,8 +442,15 @@ class FDIDMHardwareTestTab(QWidget):
         btn_l.addWidget(self.btn_stop_test, 1, 0)
         btn_l.addWidget(self.btn_export_log, 1, 1)
         btn_l.addWidget(self.log_status_label, 2, 0, 1, 2)
+        # Export feedback remains available through this label and the button
+        # tooltip, but it does not consume scarce height in the default
+        # operator rail.  It is made visible only after an export action.
+        self.log_status_label.setVisible(False)
         layout.addWidget(btn_group)
         layout.addStretch()
+        for compact_layout in (hw, fd, adapt, gain, btn_l):
+            compact_layout.setContentsMargins(5, 6, 5, 5)
+            compact_layout.setVerticalSpacing(3)
         self._compact_left_controls(panel)
         self._on_channel_mode_changed()
         self._on_device_changed()
@@ -482,10 +494,10 @@ class FDIDMHardwareTestTab(QWidget):
         result_grid.addLayout(ctrl_row, 0, 0, 1, 3)
 
         big_style = "font-size: 18px; font-weight: 700;"
-        # 大数字行只放 SER 前后与改善量（均分三列，文本短于一列宽度，不裁尾）
-        self.observation_before_label = QLabel("开启前：—")
-        self.observation_after_label = QLabel("开启后：—")
-        self.observation_improvement_label = QLabel("SER 改善：—")
+        # 主结论只显示 GMI；EVM/SER/CRC 留在下一行作为真链路证据。
+        self.observation_before_label = QLabel("当前净 GMI：—")
+        self.observation_after_label = QLabel("候选净 GMI：—")
+        self.observation_improvement_label = QLabel("保守增益：—")
         self.observation_before_label.setStyleSheet(big_style + " color:#333333;")
         self.observation_after_label.setStyleSheet(big_style + " color:#333333;")
         self.observation_improvement_label.setStyleSheet(big_style + " color:#167c3a;")
@@ -918,10 +930,8 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_clear_ab_surface.clicked.connect(self._on_clear_ab_surface_clicked)
         self.btn_adaptive_evaluate.clicked.connect(self._on_adaptive_evaluate_clicked)
         self.adaptive_enable_check.stateChanged.connect(self._on_adaptive_enable_changed)
-        self.adaptive_auto_apply_check.stateChanged.connect(lambda _: self._handle_alpha_beta_adaptation(self.backend.get_status()) if self.backend is not None else None)
-        for w in (self.adaptive_coarse_spin, self.adaptive_fine_spin, self.adaptive_interval_spin,
-                  self.adaptive_stability_spin, self.adaptive_min_gain_spin, self.adaptive_cooldown_spin):
-            w.valueChanged.connect(self._on_adaptive_config_changed)
+        for w in (self.gmi_receiver_combo, self.gmi_catalogue_combo, self.gmi_robustness_combo):
+            w.currentIndexChanged.connect(self._on_adaptive_config_changed)
         for w in (self.alpha_spin, self.beta_spin, self.m_spin, self.n_spin, self.cp_spin,
                   self.frame_count_spin, self.guard_spin, self.evm_avg_spin, self.train_amp_spin,
                   self.max_order_spin, self.htf_update_spin, self.process_interval_spin,
@@ -1113,13 +1123,13 @@ class FDIDMHardwareTestTab(QWidget):
 
     def _on_adaptive_evaluate_clicked(self):
         if self.backend is None:
-            self._log("尚未创建后端，无法评估 α/β。")
+            self._log("尚未创建后端，无法评估 GMI 波形库。")
             return
         try:
-            queued = bool(self.backend.request_alpha_beta_adaptation()) if hasattr(self.backend, "request_alpha_beta_adaptation") else False
-            self._log("已提交 α/β 立即评估。" if queued else "尚无有效CSI；将在下一有效帧评估 α/β。")
+            queued = bool(self.backend.request_gmi_evaluation()) if hasattr(self.backend, "request_gmi_evaluation") else False
+            self._log("已提交 GMI 立即评估。" if queued else "尚无可信 CSI；将在下一有效帧评估有限波形库。")
         except Exception as e:
-            self._log(f"α/β 立即评估失败: {type(e).__name__}: {e}")
+            self._log(f"GMI 立即评估失败: {type(e).__name__}: {e}")
 
     def _on_export_log_clicked(self):
         log_dir = Path(__file__).resolve().parents[2] / "log"
@@ -1524,6 +1534,57 @@ class FDIDMHardwareTestTab(QWidget):
         self.observation_note_label.setToolTip(full_text)
 
     def _update_adaptive_state_row(self, status):
+        gmi = dict(status.get("gmi_adaptation", {}) or {})
+        if not gmi:
+            self._update_legacy_adaptive_state_row(status)
+            return
+        receiver = str(gmi.get("receiver_mode", status.get("gmi_receiver_mode", "diagonal")))
+        current_token = str(gmi.get("current_token_id", ""))
+        candidate_token = str(gmi.get("candidate_token_id", ""))
+        gain = float(gmi.get("gain_lower_nats", 0.0))
+        threshold = float(gmi.get("threshold_nats", 0.0))
+        search = str(gmi.get("state", "—"))
+        valid = str(status.get("adaptive_validation_state", "—"))
+        search_name = {
+            "disabled": "关闭", "idle": "等待", "queued": "等待评分", "scoring": "GMI 评分中",
+            "waiting_channel": "等待可信 CSI", "candidate_ready": "候选已就绪",
+            "tracking": "保持当前 token", "error": "评分异常", "stopped": "已停止",
+        }.get(search, search)
+        valid_name = {
+            "idle": "未验证", "prepare_contract": "准备公共功率合同",
+            "a1_applying": "应用 A1", "a1_settling": "A1 重捕获", "a1_collecting": "采集 A1",
+            "b1_applying": "应用 B1", "b1_settling": "B1 重捕获", "b1_collecting": "采集 B1",
+            "b2_collecting": "采集 B2", "a2_applying": "应用 A2", "a2_settling": "A2 重捕获",
+            "a2_collecting": "采集 A2", "commit_applying": "提交候选",
+            "rollback_applying": "回滚基线",
+            "improved": "已确认改善", "regressed": "已确认退化",
+            "inconclusive": "暂不可归因", "rollback_failed": "回滚失败",
+            "aborted": "验证中断",
+        }.get(valid, valid)
+        stage = valid_name if valid not in {"", "idle", "disabled"} else search_name
+        receiver_name = "对角 K=0" if receiver == "diagonal" else "完整匹配"
+        txt = (
+            f"GMI：{receiver_name} · token {current_token[-6:] if current_token else '—'} · {stage} · "
+            f"净增益下界 {gain:.3g}"
+        )
+        reason = str(status.get("adaptive_validation_reason", "") or gmi.get("reason", ""))
+        self.adaptive_state_label.setText(txt)
+        detail = (
+            f"receiver={receiver}；current token={current_token or '—'}；candidate token={candidate_token or '—'}；"
+            f"搜索={search_name}（{search}）；验证={valid_name}（{valid}）；"
+            f"gain_lower={gain:.6g}；threshold={threshold:.6g}"
+        )
+        if reason:
+            detail += f"；验证说明：{reason}"
+        self.adaptive_state_label.setToolTip(detail)
+
+    def _update_legacy_adaptive_state_row(self, status):
+        """Render historical SER-search status without granting it control.
+
+        Old log fixtures and fixed-mode backends still expose the legacy
+        fields.  Keeping them readable is useful for replay, while live GMI
+        operation always takes the branch above.
+        """
         a = float(status.get("alpha", np.nan))
         b = float(status.get("beta", np.nan))
         search = str(status.get("adaptive_alpha_beta_state", "—"))
@@ -1532,13 +1593,15 @@ class FDIDMHardwareTestTab(QWidget):
         beta_obs = status.get("adaptive_beta_observable")
         if alpha_obs is None or beta_obs is None:
             try:
-                ab = self.backend.get_alpha_beta_adaptation_status()
-                alpha_obs = ab.get("alpha_observable")
-                beta_obs = ab.get("beta_observable")
+                legacy = self.backend.get_alpha_beta_adaptation_status()
+                alpha_obs = legacy.get("alpha_observable")
+                beta_obs = legacy.get("beta_observable")
             except Exception:
                 pass
-        def yn(v):
-            return "—" if v is None else ("✓" if bool(v) else "×")
+
+        def yn(value):
+            return "—" if value is None else ("✓" if bool(value) else "×")
+
         search_name = {
             "disabled": "关闭", "idle": "等待有效信道", "monitoring": "监测中",
             "queued": "等待评估", "optimizing": "搜索中", "waiting_channel": "等待可信信道",
@@ -1549,20 +1612,17 @@ class FDIDMHardwareTestTab(QWidget):
             "baseline_settling": "OFF 基线稳定", "baseline_collecting": "采集 OFF 基线",
             "candidate_applying": "切换 ON 候选", "candidate_settling": "ON 候选稳定",
             "candidate_collecting": "采集 ON 候选", "commit_applying": "提交候选",
-            "rollback_applying": "回滚基线",
-            "improved": "已确认改善", "regressed": "已确认退化",
-            "inconclusive": "暂不可归因", "rollback_failed": "回滚失败",
-            "aborted": "验证中断",
+            "rollback_applying": "回滚基线", "improved": "已确认改善", "regressed": "已确认退化",
+            "inconclusive": "暂不可归因", "rollback_failed": "回滚失败", "aborted": "验证中断",
         }.get(valid, valid)
         index_text = "—" if not (np.isfinite(a) and np.isfinite(b)) else f"{a:.2f}/{b:.2f}"
-        # Keep the visible row decision-oriented.  The raw enums and reason
-        # remain available on hover for diagnosis/export correlation.
         stage = valid_name if valid not in {"", "idle", "disabled"} else search_name
-        txt = f"自适应：α/β={index_text} · {stage} · 可观测 α{yn(alpha_obs)} β{yn(beta_obs)}"
+        self.adaptive_state_label.setText(
+            f"自适应：α/β={index_text} · {stage} · 可观测 α{yn(alpha_obs)} β{yn(beta_obs)}"
+        )
         reason = str(status.get("adaptive_validation_reason", "") or "")
-        self.adaptive_state_label.setText(txt)
         detail = (
-            f"当前 α/β={index_text}；搜索状态={search_name}（{search}）；"
+            f"legacy_ser；当前 α/β={index_text}；搜索状态={search_name}（{search}）；"
             f"验证状态={valid_name}（{valid}）；α可观测={yn(alpha_obs)}；β可观测={yn(beta_obs)}"
         )
         if reason:
@@ -1596,6 +1656,42 @@ class FDIDMHardwareTestTab(QWidget):
         validation = dict(status.get("adaptive_validation", {}) or {})
         validation_state = str(validation.get("state", "") or status.get("adaptive_validation_state", ""))
         validation_reason = str(validation.get("result_reason", "") or "")
+        gmi = dict(status.get("gmi_adaptation", {}) or {})
+        if gmi and (gmi.get("enabled") or gmi.get("resource_id")):
+            scores = {str(item.get("token_id", "")): dict(item) for item in gmi.get("scores", [])}
+            current_id = str(gmi.get("current_token_id", ""))
+            candidate_id = str(gmi.get("candidate_token_id", ""))
+            current_score = scores.get(current_id, {})
+            candidate_score = scores.get(candidate_id, {})
+            current_net = finite_float(current_score.get("lower_bound_nats"))
+            candidate_net = finite_float(candidate_score.get("lower_bound_nats"))
+            gain_lower = finite_float(gmi.get("gain_lower_nats"))
+            self.observation_before_label.setText(f"当前净 GMI {fmt(current_net, '', '.4g')}")
+            self.observation_after_label.setText(f"候选净 GMI {fmt(candidate_net, '', '.4g')}")
+            self.observation_improvement_label.setText(f"GMI 保守增益 {fmt(gain_lower, '', '+.3g')}")
+            allowed = bool(gmi.get("switch_allowed", False))
+            receiver = str(gmi.get("receiver_mode", "diagonal"))
+            confidence = "候选可验证" if allowed else ("完整接收机对照" if receiver == "full_matched" else "保持当前")
+            self.observation_badge_label.setText(f"置信状态：{confidence} · {validation_state or gmi.get('state', '—')}")
+            self.observation_badge_label.setStyleSheet(
+                f"color:{'#167c3a' if allowed else '#555555'}; font-weight:600;"
+            )
+            abba = dict(validation.get("abba_evidence", {}) or {})
+            baseline = dict(abba.get("baseline", {}) or {})
+            candidate = dict(abba.get("candidate", {}) or {})
+            self.observation_evm_label.setText(
+                f"EVM {fmt(baseline.get('data_aided_evm_mean'), '%', '.2f')} → "
+                f"{fmt(candidate.get('data_aided_evm_mean'), '%', '.2f')}"
+            )
+            reason = str(validation_reason or gmi.get("reason", ""))
+            self._set_observation_note(reason or "等待可信 CSI 与 A-B-B-A 真链路证据")
+            self.observation_before_label.setToolTip(f"token={current_id or '—'}；resource={gmi.get('resource_id', '—')}")
+            self.observation_after_label.setToolTip(f"token={candidate_id or '—'}；library={gmi.get('library_id', '—')}")
+            self.observation_improvement_label.setToolTip(
+                f"gain_lower={gain_lower:.6g}；threshold={finite_float(gmi.get('threshold_nats')):.6g} nats/charged-sample"
+            )
+            self._update_observation_stats(validation)
+            return
         validation_display_applied = False
         exact_windows_applied = False
         self.observation_improvement_label.setToolTip("")
@@ -1938,18 +2034,11 @@ class FDIDMHardwareTestTab(QWidget):
             cfo_scan_min_score=0.55,
             cfo_scan_jump_guard_hz=12_000.0,
             auto_tdl_param_for_software=True,
-            adaptive_alpha_beta_enable=self.adaptive_enable_check.isChecked(),
-            adaptive_alpha_beta_coarse_step=self.adaptive_coarse_spin.value(),
-            adaptive_alpha_beta_fine_step=self.adaptive_fine_spin.value(),
-            adaptive_alpha_beta_interval_frames=self.adaptive_interval_spin.value(),
-            adaptive_alpha_beta_min_improvement_db=self.adaptive_min_gain_spin.value(),
-            adaptive_alpha_beta_stability_evals=self.adaptive_stability_spin.value(),
-            adaptive_alpha_beta_cooldown_frames=self.adaptive_cooldown_spin.value(),
-            adaptive_alpha_beta_integer_margin_db=0.10,
-            adaptive_alpha_beta_max_order=512,
-            adaptive_alpha_beta_min_sync_metric=0.30,
-            adaptive_alpha_beta_require_good_frame=False,
-            adaptive_alpha_beta_rcond=1e-6,
+            adaptive_alpha_beta_enable=False,
+            gmi_adaptive_enable=self.adaptive_enable_check.isChecked(),
+            gmi_receiver_mode=self._current_data(self.gmi_receiver_combo, "diagonal"),
+            gmi_catalogue_cap=int(self._current_data(self.gmi_catalogue_combo, 16)),
+            gmi_robustness_profile=self._current_data(self.gmi_robustness_combo, "standard"),
         )
 
     def _configure_backend(self, tx_text: str):
@@ -2051,12 +2140,8 @@ class FDIDMHardwareTestTab(QWidget):
             self._schedule_param_apply(0)
 
     def _on_adaptive_config_changed(self, *_args):
-        # Keep the fine grid no coarser than the coarse grid.  These settings
-        # are control-plane only and are safe to update while UHD is running.
-        try:
-            self.adaptive_fine_spin.setMaximum(max(0.01, self.adaptive_coarse_spin.value()))
-        except Exception:
-            pass
+        # Receiver/library/profile are control-plane settings.  Rebuilding the
+        # finite library invalidates stale scores without touching RF gains.
         if self.backend is not None and not self._suppress_param_signals:
             self._schedule_param_apply(0)
 
@@ -2345,9 +2430,84 @@ class FDIDMHardwareTestTab(QWidget):
         label = getattr(self, "adaptive_status_label", None)
         if status is None:
             return
+        gmi = dict(status.get("gmi_adaptation", {}) or {})
+        if not gmi:
+            self._handle_legacy_adaptation_diagnostic(status, label)
+            return
+        enabled = bool(gmi.get("enabled", status.get("gmi_adaptive_enabled", False)))
+        state = str(gmi.get("state", "disabled"))
+        receiver = str(gmi.get("receiver_mode", "diagonal"))
+        current_token = str(gmi.get("current_token_id", ""))
+        candidate_token = str(gmi.get("candidate_token_id", ""))
+        rec_a = float(gmi.get("candidate_alpha", np.nan))
+        rec_b = float(gmi.get("candidate_beta", np.nan))
+        gain = float(gmi.get("gain_lower_nats", 0.0))
+        threshold = float(gmi.get("threshold_nats", 0.0))
+        reason = str(gmi.get("reason", "") or "")
+        ready = bool(gmi.get("switch_allowed", False))
+        seq = int(gmi.get("sequence", 0))
+        validation_state = str(status.get("adaptive_validation_state", "") or "")
+
+        if label is not None:
+            if not enabled:
+                label.setText("GMI 自适应：关闭")
+            elif receiver == "full_matched":
+                label.setText("完整匹配接收机：GMI 对 α/β 不敏感，无需切换")
+            elif validation_state in {"a1_collecting", "b1_collecting", "b2_collecting", "a2_collecting"}:
+                label.setText(f"A-B-B-A 真链路验证：{validation_state[:2].upper()} 采集中")
+            elif validation_state == "rollback_applying":
+                label.setText("A-B-B-A 验证未通过：正在安全回滚")
+            elif validation_state == "rollback_failed":
+                label.setText("安全回滚失败：请立即停止测试")
+            else:
+                state_name = {
+                    "idle": "等待", "queued": "排队", "scoring": "评分中",
+                    "waiting_channel": "等待可信 CSI", "tracking": "保持当前 token",
+                    "candidate_ready": "候选可验证", "error": "评分异常",
+                }.get(state, state)
+                token_text = current_token[-6:] if current_token else "—"
+                candidate_text = candidate_token[-6:] if candidate_token else "—"
+                label.setText(
+                    f"GMI：{state_name} · 当前 {token_text} · 候选 {candidate_text} · "
+                    f"保守增益 {gain:.3g} nats/sample"
+                )
+            label.setToolTip(
+                f"receiver={receiver}；current={current_token or '—'}；candidate={candidate_token or '—'}；"
+                f"gain_lower={gain:.6g}；threshold={threshold:.6g}；reason={reason or '—'}"
+            )
+
+        if validation_state in {
+            "a1_applying", "a1_settling", "a1_collecting", "b1_applying", "b1_settling",
+            "b1_collecting", "b2_collecting", "a2_applying", "a2_settling", "a2_collecting",
+            "commit_applying", "rollback_applying", "rollback_failed",
+        }:
+            return
+        if (not enabled or not ready or seq <= int(self._last_adaptive_recommendation_seq)):
+            return
+        self._last_adaptive_recommendation_seq = seq
+        self._mark_observation_apply(rec_a, rec_b)
+        if not (np.isfinite(rec_a) and np.isfinite(rec_b)):
+            return
+        self._log(
+            f"GMI 候选进入 A-B-B-A 验证：α={rec_a:.2f}, β={rec_b:.2f}；"
+            f"保守增益下界 {gain:.4g} nats/sample。"
+        )
+        if hasattr(self.backend, "apply_gmi_candidate"):
+            self.backend.apply_gmi_candidate()
+        else:
+            self._set_indices(rec_a, rec_b)
+
+    def _handle_legacy_adaptation_diagnostic(self, status, label):
+        """Display old SER recommendations as diagnostics only.
+
+        Legacy status is intentionally non-executable here: only a versioned
+        ``gmi_adaptation`` decision can start a new waveform transaction.
+        This preserves historical log readability without letting the old SER
+        objective regain control of the transmitter.
+        """
         enabled = bool(status.get("adaptive_alpha_beta_enabled", False))
         state = str(status.get("adaptive_alpha_beta_state", "disabled"))
-        err = str(status.get("adaptive_last_error", "") or "")
+        error = str(status.get("adaptive_last_error", "") or "")
         rec_a = float(status.get("adaptive_recommended_alpha", np.nan))
         rec_b = float(status.get("adaptive_recommended_beta", np.nan))
         gain = float(status.get("adaptive_predicted_improvement_db", np.nan))
@@ -2357,69 +2517,49 @@ class FDIDMHardwareTestTab(QWidget):
         stable = int(status.get("adaptive_stable_count", 0))
         required = int(status.get("adaptive_stable_required", 0))
         source = str(status.get("adaptive_htf_source", ""))
-        ready = bool(status.get("adaptive_alpha_beta_ready", False))
-        seq = int(status.get("adaptive_recommendation_seq", 0))
         validation_state = str(status.get("adaptive_validation_state", "") or "")
-
-        if label is not None:
-            if not enabled:
-                label.setText("自适应：关闭")
-            elif validation_state == "baseline_collecting":
-                label.setText("真实链路验证：采集关闭基线；暂不应用新候选")
-            elif validation_state == "candidate_collecting":
-                label.setText("真实链路验证：采集候选窗口；暂不应用新候选")
-            elif validation_state == "rollback_applying":
-                label.setText("真实链路验证：正在回滚基线；暂不应用新候选")
-            elif validation_state == "rollback_failed":
-                label.setText("真实链路验证：回滚失败；请立即停止测试")
-            elif err:
-                state_name = {
-                    "idle": "等待有效信道", "monitoring": "监测中",
-                    "optimizing": "搜索中", "waiting_channel": "等待可信信道",
-                }.get(state, state)
-                label.setText(f"自适应：{state_name}；{err}")
-            elif np.isfinite(rec_a) and np.isfinite(rec_b):
-                gain_txt = "nan" if not np.isfinite(gain) else f"{gain:.2f}dB"
-                snr_txt = "nan" if not np.isfinite(snr) else f"{snr:.1f}dB"
-                ser_txt = ("不可用" if not (np.isfinite(predicted_current) and np.isfinite(predicted_best))
-                           else f"{predicted_current:.3g}→{predicted_best:.3g}")
-                label.setText(
-                    f"自适应：{({'idle': '等待有效信道', 'monitoring': '监测中', 'optimizing': '搜索中', 'waiting_channel': '等待可信信道'}.get(state, state))}；"
-                    f"推荐 α/β={rec_a:.2f}/{rec_b:.2f}；"
-                    f"预测SER={ser_txt}；预计改善 {gain_txt}；预测模型SNR={snr_txt}；"
-                    f"稳定={stable}/{required}；CSI={source}"
-                )
-            else:
-                state_name = {
-                    "idle": "等待有效信道", "monitoring": "监测中",
-                    "optimizing": "搜索中", "waiting_channel": "等待可信信道",
-                }.get(state, state)
-                label.setText(f"自适应：{state_name}，等待可信信道估计；检查 CRC")
-            label.setToolTip(f"预测SER={predicted_current:.3g}→{predicted_best:.3g}；预测SNR={snr:.1f}dB")
-
-        if validation_state in {"baseline_collecting", "candidate_collecting", "rollback_applying", "rollback_failed"}:
+        if label is None:
             return
-        if (not enabled or not ready or not self.adaptive_auto_apply_check.isChecked()
-                or seq <= int(self._last_adaptive_recommendation_seq)):
-            return
-        self._last_adaptive_recommendation_seq = seq
-        self._mark_observation_apply(rec_a, rec_b)
-        if not (np.isfinite(rec_a) and np.isfinite(rec_b)):
-            return
-        delta = abs(rec_a - self.alpha_spin.value()) + abs(rec_b - self.beta_spin.value())
-        if delta < 0.5 * max(self.adaptive_fine_spin.value(), 0.01):
-            return
-        self._log(
-            f"信道自适应应用 α={rec_a:.2f}, β={rec_b:.2f}；"
-            f"论文SER预测改善 {gain:.2f} dB，CSI={source}。"
-        )
-        if hasattr(self.backend, "apply_alpha_beta_candidate"):
-            self.backend.apply_alpha_beta_candidate(
-                rec_a, rec_b, predicted_improvement_db=gain,
-                recommendation_seq=seq,
+        if not enabled:
+            label.setText("自适应：关闭（历史 SER 诊断）")
+        elif validation_state == "baseline_collecting":
+            label.setText("真实链路验证：采集关闭基线；暂不应用新候选")
+        elif validation_state == "candidate_collecting":
+            label.setText("真实链路验证：采集候选窗口；暂不应用新候选")
+        elif validation_state == "rollback_applying":
+            label.setText("真实链路验证：正在回滚基线；暂不应用新候选")
+        elif validation_state == "rollback_failed":
+            label.setText("真实链路验证：回滚失败；请立即停止测试")
+        elif error:
+            state_name = {
+                "idle": "等待有效信道", "monitoring": "监测中", "optimizing": "搜索中",
+                "waiting_channel": "等待可信信道估计",
+            }.get(state, state)
+            label.setText(f"历史 SER 诊断：{state_name}；{error}")
+        elif np.isfinite(rec_a) and np.isfinite(rec_b):
+            gain_text = "nan" if not np.isfinite(gain) else f"{gain:.2f}dB"
+            ser_text = (
+                "不可用" if not (np.isfinite(predicted_current) and np.isfinite(predicted_best))
+                else f"{predicted_current:.3g}→{predicted_best:.3g}"
+            )
+            state_name = {
+                "idle": "等待有效信道", "monitoring": "监测中", "optimizing": "搜索中",
+                "waiting_channel": "等待可信信道估计",
+            }.get(state, state)
+            label.setText(
+                f"历史 SER 诊断：{state_name}；推荐 α/β={rec_a:.2f}/{rec_b:.2f}；"
+                f"预测SER={ser_text}；预计改善 {gain_text}；稳定={stable}/{required}；CSI={source}"
             )
         else:
-            self._set_indices(rec_a, rec_b)
+            state_name = {
+                "idle": "等待有效信道", "monitoring": "监测中", "optimizing": "搜索中",
+                "waiting_channel": "等待可信信道估计",
+            }.get(state, state)
+            label.setText(f"历史 SER 诊断：{state_name}，等待可信信道估计；检查 CRC")
+        label.setToolTip(
+            f"legacy_ser（仅诊断，不触发波形切换）；预测SER={predicted_current:.3g}→{predicted_best:.3g}；"
+            f"预测SNR={snr:.1f}dB"
+        )
 
     def _update_decode_status(self, stats, status):
         ok = bool(stats.get("decode_ok", False))

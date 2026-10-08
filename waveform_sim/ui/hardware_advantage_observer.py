@@ -79,7 +79,7 @@ EVIDENCE_CONTEXT_KEYS = (
     "tdl_injected_snr_db",
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def grade_from_k(k: float) -> str:
@@ -267,6 +267,8 @@ class AdvantageObservationSession:
         self._symbols_per_frame = float("nan")
         self._coded_bits_per_frame = float("nan")
         self._last_config = (float("nan"), float("nan"))
+        self._latest_gmi_evidence: Dict[str, Any] = {}
+        self._gmi_evidence_history: List[Dict[str, Any]] = []
 
     # ---------------- 生命周期 ----------------
     def start(self, enabled: bool, context: Optional[Dict[str, Any]] = None) -> None:
@@ -286,8 +288,11 @@ class AdvantageObservationSession:
         self._last_ser_errors_total = _i(initial.get("ser_errors_total"))
         self._last_ser_symbols_total = _i(initial.get("ser_symbols_total"))
         self._last_config = (float("nan"), float("nan"))
+        self._latest_gmi_evidence = {}
+        self._gmi_evidence_history = []
         if initial:
             self._update_symbol_counts(initial)
+            self._capture_gmi_evidence(initial)
         self._open_window(bool(enabled))
 
     def now(self) -> float:
@@ -319,6 +324,7 @@ class AdvantageObservationSession:
     def on_sample(self, status: Dict[str, Any]) -> None:
         if not self.active or self._current is None:
             return
+        self._capture_gmi_evidence(status)
         context_keys = CONTEXT_KEYS + EVIDENCE_CONTEXT_KEYS
         next_context = dict(self._current.context)
         next_context.update({key: status[key] for key in context_keys if key in status})
@@ -584,6 +590,7 @@ class AdvantageObservationSession:
 
     def to_export_dict(self) -> Dict[str, Any]:
         pair = self.latest_pair()
+        evidence = self._export_gmi_evidence()
         return {
             "schema_version": SCHEMA_VERSION,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -594,6 +601,136 @@ class AdvantageObservationSession:
             "anomaly_drops": [{"t": t, "kind": kind} for t, kind in self._anomaly_drops],
             "latest_pair": self._pair_as_dict(pair),
             "excluded_window_count": self.excluded_window_count(),
+            "objective": evidence["objective"],
+            "theory": evidence["theory"],
+            "selection": evidence["selection"],
+            "hardware_validation": evidence["hardware_validation"],
+            "comparability": evidence["comparability"],
+            "legacy_ser": evidence["legacy_ser"],
+            "gmi_evidence_history": [
+                _sanitize({key: value for key, value in item.items() if key != "_marker"})
+                for item in self._gmi_evidence_history
+            ],
+        }
+
+    def _capture_gmi_evidence(self, status: Dict[str, Any]) -> None:
+        """Retain versioned GMI evidence without mixing it into SER windows."""
+        supplied = dict(status.get("gmi_evidence", {}) or {})
+        gmi = dict(status.get("gmi_adaptation", {}) or {})
+        validation = dict(status.get("adaptive_validation", {}) or {})
+        legacy = dict(status.get("adaptive_alpha_beta", {}) or {})
+        if supplied:
+            evidence = supplied
+        elif gmi and (gmi.get("enabled") or gmi.get("resource_id")):
+            evidence = {
+                "objective": "gmi_receiver_dependent",
+                "theory": {
+                    "receiver_mode": str(gmi.get("receiver_mode", "")),
+                    "receiver_id": str(gmi.get("receiver_id", "")),
+                    "resource_id": str(gmi.get("resource_id", "")),
+                    "library_id": str(gmi.get("library_id", "")),
+                    "catalogue_cap": int(gmi.get("catalogue_cap", 0) or 0),
+                    "library_size": int(gmi.get("library_size", 0) or 0),
+                    "active_library_size": int(gmi.get("active_library_size", 0) or 0),
+                    "scores": list(gmi.get("scores", []) or []),
+                },
+                "selection": {
+                    key: gmi.get(key)
+                    for key in (
+                        "state", "state_epoch", "sequence", "current_token_id",
+                        "candidate_token_id", "gain_lower_nats", "threshold_nats",
+                        "switch_allowed", "robustness_profile", "reason",
+                    )
+                },
+                "hardware_validation": validation,
+                "legacy_ser": {"diagnostic_only": True},
+            }
+        else:
+            evidence = {
+                "objective": "legacy_ser",
+                "theory": {},
+                "selection": {},
+                "hardware_validation": validation,
+                "legacy_ser": {
+                    "diagnostic_only": True,
+                    "state": str(legacy.get("state", status.get("adaptive_alpha_beta_state", "disabled"))),
+                    "predicted_ser_current": legacy.get(
+                        "predicted_ser_current", status.get("adaptive_predicted_ser_current")
+                    ),
+                    "predicted_ser_best": legacy.get(
+                        "predicted_ser_best", status.get("adaptive_predicted_ser_best")
+                    ),
+                },
+            }
+        normalized = _sanitize(evidence)
+        self._latest_gmi_evidence = normalized
+        selection = dict(normalized.get("selection", {}) or {})
+        hardware = dict(normalized.get("hardware_validation", {}) or {})
+        marker = (
+            normalized.get("objective"), selection.get("sequence"), selection.get("state"),
+            selection.get("current_token_id"), selection.get("candidate_token_id"),
+            hardware.get("state"), hardware.get("outcome"),
+        )
+        previous = self._gmi_evidence_history[-1].get("_marker") if self._gmi_evidence_history else None
+        if marker != previous:
+            snapshot = dict(normalized)
+            snapshot["t"] = float(self._clock())
+            snapshot["_marker"] = marker
+            self._gmi_evidence_history.append(snapshot)
+
+    def _export_gmi_evidence(self) -> Dict[str, Any]:
+        evidence = dict(self._latest_gmi_evidence or {})
+        objective = str(evidence.get("objective", "legacy_ser"))
+        theory = dict(evidence.get("theory", {}) or {})
+        selection = dict(evidence.get("selection", {}) or {})
+        hardware = dict(evidence.get("hardware_validation", {}) or {})
+        legacy = dict(evidence.get("legacy_ser", {}) or {"diagnostic_only": True})
+        comparable: Optional[bool]
+        reason = ""
+        if objective != "gmi_receiver_dependent":
+            comparable = False
+            reason = "legacy_ser record has no receiver-dependent GMI evidence"
+        elif not hardware:
+            comparable = None
+            reason = "hardware validation has not started"
+        else:
+            resource_ids = {
+                str(value) for value in (
+                    theory.get("resource_id"), hardware.get("resource_id"),
+                    dict(hardware.get("baseline_window", {}) or {}).get("resource_id"),
+                    dict(hardware.get("candidate_window", {}) or {}).get("resource_id"),
+                    dict(dict(hardware.get("abba_evidence", {}) or {}).get("baseline", {}) or {}).get("resource_id"),
+                    dict(dict(hardware.get("abba_evidence", {}) or {}).get("candidate", {}) or {}).get("resource_id"),
+                ) if value
+            }
+            receivers = {
+                str(value) for value in (
+                    theory.get("receiver_mode"), hardware.get("receiver_mode")
+                ) if value
+            }
+            if len(resource_ids) > 1:
+                comparable = False
+                reason = "resource_id mismatch: " + ", ".join(sorted(resource_ids))
+            elif len(receivers) > 1:
+                comparable = False
+                reason = "receiver mismatch: " + ", ".join(sorted(receivers))
+            elif not resource_ids or not receivers:
+                comparable = False
+                reason = "missing resource_id or receiver mode"
+            else:
+                comparable = True
+        return {
+            "objective": objective,
+            "theory": _sanitize(theory),
+            "selection": _sanitize(selection),
+            "hardware_validation": _sanitize(hardware),
+            "comparability": {
+                "comparable": comparable,
+                "reason": reason,
+                "resource_id": theory.get("resource_id"),
+                "receiver_mode": theory.get("receiver_mode"),
+            },
+            "legacy_ser": _sanitize(legacy),
         }
 
     # ---------------- 内部 ----------------

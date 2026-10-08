@@ -549,6 +549,88 @@ def test_engineering_controls_are_simple_by_default_and_advanced_is_collapsible(
     assert "收起" in tab.btn_toggle_advanced.text()
 
 
+def test_default_adaptive_controls_expose_only_engineering_gmi_choices(app):
+    tab = FDIDMHardwareTestTab()
+    assert tab.adaptive_enable_check.isVisibleTo(tab)
+    assert not hasattr(tab, "adaptive_auto_apply_check")
+    assert tab.gmi_receiver_combo.isVisibleTo(tab)
+    assert tab.gmi_catalogue_combo.isVisibleTo(tab)
+    assert tab.gmi_robustness_combo.isVisibleTo(tab)
+    assert tab.btn_adaptive_evaluate.isVisibleTo(tab)
+    for legacy_name in (
+        "adaptive_coarse_spin", "adaptive_fine_spin", "adaptive_interval_spin",
+        "adaptive_stability_spin", "adaptive_min_gain_spin", "adaptive_cooldown_spin",
+    ):
+        assert not hasattr(tab, legacy_name)
+    assert [tab.gmi_catalogue_combo.itemData(i) for i in range(tab.gmi_catalogue_combo.count())] == [4, 16, 36]
+    assert tab.gmi_catalogue_combo.currentData() == 16
+    kwargs = tab._backend_kwargs("FDIDM OK")
+    assert kwargs["adaptive_alpha_beta_enable"] is False
+    assert kwargs["gmi_catalogue_cap"] == 16
+    assert not any(key.startswith("adaptive_alpha_beta_") and key != "adaptive_alpha_beta_enable" for key in kwargs)
+    assert "公共 CSI" in tab.adapt_group.toolTip()
+
+
+def test_gmi_state_row_and_full_matched_reference_are_plainly_explained(app):
+    tab = FDIDMHardwareTestTab()
+    reason = "long diagnostic reason " * 20
+    status = make_status(10, 8)
+    status["gmi_adaptation"] = {
+        "enabled": True,
+        "state": "candidate_ready",
+        "receiver_mode": "diagonal",
+        "current_token_id": "token-current-123456",
+        "candidate_token_id": "token-candidate-654321",
+        "gain_lower_nats": 0.025,
+        "threshold_nats": 0.01,
+        "reason": reason,
+    }
+    tab._update_adaptive_state_row(status)
+    assert "对角 K=0" in tab.adaptive_state_label.text()
+    assert "123456" in tab.adaptive_state_label.text()
+    assert "候选已就绪" in tab.adaptive_state_label.text()
+    assert reason in tab.adaptive_state_label.toolTip()
+
+    status["gmi_adaptation"]["receiver_mode"] = "full_matched"
+    tab._handle_alpha_beta_adaptation(status)
+    assert "GMI 对 α/β 不敏感" in tab.adaptive_status_label.text()
+
+
+def test_evm_only_improvement_cannot_be_rendered_as_gmi_advantage(app):
+    tab = FDIDMHardwareTestTab()
+    status = make_status(48, 48, evm=3.0)
+    status["gmi_adaptation"] = {
+        "enabled": True,
+        "state": "tracking",
+        "receiver_mode": "diagonal",
+        "resource_id": "res-common",
+        "library_id": "lib",
+        "current_token_id": "token-a",
+        "candidate_token_id": "token-b",
+        "gain_lower_nats": 0.0,
+        "threshold_nats": 0.01,
+        "switch_allowed": False,
+        "reason": "gain_not_above_threshold",
+        "scores": [
+            {"token_id": "token-a", "lower_bound_nats": 0.5},
+            {"token_id": "token-b", "lower_bound_nats": 0.5},
+        ],
+    }
+    status["adaptive_validation_state"] = "improved"
+    status["adaptive_validation"] = {
+        "state": "improved",
+        "result_reason": "EVM improved",
+        "abba_evidence": {
+            "baseline": {"data_aided_evm_mean": 10.0},
+            "candidate": {"data_aided_evm_mean": 3.0},
+        },
+    }
+    tab._update_observation_display(status)
+    assert "保持当前" in tab.observation_badge_label.text()
+    assert "GMI" in tab.observation_improvement_label.text()
+    assert "EVM 改善" not in tab.observation_improvement_label.text()
+
+
 def test_antenna_preset_is_explicit_and_only_available_for_b210(app):
     tab = FDIDMHardwareTestTab()
     tab.btn_antenna_preset.click()
@@ -690,10 +772,79 @@ def test_export_writes_json_report(app, tmp_path, monkeypatch):
     tab._export_observation_clicked()
     assert out.exists()
     data = json.loads(out.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["windows"] and data["toggle_events"]
     assert "anomaly_drops" in data
     assert data["latest_pair"]["before"]["ser"] is not None
+    assert data["objective"] == "legacy_ser"
+    assert data["comparability"]["comparable"] is False
+    assert data["legacy_ser"]["diagnostic_only"] is True
+
+
+def test_gmi_export_groups_theory_selection_and_hardware_validation():
+    clock = FakeClock()
+    observer = AdvantageObservationSession(clock=clock)
+    status = make_status(1, 1)
+    status["gmi_adaptation"] = {
+        "enabled": True,
+        "state": "candidate_ready",
+        "receiver_mode": "diagonal",
+        "receiver_id": "rx-diagonal",
+        "resource_id": "res-common",
+        "library_id": "lib-16",
+        "catalogue_cap": 16,
+        "library_size": 16,
+        "current_token_id": "token-a",
+        "candidate_token_id": "token-b",
+        "gain_lower_nats": 0.03,
+        "threshold_nats": 0.01,
+        "switch_allowed": True,
+        "robustness_profile": "standard",
+        "reason": "robust_gain",
+        "state_epoch": 4,
+        "sequence": 2,
+        "scores": [],
+    }
+    status["adaptive_validation"] = {
+        "state": "a1_collecting",
+        "receiver_mode": "diagonal",
+        "resource_id": "res-common",
+        "baseline_window": {"resource_id": "res-common"},
+        "candidate_window": {"resource_id": "res-common"},
+    }
+    observer.start(True, status)
+    report = observer.to_export_dict()
+    assert report["objective"] == "gmi_receiver_dependent"
+    assert report["theory"]["receiver_mode"] == "diagonal"
+    assert report["selection"]["candidate_token_id"] == "token-b"
+    assert report["hardware_validation"]["state"] == "a1_collecting"
+    assert report["comparability"] == {
+        "comparable": True,
+        "reason": "",
+        "resource_id": "res-common",
+        "receiver_mode": "diagonal",
+    }
+
+
+def test_gmi_export_rejects_resource_or_receiver_mismatch():
+    clock = FakeClock()
+    observer = AdvantageObservationSession(clock=clock)
+    status = make_status(1, 1)
+    status["gmi_adaptation"] = {
+        "enabled": True,
+        "receiver_mode": "diagonal",
+        "resource_id": "res-theory",
+        "library_id": "lib",
+    }
+    status["adaptive_validation"] = {
+        "state": "a2_collecting",
+        "receiver_mode": "full_matched",
+        "resource_id": "res-hardware",
+    }
+    observer.start(True, status)
+    report = observer.to_export_dict()
+    assert report["comparability"]["comparable"] is False
+    assert "resource_id mismatch" in report["comparability"]["reason"]
 
 
 def test_stop_observation_keeps_results(app):
