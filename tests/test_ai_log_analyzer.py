@@ -121,4 +121,3 @@ def test_analyze_log_rejects_invalid_response_shape():
 
     with pytest.raises(RuntimeError, match="响应格式"):
         analyze_log("log", DeepSeekConfig("https://api.example.test", "model", "key"), opener)
-
