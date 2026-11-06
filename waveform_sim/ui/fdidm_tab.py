@@ -23,11 +23,14 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QScrollArea,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -162,7 +165,7 @@ class FDIDMTab(BaseWaveformTab):
         # 旧版手动刷新按钮保留为隐藏的基类兼容控件。
         self.btn_auto_ber_snr.setText("理论 SER-SNR 自动刷新已启用")
         self.btn_auto_ber_snr.hide()
-        self.btn_stop_ber_snr.setText("停止理论 SER-SNR 刷新")
+        self.btn_stop_ber_snr.setText("停止理论曲线刷新")
         self.btn_stop_ber_snr.setEnabled(False)
 
         self.update_timer = QTimer()
@@ -181,7 +184,10 @@ class FDIDMTab(BaseWaveformTab):
         # before the first automatic SER-SNR refresh.
         self._sync_profile_defaults(self.channel_combo.currentText())
         self._update_info_panel(running=False)
-        QTimer.singleShot(400, lambda: self._schedule_auto_ser_snr("初始化"))
+        self._initial_refresh_timer = QTimer(self)
+        self._initial_refresh_timer.setSingleShot(True)
+        self._initial_refresh_timer.timeout.connect(lambda: self._schedule_auto_ser_snr("初始化"))
+        self._initial_refresh_timer.start(400)
 
     # ------------------------------------------------------------------
     # UI controls
@@ -197,6 +203,7 @@ class FDIDMTab(BaseWaveformTab):
             form.setVerticalSpacing(6)
             form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
             form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+            form.setRowWrapPolicy(QFormLayout.WrapLongRows)
             group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
             return group, form
 
@@ -324,7 +331,7 @@ class FDIDMTab(BaseWaveformTab):
         self.residual_doppler_spin.setToolTip(
             "公共轨道频移补偿后，真正决定小尺度信道相干时间的最大Doppler扩展。"
         )
-        ch_form.addRow("残余Doppler扩展:", self.residual_doppler_spin)
+        ch_form.addRow("残余扩展:", self.residual_doppler_spin)
 
         self.doppler_compensation_spin = QDoubleSpinBox()
         self.doppler_compensation_spin.setRange(0.0, 100.0)
@@ -335,7 +342,7 @@ class FDIDMTab(BaseWaveformTab):
         self.doppler_compensation_spin.setToolTip(
             "对可预测公共轨道Doppler的预补偿比例；剩余部分作为残余公共CFO。"
         )
-        ch_form.addRow("公共Doppler补偿:", self.doppler_compensation_spin)
+        ch_form.addRow("公共频移补偿:", self.doppler_compensation_spin)
 
         self.random_channel_check = QCheckBox("随机路径相位/角度")
         self.random_channel_check.setChecked(True)
@@ -367,12 +374,12 @@ class FDIDMTab(BaseWaveformTab):
         self.btn_alpha_mc_once = QPushButton("手动绘制MC α曲线")
         self.btn_alpha_mc_once.setMinimumHeight(28)
         self.btn_alpha_mc_once.setToolTip("仅下一次刷新使用Monte-Carlo实测；后续参数自动刷新仍默认使用ZF理论值。")
-        stat_form.addRow("Monte-Carlo:", self.btn_alpha_mc_once)
+        stat_form.addRow("MC 曲线:", self.btn_alpha_mc_once)
 
 
         # --- 快捷按钮 ---
         quick_group = QGroupBox("快捷操作")
-        quick_layout = QHBoxLayout(quick_group)
+        quick_layout = QGridLayout(quick_group)
         quick_layout.setContentsMargins(8, 8, 8, 8)
         quick_layout.setSpacing(6)
         self.btn_search_best = QPushButton("理论搜索最优 α/β")
@@ -382,19 +389,57 @@ class FDIDMTab(BaseWaveformTab):
         self.btn_regen_channel = QPushButton("重生成信道")
         self.btn_ofdm = QPushButton("OFDM")
         self.btn_otfs = QPushButton("OTFS")
-        for btn in (self.btn_apply_best, self.btn_regen_channel, self.btn_ofdm, self.btn_otfs):
+        for index, btn in enumerate((self.btn_apply_best, self.btn_regen_channel, self.btn_ofdm, self.btn_otfs)):
             btn.setMinimumHeight(28)
-            quick_layout.addWidget(btn)
+            quick_layout.addWidget(btn, index // 2, index % 2)
 
         # 高级参数模块已移除。搜索步长、随机种子和相干参数仍保留为内部配置，
         # 由既有默认值驱动，避免破坏后端兼容性。
 
         # --- 自适应控制（左栏） ---
         self.adaptive_controls = AdaptiveControlBox()
+        self.adaptive_controls.layout().setRowWrapPolicy(QFormLayout.WrapLongRows)
+        compact_labels = {
+            "优化/采样间隔": "评估/采样",
+            "粗/细搜索步长": "粗/细步长",
+            "稳定次数/最小增益": "稳定次数/增益",
+        }
+        for label in self.adaptive_controls.findChildren(QLabel):
+            if label.text() in compact_labels:
+                label.setToolTip(label.text())
+                label.setText(compact_labels[label.text()])
+        self.channel_combo.setMinimumContentsLength(13)
+        self.channel_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.controls_panel.setMinimumWidth(360)
 
-        for group in (idx_group, frame_group, ch_group, self.adaptive_controls,
-                      quick_group):
-            self.param_layout.addWidget(group)
+        # Keep the short operating rail visible while the parameter pages
+        # scroll independently.  The previous nested "basic parameters" group
+        # placed every setting above the start/stop buttons.
+        self.param_group.hide()
+        self.parameter_tabs = QTabWidget()
+        self.parameter_tabs.setDocumentMode(True)
+        for title, groups in (
+            ("常用", (idx_group, frame_group, quick_group)),
+            ("信道", (ch_group,)),
+            ("自适应", (self.adaptive_controls,)),
+            ("统计", (stat_group,)),
+        ):
+            content = QWidget()
+            content_layout = QVBoxLayout(content)
+            content_layout.setContentsMargins(4, 6, 4, 6)
+            content_layout.setSpacing(8)
+            for group in groups:
+                content_layout.addWidget(group)
+            content_layout.addStretch(1)
+            page = QScrollArea()
+            page.setWidgetResizable(True)
+            page.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            page.setWidget(content)
+            self.parameter_tabs.addTab(page, title)
+
+        self.controls_scroll.hide()
+        self.controls_rail_layout.addWidget(self.parameter_tabs, 1)
+
     def _connect_fdidm_signals(self):
         self.btn_start.clicked.connect(self._on_start_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
@@ -498,7 +543,8 @@ class FDIDMTab(BaseWaveformTab):
 
         self.ber_plot.clear()
         try:
-            self.ber_plot.addLegend(offset=(8, 8))
+            self.ber_plot.addLegend(offset=(4, 4), colCount=4, horSpacing=4,
+                                    verSpacing=-3, labelTextSize="8pt")
         except Exception:
             pass
         self.ber_plot.setTitle("SER vs α for β=0:0.2:2")
@@ -519,13 +565,28 @@ class FDIDMTab(BaseWaveformTab):
         self.ber_snr_plot.setYRange(*self.SER_Y_RANGE, padding=0)
         self.ber_snr_plot.enableAutoRange(axis="x", enable=False)
         self.ber_snr_plot.enableAutoRange(axis="y", enable=False)
-        self.ber_snr_plot.addLegend(offset=(8, 8))
+        self.ber_snr_plot.addLegend(offset=(4, 4), colCount=2, horSpacing=8,
+                                   verSpacing=-3)
         self._time_metric_curves = {}
         self._time_switch_labels = []
         self._time_switch_rendered = 0
         self._time_plot_eval_count = -1
         self._time_plot_x_view = None
         self._time_plot_y_fit = None
+
+    @staticmethod
+    def _compact_plot_legend(plot):
+        """Keep every series key visible in the smallest supported plot."""
+        legend = plot.getPlotItem().legend
+        if legend is None:
+            return
+        legend.layout.setContentsMargins(3, 3, 3, 3)
+        for _, label in legend.items:
+            # QGraphicsTextItem defaults to a four-pixel document margin on
+            # every side, which otherwise makes the 11 beta keys too tall.
+            label.item.document().setDocumentMargin(0)
+            label.updateMin()
+        legend.updateSize()
 
     # ------------------------------------------------------------------
     # Backend construction and updates
@@ -829,6 +890,9 @@ class FDIDMTab(BaseWaveformTab):
         schedules a fresh workflow:
             current H_tf -> theory search alpha*/beta* -> redraw SER-SNR curves.
         """
+        if self._tasks_suspended:
+            self._refresh_on_resume = True
+            return
         if not hasattr(self, "_auto_refresh_timer"):
             return
         self._auto_scan_reason = str(reason)
@@ -869,6 +933,9 @@ class FDIDMTab(BaseWaveformTab):
 
     def _start_auto_ser_snr_refresh(self):
         """Start a new automatic refresh using independent search/plot workers."""
+        if self._tasks_suspended:
+            self._refresh_on_resume = True
+            return
         try:
             base_kwargs = self._backend_kwargs()
             alpha_sweep_frames = int(self.alpha_mc_frames_spin.value())
@@ -918,7 +985,7 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_beta_data.clear()
         self._ser_snr_curves.clear()
         self._ser_snr_data.clear()
-        self.adaptive_plots.set_snr_title("SER-SNR 性能对比（等待动态参数搜索）")
+        self.adaptive_plots.set_snr_title("共享信道 SER-SNR（等待搜索）")
 
         dyn_mode = str(base_kwargs.get("channel_dynamics", "fixed"))
         dyn_note = (
@@ -1038,8 +1105,9 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_active_token = int(token)
         self._snr_active_token = int(token)
 
-        self.adaptive_plots.set_snr_title(
-            "共享信道稀疏LMMSE SER-SNR（FDIDM每个SNR独立优化α/β）"
+        self.adaptive_plots.set_snr_title("共享信道 LMMSE SER-SNR")
+        self.adaptive_plots.snr_plot.setToolTip(
+            "四波形使用同一固定物理信道，采用稀疏 LMMSE 检测；FDIDM 在每个 SNR 点独立优化 α/β。"
         )
 
         self._alpha_thread = threading.Thread(
@@ -1194,17 +1262,19 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_beta_curves.clear()
         self._alpha_beta_data.clear()
         try:
-            self.ber_plot.addLegend(offset=(8, 8))
+            self.ber_plot.addLegend(offset=(4, 4), colCount=4, horSpacing=4,
+                                    verSpacing=-3, labelTextSize="8pt")
         except Exception:
             pass
         self.ber_plot.setLogMode(y=True)
         mode = str(alpha_curve_mode or self._selected_alpha_curve_mode())
-        ylabel = "ZF Theory SER" if mode == "theory" else "Measured SER"
-        title = "ZF Theory SER vs α for β=0:0.2:2" if mode == "theory" else "Monte-Carlo SER vs α for β=0:0.2:2"
+        ylabel = "LMMSE SER" if mode == "theory" else "Measured SER"
+        title = "LMMSE SER vs α" if mode == "theory" else "Monte-Carlo SER vs α"
         floor = self._current_alpha_ser_floor() if floor is None else float(floor)
         self.ber_plot.setLabel("bottom", "α")
         self.ber_plot.setLabel("left", ylabel)
-        self.ber_plot.setTitle(f"{title} (display floor={floor:.2e})")
+        self.ber_plot.setTitle(title)
+        self.ber_plot.setToolTip(f"β=0:0.2:2；α 步长 0.1；显示下限 {floor:.2e}。")
         # Log-axis lower limit follows the same rule-of-three floor rather than
         # a hard-coded 1e-12.  Values below the floor are plotted at the floor.
         ymin_exp = float(np.floor(np.log10(max(floor, 1e-300))))
@@ -1220,6 +1290,13 @@ class FDIDMTab(BaseWaveformTab):
     def _on_qt_destroyed(self, *_args):
         """Stop background work when the Qt object is being destroyed."""
         self._qt_alive = False
+        for name in ("_auto_refresh_timer", "_initial_refresh_timer", "update_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
         try:
             self.adaptive_timer.stop()
         except Exception:
@@ -1275,6 +1352,30 @@ class FDIDMTab(BaseWaveformTab):
         self.btn_auto_ber_snr.setEnabled(True)
         self.update_info_panel(status_text="已停止当前自动刷新。后续参数更新会再次自动触发搜索、左下角α-SER与自适应过程页SER-SNR绘制。")
 
+    def suspend_tasks(self):
+        self._refresh_on_resume = (
+            self._auto_refresh_timer.isActive()
+            or self._initial_refresh_timer.isActive()
+            or self._search_active_token is not None
+            or self._alpha_active_token is not None
+            or self._snr_active_token is not None
+            or self._last_search_result is None
+        )
+        self._tasks_suspended = True
+        self._initial_refresh_timer.stop()
+        self._auto_refresh_timer.stop()
+        self.adaptive_timer.stop()
+        self._stop_ser_snr_sweep()
+        self._on_stop_clicked()
+        super().suspend_tasks()
+
+    def resume_tasks(self):
+        super().resume_tasks()
+        self.adaptive_timer.start()
+        if getattr(self, "_refresh_on_resume", False):
+            self._refresh_on_resume = False
+            self._schedule_auto_ser_snr("返回仿真页面")
+
     def _on_search_finished(self, token, result):
         if int(token) != int(self._auto_scan_token):
             return
@@ -1304,7 +1405,7 @@ class FDIDMTab(BaseWaveformTab):
         if self.status_text_label is not None:
             old = self.status_text_label.text()
             self.status_text_label.setText(
-                old + f"\n\n自动刷新{reason}：左下角α-SER与自适应过程页SER-SNR采用独立线程绘制，曲线已按当前token更新。"
+                old + f"\n\n自动刷新{reason}：α-SER 与 SER-SNR 曲线已按当前参数更新。"
             )
 
     @staticmethod
@@ -1475,7 +1576,8 @@ class FDIDMTab(BaseWaveformTab):
             "AFDM": ((119, 172, 48), "t"),
             "FDIDM": ((126, 47, 142), "d"),
         }
-        self.ber_snr_plot.setTitle("共享动态信道实时SER（显示降采样 + log-EMA）")
+        self.ber_snr_plot.setTitle("共享动态信道实时 SER")
+        self.ber_snr_plot.setToolTip("四波形共享动态信道；曲线按显示周期采样并采用 log-EMA 平滑。")
         plotted = {}
         for name, values in series.items():
             y = np.asarray([
@@ -1503,6 +1605,7 @@ class FDIDMTab(BaseWaveformTab):
                     symbolPen=pen, symbolBrush="w", name=name,
                 )
                 self._time_metric_curves[name] = curve
+                self._compact_plot_legend(self.ber_snr_plot)
             curve.setData(x, y)
 
         window = float(self.TIME_WINDOW_SEC)
@@ -1669,6 +1772,7 @@ class FDIDMTab(BaseWaveformTab):
             )
             self._alpha_beta_curves[name] = curve
             self._alpha_beta_data[name] = ([], [])
+            self._compact_plot_legend(self.ber_plot)
 
         x, y = self._alpha_beta_data.setdefault(name, ([], []))
         floor = float(ser_floor)
@@ -1694,9 +1798,10 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_active_token = None
         ctx = self._refresh_context_by_token.get(int(token), {})
         mode = str(ctx.get("alpha_curve_mode", self._selected_alpha_curve_mode()))
-        title = "ZF/MMSE Theory SER" if mode == "theory" else "Monte-Carlo SER"
+        title = "LMMSE SER" if mode == "theory" else "Monte-Carlo SER"
         floor = float(self._alpha_ser_floor_by_token.get(int(token), self._current_alpha_ser_floor()))
-        self.ber_plot.setTitle(f"{title} vs α for β=0:0.2:2 ({reason}, α step=0.1, display floor={floor:.2e})")
+        self.ber_plot.setTitle(f"{title} vs α")
+        self.ber_plot.setToolTip(f"β=0:0.2:2；{reason}；α 步长 0.1；显示下限 {floor:.2e}。")
         self._maybe_finish_auto_refresh(int(token), str(reason))
 
     def _on_ser_snr_point(self, token, name, snr, ser, alpha, beta):
@@ -1710,7 +1815,10 @@ class FDIDMTab(BaseWaveformTab):
         if int(token) != int(self._auto_scan_token):
             return
         self._snr_active_token = None
-        self.adaptive_plots.set_snr_title(f"SER-SNR 性能对比（{reason}）")
+        self.adaptive_plots.set_snr_title("共享信道 LMMSE SER-SNR")
+        self.adaptive_plots.snr_plot.setToolTip(
+            f"四波形共享固定信道，FDIDM 在每个 SNR 点独立优化 α/β。扫描状态：{reason}"
+        )
         self._maybe_finish_auto_refresh(int(token), str(reason))
 
     # ------------------------------------------------------------------
@@ -1767,9 +1875,10 @@ class FDIDMTab(BaseWaveformTab):
                 metrics = {}
             mode = str(summary.get("channel_dynamics", self._selected_channel_dynamics()))
             frame = int(metrics.get("frames", 0))
-            self.spectrum_plot.setTitle(
-                f"LEO Delay-Doppler：{summary.get('channel_model', '--')} / "
-                f"{mode}；seed={summary.get('seed', '--')}；frame={frame}"
+            self.spectrum_plot.setTitle("LEO Delay-Doppler Paths")
+            self.spectrum_plot.setToolTip(
+                f"模型：{summary.get('channel_model', '--')}；模式：{mode}；"
+                f"seed={summary.get('seed', '--')}；frame={frame}"
             )
         except Exception:
             pass
@@ -1887,8 +1996,4 @@ class FDIDMTab(BaseWaveformTab):
             )
 
     def closeEvent(self, event):
-        try:
-            self._stop_ser_snr_sweep()
-            self._on_stop_clicked()
-        finally:
-            super().closeEvent(event)
+        super().closeEvent(event)

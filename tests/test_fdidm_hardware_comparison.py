@@ -1,8 +1,4 @@
-"""离屏验证 FDIDM 硬件优势观测面板（替代旧的定时对比会话测试）。
-
-覆盖 spec：AC1 面板初始化与配对统计、AC2 异常窗口剔除显示、AC4 时间轴与
-状态行、AC6 live 路径无 stop/start、AC8 导出报告。不依赖 USRP / GNU Radio。
-"""
+"""离屏验证硬件自动图表会话、窗口统计与安全状态；不连接 USRP。"""
 import json
 import os
 import numpy as np
@@ -15,7 +11,7 @@ pytest.importorskip("PyQt5")
 pytest.importorskip("pyqtgraph")
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QFileDialog
+from PyQt5.QtWidgets import QApplication, QFileDialog, QGroupBox, QPushButton
 import pyqtgraph as pg
 
 from waveform_sim.ui.fdidm_hardware_test_tab import FDIDMHardwareTestTab
@@ -66,6 +62,15 @@ class FakeBackend:
 
     def get_decode_stats(self):
         return {"match_ratio": 0.9, "decode_ok": True}
+
+    def get_rx_spectrum_source(self, _count, **_kwargs):
+        return np.ones(128, dtype=np.complex128)
+
+    def get_rx_constellation(self, _count, **_kwargs):
+        return np.array([1 + 1j, -1 - 1j])
+
+    def get_rx_text(self):
+        return "FDIDM OK"
 
 
 def make_status(frames, ok, ser=0.05, evm=8.0, overflow=0, alpha=0.5, beta=1.0,
@@ -150,7 +155,7 @@ def feed(tab, clock, n, ser, evm=8.0, overflow_step=0, alpha=0.5, beta=1.0,
 
 def test_timeline_only_adds_new_frames_and_masks_invalid_evm(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     try:
         first = make_status(1, 1, ser=0.1, evm=8.0)
         clock.advance()
@@ -171,7 +176,7 @@ def test_timeline_only_adds_new_frames_and_masks_invalid_evm(app):
 def test_effect_bars_keep_evm_when_exact_ser_is_zero(app):
     """A clean zero-error link must not hide an otherwise valid EVM result."""
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     try:
         feed(tab, clock, 40, ser=0.0, evm=8.0)
         tab.adaptive_enable_check.setChecked(True)
@@ -196,7 +201,7 @@ def test_effect_bars_keep_evm_when_exact_ser_is_zero(app):
 def test_effect_bars_mark_non_normalisable_zero_ser_baseline(app):
     """A zero OFF baseline plus ON errors is shown as unavailable, never 100%."""
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     try:
         feed(tab, clock, 40, ser=0.0, evm=8.0)
         tab.adaptive_enable_check.setChecked(True)
@@ -220,7 +225,7 @@ def test_effect_bars_mark_non_normalisable_zero_ser_baseline(app):
 def test_effect_plot_has_no_event_overlay_and_plot_ranges_are_independent(app):
     """The categorical result must stay overlay-free and own its zoom state."""
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     try:
         feed(tab, clock, 40, ser=0.05, evm=8.0)
         tab.adaptive_enable_check.setChecked(True)
@@ -260,16 +265,25 @@ def test_effect_plot_has_no_event_overlay_and_plot_ranges_are_independent(app):
         tab._on_stop_test_clicked()
 
 
-def test_observation_controls_default_state(app):
+def test_top_observation_overview_and_report_controls_are_really_removed(app):
     tab = FDIDMHardwareTestTab()
-    assert not tab.btn_start_observation.isEnabled()
-    assert not tab.btn_stop_observation.isEnabled()
-    assert not tab.btn_export_observation.isEnabled()
-    assert tab.btn_start_observation.text() == "重新开始观测"
-    # 旧定时对比控件已彻底删除（F7）
-    assert not hasattr(tab, "btn_start_comparison")
-    assert not hasattr(tab, "comparison_session")
-    assert "自动记录" in tab.observation_state_label.text()
+    for name in (
+        "comparison_result_group", "btn_start_observation", "btn_stop_observation",
+        "btn_export_observation", "observation_before_label", "observation_after_label",
+        "observation_improvement_label", "observation_badge_label", "observation_evm_label",
+        "observation_note_label", "observation_state_label", "btn_start_comparison",
+        "comparison_session", "_start_observation_clicked", "_stop_observation_clicked",
+        "_export_observation_clicked", "_set_observation_note", "_observation_context",
+    ):
+        assert not hasattr(tab, name), name
+    # Check the widget tree too: hiding the old controls is not removal.
+    assert not any(group.title().startswith("优势观测（") for group in tab.findChildren(QGroupBox))
+    assert not any(any(word in button.text() for word in ("重新开始观测", "停止观测", "导出观测"))
+                   for button in tab.findChildren(QPushButton))
+    assert tab.plot_tabs.count() == 2
+    assert tab.observation_stats_group.parent() is tab.observation_stats_cell
+    assert not tab.observer.active
+    tab.close()
 
 
 def test_hardware_start_automatically_starts_observation_and_stop_preserves_it(app):
@@ -279,14 +293,13 @@ def test_hardware_start_automatically_starts_observation_and_stop_preserves_it(a
     try:
         assert tab.test_running
         assert tab.observer.active
-        assert tab.btn_start_observation.isEnabled()
-        assert tab.btn_stop_observation.isEnabled()
-        assert any("自动开始" in line for line in tab._ui_log_entries)
+        assert tab.backend.start_calls == 1
+        assert tab.update_timer.isActive()
     finally:
         tab._on_stop_test_clicked()
     assert not tab.observer.active
-    assert not tab.btn_start_observation.isEnabled()
-    assert not tab.btn_stop_observation.isEnabled()
+    assert not tab.update_timer.isActive()
+    assert tab.backend.stop_calls == 1
 
 
 def test_live_parameter_error_stops_backend_and_restores_controls(app):
@@ -339,24 +352,29 @@ def test_automatic_end_to_end_observation_needs_no_extra_start_click(app):
     pair = tab.observer.latest_pair()
     assert pair is not None and pair.outcome == "improved"
     assert len(tab.observer.windows()) == 2
-    assert tab.btn_export_observation.isEnabled()
+    assert not tab.observer.active
+    assert "结论 improved" in tab.observation_stats_label.text()
 
 
-def test_restart_observation_clears_old_windows(app):
+def test_hardware_restart_begins_a_fresh_chart_session(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 20, ser=0.05)
-    tab._stop_observation_clicked()
+    tab._on_stop_test_clicked()
     assert tab.observer.windows()
-    tab._start_observation_clicked()
-    assert tab.observer.active
-    assert tab.observer.windows() == []
-    assert tab.observer.events() == []
+    tab._on_start_test_clicked()
+    try:
+        assert tab.observer.active
+        assert tab.observer.windows() == []
+        assert tab.observer.events() == []
+        assert not tab._obs_t
+    finally:
+        tab.suspend_tasks()
 
 
 def test_live_toggle_pending_is_initialized_and_keeps_runtime_curve(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     tab._update_evm_plot(7.0)
     before = list(tab._evm_history)
     tab.adaptive_enable_check.setChecked(True)
@@ -378,7 +396,7 @@ def test_toggle_feedback_is_truthful_when_observation_is_inactive(app):
 
 def test_observation_pair_updates_panel_and_timeline(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.05, evm=8.0)
     tab.adaptive_enable_check.setChecked(True)  # 评审手动开关 → 事件
     feed(tab, clock, 40, ser=0.01, evm=6.0, alpha=0.75, beta=0.8)
@@ -387,20 +405,17 @@ def test_observation_pair_updates_panel_and_timeline(app):
     pair = tab.observer.latest_pair()
     assert pair is not None and pair.comparable
     assert pair.outcome == "improved"
-    assert "实测优势" in tab.observation_improvement_label.text()
     # v2：两页签各四宫格；观测页统计表出现窗口汇总行（AC6/AC7）
     assert tab.plot_tabs.count() == 2
     assert "固定基线" in tab.observation_stats_label.text()
-    assert "可信" in tab.observation_badge_label.text()
-    assert "精确计数" in tab.observation_badge_label.text()
-    assert "EVM" in tab.observation_evm_label.text()
-    assert "解调误差 EVM" in tab.observation_evm_label.toolTip()
     stats_text = tab.observation_stats_label.text()
-    assert "CRC" in stats_text
+    assert "结论 improved" in stats_text
+    assert "精确" in stats_text and "95%区间" in stats_text
+    assert "CRC" in stats_text and "数据EVM" in stats_text
     assert "raw/FEC BER" in tab.observation_stats_label.toolTip()
     assert "PAPR" not in stats_text and "合同" not in stats_text
     assert "contract=common-rms" in tab.observation_stats_label.toolTip()
-    assert "SER" in tab.observation_before_label.text()
+    assert "SER" in stats_text
     # 时间轴：曲线有数据 + 一条开关事件竖线（AC4）
     assert tab.timeline_ser_curve.xData is not None and len(tab.timeline_ser_curve.xData) > 0
     assert len(tab._timeline_event_items) == 1
@@ -410,13 +425,17 @@ def test_observation_pair_updates_panel_and_timeline(app):
 
 def test_observation_does_not_claim_candidate_before_waveform_switch(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.05)
     tab.adaptive_enable_check.setChecked(True)
     feed(tab, clock, 40, ser=0.05)
     tab._update_observation_display()
-    assert "无结论" in tab.observation_improvement_label.text()
-    assert "未切换候选波形" in tab.observation_improvement_label.text()
+    pair = tab.observer.latest_pair()
+    assert pair is not None and pair.outcome == "inconclusive"
+    assert pair.before.alpha_mean == pytest.approx(pair.after.alpha_mean)
+    assert pair.before.beta_mean == pytest.approx(pair.after.beta_mean)
+    assert "confidence intervals overlap" in pair.validation_reason
+    assert "结论 inconclusive" in tab.observation_stats_label.text()
 
 
 def test_waiting_channel_status_gives_actionable_rf_hint(app):
@@ -430,30 +449,34 @@ def test_waiting_channel_status_gives_actionable_rf_hint(app):
 
 def test_anomaly_window_excluded_shown_in_panel(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 20, ser=0.05)
     feed(tab, clock, 10, ser=0.05, overflow_step=1)  # 1/3 采样带 overflow → 整窗剔除
     tab.adaptive_enable_check.setChecked(True)
     feed(tab, clock, 20, ser=0.01, evm=6.0)
     tab._update_observation_display()
     # 剔除数在面板可见（AC2）
-    assert "剔除 1 个异常窗口" in tab.observation_state_label.text()
+    assert tab.observer.excluded_window_count() == 1
+    assert "已剔除" in tab.observation_stats_label.text()
     assert len(tab._timeline_anomaly_items) >= 1  # 时间轴异常剔除阴影（AC4）
     # 关闭期窗口被剔除，不得伪造结论（AC2/AC5）
     assert tab.observer.latest_pair() is None
-    assert "—" in tab.observation_improvement_label.text()
+    assert "结论 improved" not in tab.observation_stats_label.text()
 
 
-def test_insufficient_samples_do_not_form_conclusion(app):
+def test_insufficient_valid_frames_do_not_form_conclusion(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.05)
     tab.adaptive_enable_check.setChecked(True)
-    feed(tab, clock, 40, ser=1e-5, evm=6.0)  # 开启段错误符号数 <10
+    feed(tab, clock, 20, ser=1e-5, evm=6.0)  # 去除切换瞬态后少于24帧
     tab._update_observation_display()
-    assert "样本不足" in tab.observation_improvement_label.text()
-    assert "dB" not in tab.observation_improvement_label.text()
-    assert "样本不足" in tab.observation_badge_label.text()
+    pair = tab.observer.latest_pair()
+    assert pair is not None and pair.outcome == "inconclusive"
+    assert pair.after.frames < 24
+    assert "insufficient valid frames" in pair.validation_reason
+    assert "结论 inconclusive" in tab.observation_stats_label.text()
+    assert "95%区间" in tab.observation_stats_label.text()
 
 
 def test_adaptive_state_row_shows_observability(app):
@@ -486,7 +509,7 @@ def test_idle_validation_does_not_hide_optimizer_state(app):
     assert "optimizing" in tab.adaptive_state_label.toolTip()
 
 
-def test_advantage_cards_use_exact_backend_validation_windows(app):
+def test_window_summary_uses_exact_backend_validation_windows(app):
     tab = FDIDMHardwareTestTab()
     status = make_status(48, 42)
     status.update({
@@ -511,11 +534,12 @@ def test_advantage_cards_use_exact_backend_validation_windows(app):
         },
     })
     tab._update_observation_display(status)
-    assert "0.00/0.00" in tab.observation_before_label.toolTip()
-    assert "0.75/0.80" in tab.observation_after_label.toolTip()
-    assert "12.00% → 6.00%" in tab.observation_evm_label.text()
-    assert "320/4000" in tab.observation_badge_label.toolTip()
-    assert "320/4000" in tab.observation_stats_label.text()
+    summary = tab.observation_stats_label.text()
+    assert "验证 OFF" in summary and "验证 ON" in summary
+    assert "320/4000" in summary and "20/2000" in summary
+    assert "数据EVM 12.00%" in summary and "数据EVM 6.00%" in summary
+    assert "contract=txp-test" in tab.observation_stats_label.toolTip()
+    assert "采集 ON 候选" in tab.adaptive_state_label.text()
 
 
 def test_no_reliable_preamble_is_not_presented_as_an_evm_measurement(app):
@@ -626,9 +650,11 @@ def test_evm_only_improvement_cannot_be_rendered_as_gmi_advantage(app):
         },
     }
     tab._update_observation_display(status)
-    assert "保持当前" in tab.observation_badge_label.text()
-    assert "GMI" in tab.observation_improvement_label.text()
-    assert "EVM 改善" not in tab.observation_improvement_label.text()
+    assert "GMI" in tab.adaptive_state_label.text()
+    assert "净增益下界 0" in tab.adaptive_state_label.text()
+    assert "gain_lower=0" in tab.adaptive_state_label.toolTip()
+    assert "threshold=0.01" in tab.adaptive_state_label.toolTip()
+    assert "EVM 改善" not in tab.adaptive_state_label.text()
 
 
 def test_antenna_preset_is_explicit_and_only_available_for_b210(app):
@@ -671,7 +697,7 @@ def test_ui_does_not_apply_a_new_candidate_while_validation_is_active(app):
     tab, _clock = make_tab(app)
     tab.adaptive_enable_check.setChecked(True)
     calls = []
-    tab.backend.apply_alpha_beta_candidate = lambda *args, **kwargs: calls.append((args, kwargs))
+    tab.backend.apply_gmi_candidate = lambda: calls.append(True)
     status = make_status(10, 8)
     status.update({
         "adaptive_alpha_beta_enabled": True,
@@ -680,18 +706,23 @@ def test_ui_does_not_apply_a_new_candidate_while_validation_is_active(app):
         "adaptive_recommended_alpha": 0.75,
         "adaptive_recommended_beta": 0.80,
         "adaptive_predicted_improvement_db": 2.0,
-        "adaptive_validation_state": "baseline_collecting",
+        "adaptive_validation_state": "a1_collecting",
+        "gmi_adaptation": {
+            "enabled": True, "state": "candidate_ready", "receiver_mode": "diagonal",
+            "candidate_alpha": 0.75, "candidate_beta": 0.8, "sequence": 3,
+            "gain_lower_nats": 0.03, "threshold_nats": 0.01, "switch_allowed": True,
+        },
     })
     tab._handle_alpha_beta_adaptation(status)
     assert calls == []
-    assert "真实链路验证" in tab.adaptive_status_label.text()
+    assert "A-B-B-A 真链路验证" in tab.adaptive_status_label.text()
 
 
-@pytest.mark.parametrize("state", ["rollback_applying", "rollback_failed"])
+@pytest.mark.parametrize("state", ["rollback_applying", "rollback_failed", "aborted"])
 def test_ui_never_applies_a_candidate_during_rollback(app, state):
     tab, _clock = make_tab(app)
     calls = []
-    tab.backend.apply_alpha_beta_candidate = lambda *args, **kwargs: calls.append((args, kwargs))
+    tab.backend.apply_gmi_candidate = lambda: calls.append(True)
     status = make_status(10, 8)
     status.update({
         "adaptive_alpha_beta_enabled": True,
@@ -699,13 +730,27 @@ def test_ui_never_applies_a_candidate_during_rollback(app, state):
         "adaptive_recommendation_seq": 3,
         "adaptive_recommended_alpha": 0.75,
         "adaptive_recommended_beta": 0.8,
-        "adaptive_validation_state": state,
+        # The detailed transaction wins over a lagging flat status field.
+        "adaptive_validation_state": "idle",
+        "adaptive_validation": {"state": state, "result_reason": "baseline not restored"},
+        "gmi_adaptation": {
+            "enabled": True, "state": "candidate_ready", "receiver_mode": "diagonal",
+            "candidate_alpha": 0.75, "candidate_beta": 0.8, "sequence": 3,
+            "gain_lower_nats": 0.03, "threshold_nats": 0.01, "switch_allowed": True,
+        },
     })
     tab._handle_alpha_beta_adaptation(status)
     assert calls == []
+    tab._update_observation_display(status)
+    if state == "rollback_failed":
+        assert "请立即停止测试" in tab.adaptive_state_label.text()
+        assert "#a33b3b" in tab.adaptive_state_label.styleSheet()
+    if state == "aborted":
+        assert "未确认回滚" in tab.adaptive_state_label.text()
+        assert "#a33b3b" in tab.adaptive_state_label.styleSheet()
 
 
-def test_advantage_conclusion_distinguishes_evm_only_and_rollback_failure(app):
+def test_validation_summary_keeps_measurements_and_critical_stop_warnings(app):
     tab = FDIDMHardwareTestTab()
     status = make_status(48, 42)
     validation = {
@@ -717,13 +762,14 @@ def test_advantage_conclusion_distinguishes_evm_only_and_rollback_failure(app):
         "candidate_beta": 0.8,
         "result_reason": "candidate EVM improvement is statistically supported without SER regression",
         "measured": {"measured_ser_gain_db": 0.0, "evm_delta_pp": -3.5},
-        "baseline_window": {"valid_frames": 64},
-        "candidate_window": {"valid_frames": 64},
+        "baseline_window": {"valid_frames": 64, "data_aided_evm_mean": 10.0},
+        "candidate_window": {"valid_frames": 64, "data_aided_evm_mean": 6.5},
     }
     status.update({"adaptive_validation_state": "improved", "adaptive_validation": validation})
     tab._update_observation_display(status)
-    assert "EVM 改善 3.50 pp" in tab.observation_improvement_label.text()
-    assert "SER 改善" not in tab.observation_improvement_label.text()
+    assert "数据EVM 10.00%" in tab.observation_stats_label.text()
+    assert "数据EVM 6.50%" in tab.observation_stats_label.text()
+    assert validation["result_reason"] in tab.observation_stats_label.text()
 
     validation["result_reason"] = "candidate SER improvement is statistically supported"
     validation["measured"] = {
@@ -732,15 +778,16 @@ def test_advantage_conclusion_distinguishes_evm_only_and_rollback_failure(app):
         "evm_delta_pp": -3.5,
     }
     tab._update_observation_display(status)
-    assert "SER ≥5.28 dB" in tab.observation_improvement_label.text()
-    assert "置信区间下界" in tab.observation_improvement_label.toolTip()
+    assert validation["result_reason"] in tab.observation_stats_label.text()
 
     validation["state"] = "rollback_failed"
     validation["outcome"] = "regressed"
     status["adaptive_validation_state"] = "rollback_failed"
     tab._update_observation_display(status)
-    assert "回滚失败" in tab.observation_improvement_label.text()
-    assert "已安全回滚" not in tab.observation_improvement_label.text()
+    assert "回滚失败" in tab.adaptive_state_label.text()
+    assert "请立即停止测试" in tab.adaptive_state_label.text()
+    assert "#a33b3b" in tab.adaptive_state_label.styleSheet()
+    assert "已安全回滚" not in tab.adaptive_state_label.text()
 
     validation["state"] = validation["outcome"] = "aborted"
     validation["result_reason"] = "validation aborted; baseline was not restored"
@@ -748,30 +795,27 @@ def test_advantage_conclusion_distinguishes_evm_only_and_rollback_failure(app):
     status["adaptive_alpha_beta_enabled"] = False
     tab._update_adaptive_state_row(status)
     tab._update_observation_display(status)
-    assert "未确认回滚" in tab.observation_improvement_label.text()
+    assert "未确认回滚" in tab.adaptive_state_label.text()
     assert "验证中断" in tab.adaptive_state_label.text()
-    assert "已回滚基线" not in tab.observation_improvement_label.text()
+    assert "#a33b3b" in tab.adaptive_state_label.styleSheet()
+    assert "已回滚基线" not in tab.adaptive_state_label.text()
 
     validation["state"] = validation["outcome"] = "inconclusive"
     validation["result_reason"] = "pilot fit changed between A/B windows; RF channel is not stationary"
     status["adaptive_validation_state"] = "inconclusive"
     tab._update_observation_display(status)
-    assert "导频条件变化" in tab.observation_improvement_label.text()
-    assert "无法归因" in tab.observation_improvement_label.text()
+    assert "暂不可归因" in tab.adaptive_state_label.text()
+    assert validation["result_reason"] in tab.observation_stats_label.text()
 
 
-def test_export_writes_json_report(app, tmp_path, monkeypatch):
+def test_offline_observer_report_still_preserves_evidence(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.05)
     tab.adaptive_enable_check.setChecked(True)
     feed(tab, clock, 40, ser=0.01, evm=6.0)
-    out = tmp_path / "advantage_report.json"
-    monkeypatch.setattr(QFileDialog, "getSaveFileName",
-                        lambda *a, **k: (str(out), ""))
-    tab._export_observation_clicked()
-    assert out.exists()
-    data = json.loads(out.read_text(encoding="utf-8"))
+    # The offline engine remains usable without a dedicated report UI.
+    data = json.loads(json.dumps(tab.observer.to_export_dict()))
     assert data["schema_version"] == 3
     assert data["windows"] and data["toggle_events"]
     assert "anomaly_drops" in data
@@ -779,6 +823,50 @@ def test_export_writes_json_report(app, tmp_path, monkeypatch):
     assert data["objective"] == "legacy_ser"
     assert data["comparability"]["comparable"] is False
     assert data["legacy_ser"]["diagnostic_only"] is True
+
+
+def test_refresh_uses_one_snapshot_and_applies_gmi_without_report_ui(app, monkeypatch):
+    tab, clock = make_tab(app)
+    backend = tab.backend
+    reads = []
+    applied = []
+
+    def forbid_report(*_args, **_kwargs):
+        raise AssertionError("Hardware chart sessions must not call report logic")
+
+    monkeypatch.setattr(tab.observer, "to_export_dict", forbid_report)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", forbid_report)
+    tab._on_start_test_clicked()
+    assert tab.test_running and tab.observer.active
+    backend.frames = backend.ok = 2
+    status = make_status(2, 2)
+    status["gmi_adaptation"] = {
+        "enabled": True, "state": "candidate_ready", "receiver_mode": "diagonal",
+        "resource_id": "common-resource", "current_token_id": "a", "candidate_token_id": "b",
+        "candidate_alpha": 0.75, "candidate_beta": 0.8, "sequence": 1,
+        "gain_lower_nats": 0.03, "threshold_nats": 0.01, "switch_allowed": True,
+    }
+
+    def read_status():
+        reads.append(True)
+        return status
+
+    monkeypatch.setattr(backend, "get_status", read_status)
+    backend.apply_gmi_candidate = lambda: applied.append(True)
+    clock.advance()
+    tab._refresh_plots()
+    assert reads == [True]
+    assert applied == [True]
+    assert len(tab._obs_t) == 1
+    assert tab.timeline_ser_curve.xData is not None
+    assert len(tab.timeline_ser_curve.xData) == 1
+    assert tab.rx_curve.xData is not None and len(tab.rx_curve.xData) > 0
+    assert "GMI" in tab.adaptive_state_label.text()
+    assert not any("刷新失败" in line for line in tab._ui_log_entries)
+    tab._on_stop_test_clicked(preserve_plots=True)
+    assert not tab.test_running and not tab.observer.active
+    tab.suspend_tasks()
+    assert tab.backend is None
 
 
 def test_gmi_export_groups_theory_selection_and_hardware_validation():
@@ -847,23 +935,25 @@ def test_gmi_export_rejects_resource_or_receiver_mismatch():
     assert "resource_id mismatch" in report["comparability"]["reason"]
 
 
-def test_stop_observation_keeps_results(app):
+def test_hardware_suspend_stops_chart_session_and_keeps_results(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.05)
     tab.adaptive_enable_check.setChecked(True)
     feed(tab, clock, 40, ser=0.01, evm=6.0)
-    tab._stop_observation_clicked()
+    tab.suspend_tasks()
     assert not tab.observer.active
-    assert tab.btn_start_observation.isEnabled()
-    assert tab.btn_export_observation.isEnabled()
+    assert tab.backend is None
+    assert not tab.update_timer.isActive()
     tab._update_observation_display()
-    assert "实测优势" in tab.observation_improvement_label.text()  # 结果保留可查看
+    assert tab.observer.latest_pair().outcome == "improved"
+    assert "结论 improved" in tab.observation_stats_label.text()
+    assert len(tab.timeline_ser_curve.xData) > 0
 
 
 def test_power_mismatch_can_never_render_green_advantage(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.05, contract_id="baseline", tx_rms=0.20)
     tab.adaptive_enable_check.setChecked(True)
     feed(tab, clock, 40, ser=0.01, evm=6.0, contract_id="candidate", tx_rms=0.10)
@@ -871,22 +961,25 @@ def test_power_mismatch_can_never_render_green_advantage(app):
     pair = tab.observer.latest_pair()
     assert pair is not None and not pair.comparable
     assert pair.outcome == "inconclusive"
-    assert "无结论" in tab.observation_improvement_label.text()
-    assert "#167c3a" not in tab.observation_improvement_label.styleSheet()
-    assert "功率不可比" in tab.observation_note_label.text()
+    assert "结论 inconclusive" in tab.observation_stats_label.text()
+    assert "功率不可比" in tab.observation_stats_label.text()
+    assert "#167c3a" not in tab.observation_stats_label.styleSheet()
+    assert tab.timeline_candidate_bars.opts["brush"].color().green() <= 150
 
 
-def test_regression_is_red_and_explicitly_reports_rollback(app):
+def test_regression_remains_red_in_effect_chart_and_window_summary(app):
     tab, clock = make_tab(app)
-    tab._start_observation_clicked()
+    tab._begin_observation()
     feed(tab, clock, 40, ser=0.01, evm=5.0)
     tab.adaptive_enable_check.setChecked(True)
     feed(tab, clock, 40, ser=0.05, evm=9.0)
     tab._update_observation_display()
     assert tab.observer.latest_pair().outcome == "regressed"
-    assert "实测退化" in tab.observation_improvement_label.text()
-    assert "已回滚" in tab.observation_improvement_label.text()
-    assert "#a33b3b" in tab.observation_improvement_label.styleSheet()
+    assert "结论 regressed" in tab.observation_stats_label.text()
+    color = tab.timeline_candidate_bars.opts["brush"].color()
+    assert color.red() > color.green()
+    # A diagnostic pair alone cannot claim that a radio rollback occurred.
+    assert "已回滚" not in tab.adaptive_state_label.text()
 
 
 def test_decode_status_uses_explicit_evidence_names_and_missing_values(app):
@@ -960,14 +1053,9 @@ def test_advantage_grid_four_cells_remain_balanced_with_long_text(app, width, he
         assert min(widths) > 0 and max(widths) / min(widths) <= 1.08
         assert min(heights) > 0 and max(heights) / min(heights) <= 1.08
         assert tab.observation_stats_group.parent() is tab.observation_stats_cell
-        cards = [tab.observation_before_label, tab.observation_after_label,
-                 tab.observation_improvement_label]
-        card_widths = [card.width() for card in cards]
-        assert min(card_widths) > 120
-        assert max(card_widths) / min(card_widths) <= 1.12
-        assert tab.comparison_result_group.height() >= 190
-        assert tab.comparison_result_group.maximumHeight() > 1000
-        assert all(card.height() >= card.minimumHeight() for card in cards)
+        assert not hasattr(tab, "comparison_result_group")
+        assert tab.adaptive_state_label.isVisibleTo(tab)
+        assert min(heights) >= 160
         # The default operator path fits without vertical scrolling even at the
         # smallest supported window; advanced diagnostics remain collapsible.
         assert tab.controls_panel.sizeHint().height() <= tab.controls_scroll.viewport().height()
@@ -1016,8 +1104,10 @@ def test_real_validation_text_does_not_squeeze_advantage_grid(app):
                  tab.timeline_ab_cell, tab.observation_stats_cell]
         assert min(cell.height() for cell in cells) >= 160
         assert max(cell.height() for cell in cells) / min(cell.height() for cell in cells) <= 1.08
-        assert "回滚失败" in tab.observation_improvement_label.text()
-        assert "请立即停止测试" in tab.observation_improvement_label.text()
+        assert tab.adaptive_state_label.isVisibleTo(tab)
+        assert "回滚失败" in tab.adaptive_state_label.text()
+        assert "请立即停止测试" in tab.adaptive_state_label.text()
+        assert "#a33b3b" in tab.adaptive_state_label.styleSheet()
         assert reason in tab.observation_stats_label.text()
     finally:
         tab.close()

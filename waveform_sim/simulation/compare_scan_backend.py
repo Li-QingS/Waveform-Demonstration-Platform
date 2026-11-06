@@ -1,399 +1,408 @@
+"""Paired full-grid CP-OFDM / rectangular OTFS / DAFT-AFDM experiments.
 
-# -*- coding: utf-8 -*-
+A generic ideal-timing/CSI three-tap model, separate from standalone OFDM NTN.
+All waveforms use M*T QAM resources, the same ordinary CP, identical payload
+bits/channel/time-domain noise and equal complete-frame transmitted energy.
+The default is full LMMSE for every waveform. Practical mode explicitly mixes
+one-tap OFDM with full OTFS/AFDM and includes a receiver-complexity difference.
 """
-compare_scan_backend.py
-
-独立的三波形扫描仿真后端。
-
-这个文件不调用 simple_ofdm_rx/simple_otfs_rx/simple_afdm_rx 中的 BER。
-它专门用于“波形对比/自动扫描”页面，按统一物理信道和统一 Monte-Carlo
-统计方式生成 BER-CFO 与 BER-Doppler 曲线。
-
-建模口径：
-1. 统一 64 点基带离散系统，子载波间隔 15 kHz，采样率 960 kSa/s；
-2. 统一 7 个数据单元，每单元 48 个数据符号；
-3. 统一 QAM 映射、统一 3 径时变多径、统一 CFO、统一 Doppler；
-4. OFDM 接收机只做单抽头频域均衡，CFO/Doppler 产生的 ICI 不被完全消除；
-5. OTFS 接收机用 DD 域完整 LMMSE 检测；
-6. AFDM 接收机用 DAFT 域完整 LMMSE 检测；
-7. 结果来自符号级 Monte-Carlo 误码统计，而不是人工 penalty 曲线。
-"""
-
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, Tuple
-
+from dataclasses import asdict, dataclass, replace
+import math
+from typing import Dict
 import numpy as np
+from waveform_sim.core.modem import (
+    bits_per_symbol as _bits_per_symbol,
+    qam_modulate as _qam_mod,
+    qam_demodulate as _qam_demod,
+)
+
+MATLAB_COLORS = {"OFDM": (0, 114, 189), "OTFS": (217, 83, 25), "AFDM": (119, 172, 48)}
+WAVEFORMS = ("OFDM", "OTFS", "AFDM")
+RECEIVER_MODES = ("full_mmse", "practical")
+CHIRP_CONVENTION = "exp(-j 2 pi c n^2), no division by FFT length"
+PREFIX = "ordinary_cp"
 
 
-MATLAB_COLORS = {
-    "OFDM": (0, 114, 189),
-    "OTFS": (217, 83, 25),
-    "AFDM": (119, 172, 48),
-}
+def _check_cancel(stop_event):
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Waveform comparison cancelled")
 
 
-def _bits_per_symbol(mod_order: str) -> int:
-    mod_order = str(mod_order).upper()
-    if mod_order == "QPSK":
-        return 2
-    if mod_order == "16QAM":
-        return 4
-    if mod_order == "64QAM":
-        return 6
-    raise ValueError(f"unsupported modulation: {mod_order}")
+def _integer(value, name, minimum=0):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return int(value)
 
 
-def _qam_mod(bits: np.ndarray, mod_order: str) -> np.ndarray:
-    mod_order = str(mod_order).upper()
-    bits = np.asarray(bits, dtype=np.int8).reshape(-1)
-    bps = _bits_per_symbol(mod_order)
-    n = len(bits) // bps
-    b = bits[: n * bps].reshape(n, bps)
-
-    if mod_order == "QPSK":
-        i = 1 - 2 * b[:, 0]
-        q = 1 - 2 * b[:, 1]
-        return (i + 1j * q) / np.sqrt(2.0)
-
-    if mod_order == "16QAM":
-        def pam2(x0, x1):
-            code = 2 * x0 + x1
-            table = np.array([-3.0, -1.0, 3.0, 1.0])
-            return table[code]
-        i = pam2(b[:, 0], b[:, 1])
-        q = pam2(b[:, 2], b[:, 3])
-        return (i + 1j * q) / np.sqrt(10.0)
-
-    if mod_order == "64QAM":
-        # 3-bit Gray PAM: 000,-7; 001,-5; 011,-3; 010,-1; 110,1; 111,3; 101,5; 100,7
-        table = {
-            0: -7.0, 1: -5.0, 3: -3.0, 2: -1.0,
-            6: 1.0, 7: 3.0, 5: 5.0, 4: 7.0,
-        }
-        ci = 4 * b[:, 0] + 2 * b[:, 1] + b[:, 2]
-        cq = 4 * b[:, 3] + 2 * b[:, 4] + b[:, 5]
-        i = np.array([table[int(x)] for x in ci], dtype=np.float64)
-        q = np.array([table[int(x)] for x in cq], dtype=np.float64)
-        return (i + 1j * q) / np.sqrt(42.0)
-
-    raise ValueError(f"unsupported modulation: {mod_order}")
+def _finite(value, name):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite") from exc
+    if not np.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return value
 
 
-def _qam_demod(symbols: np.ndarray, mod_order: str) -> np.ndarray:
-    mod_order = str(mod_order).upper()
-    s = np.asarray(symbols, dtype=np.complex128).reshape(-1)
-
-    if mod_order == "QPSK":
-        out = np.empty((len(s), 2), dtype=np.int8)
-        z = s * np.sqrt(2.0)
-        out[:, 0] = (np.real(z) < 0).astype(np.int8)
-        out[:, 1] = (np.imag(z) < 0).astype(np.int8)
-        return out.reshape(-1)
-
-    if mod_order == "16QAM":
-        z = s * np.sqrt(10.0)
-        levels = np.array([-3.0, -1.0, 1.0, 3.0])
-        table = np.array([[0, 0], [0, 1], [1, 1], [1, 0]], dtype=np.int8)
-
-        idx_i = np.argmin((np.real(z)[:, None] - levels[None, :]) ** 2, axis=1)
-        idx_q = np.argmin((np.imag(z)[:, None] - levels[None, :]) ** 2, axis=1)
-        bi = table[idx_i]
-        bq = table[idx_q]
-        return np.column_stack([bi[:, 0], bi[:, 1], bq[:, 0], bq[:, 1]]).reshape(-1)
-
-    if mod_order == "64QAM":
-        z = s * np.sqrt(42.0)
-        levels = np.array([-7.0, -5.0, -3.0, -1.0, 1.0, 3.0, 5.0, 7.0])
-        table = np.array(
-            [
-                [0, 0, 0],
-                [0, 0, 1],
-                [0, 1, 1],
-                [0, 1, 0],
-                [1, 1, 0],
-                [1, 1, 1],
-                [1, 0, 1],
-                [1, 0, 0],
-            ],
-            dtype=np.int8,
-        )
-        idx_i = np.argmin((np.real(z)[:, None] - levels[None, :]) ** 2, axis=1)
-        idx_q = np.argmin((np.imag(z)[:, None] - levels[None, :]) ** 2, axis=1)
-        bi = table[idx_i]
-        bq = table[idx_q]
-        return np.column_stack([bi[:, 0], bi[:, 1], bi[:, 2], bq[:, 0], bq[:, 1], bq[:, 2]]).reshape(-1)
-
-    raise ValueError(f"unsupported modulation: {mod_order}")
+def _waveforms(names):
+    if isinstance(names, str):
+        names = [names]
+    out = tuple(dict.fromkeys(str(name).upper() for name in names))
+    if not out or any(name not in WAVEFORMS for name in out):
+        raise ValueError("waveforms must contain OFDM, OTFS or AFDM")
+    return out
 
 
-def _normalized_sparse_channel(rng: np.random.Generator, doppler_hz: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _normalized_sparse_channel(rng, doppler_hz):
+    """Normalize expected PDP energy, preserving random channel attenuation."""
     delays = np.array([0, 2, 5], dtype=np.int64)
-    gain_db = np.array([0.0, -3.5, -7.0], dtype=np.float64)
-    amp = 10.0 ** (gain_db / 20.0)
-    fading = (rng.standard_normal(3) + 1j * rng.standard_normal(3)) / np.sqrt(2.0)
-    gains = amp * fading
-    gains = gains / np.sqrt(np.sum(np.abs(gains) ** 2) + 1e-12)
-    fd = float(max(0.0, doppler_hz)) * np.array([0.0, 0.6, -0.8], dtype=np.float64)
-    return delays, gains.astype(np.complex128), fd.astype(np.float64)
+    powers = 10.0 ** (np.array([0.0, -3.5, -7.0]) / 10.0)
+    powers /= powers.sum()
+    gains = np.sqrt(powers / 2.0) * (rng.standard_normal(3) + 1j * rng.standard_normal(3))
+    dopplers = float(doppler_hz) * np.array([0.0, 0.6, -0.8])
+    return delays, gains, dopplers
 
 
-@dataclass
+@dataclass(frozen=True)
 class ScanConfig:
     fft_len: int = 64
     n_slots: int = 7
     cp_len: int = 16
     subcarrier_spacing: float = 15e3
     lmmse_diag_loading: float = 1e-8
+    channel_model: str = "multipath"
+    # None retains the old normalized 0.05 coefficient at every FFT length.
+    # Public values use the same standard DAFT convention as standalone AFDM.
+    afdm_c1: float | None = None
+    afdm_c2: float | None = None
+
+    def validated(self):
+        m = _integer(self.fft_len, "fft_len", 8)
+        _integer(self.n_slots, "n_slots", 1)
+        cp = _integer(self.cp_len, "cp_len")
+        if m > 512 or m & (m - 1):
+            raise ValueError("fft_len must be a power of two between 8 and 512")
+        if cp >= m:
+            raise ValueError("cp_len must be smaller than fft_len")
+        model = str(self.channel_model).lower()
+        if model not in {"awgn", "multipath"}:
+            raise ValueError("channel_model must be multipath or AWGN")
+        if model == "multipath" and cp < 5:
+            raise ValueError("cp_len must cover the maximum path delay (5 samples)")
+        if _finite(self.subcarrier_spacing, "subcarrier_spacing") <= 0:
+            raise ValueError("subcarrier_spacing must be positive")
+        if _finite(self.lmmse_diag_loading, "lmmse_diag_loading") < 0:
+            raise ValueError("lmmse_diag_loading must be non-negative")
+        chirps = {}
+        for name in ("afdm_c1", "afdm_c2"):
+            value = getattr(self, name)
+            if value is None:
+                value = 0.05 / m
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"{name} must be a finite chirp coefficient")
+            value = _finite(value, name)
+            if not 0.0 <= value <= 0.5:
+                raise ValueError(f"{name} must lie in [0, 0.5] in the standard DAFT convention")
+            chirps[name] = value
+        return replace(self, fft_len=m, n_slots=int(self.n_slots), cp_len=cp,
+                       subcarrier_spacing=float(self.subcarrier_spacing),
+                       lmmse_diag_loading=float(self.lmmse_diag_loading), channel_model=model,
+                       **chirps)
+
+
+def validate_parameters(snr_db, cfo_hz, doppler_hz, mod_order, frames=1, seed=42,
+                        receiver_mode="full_mmse", config=None):
+    """Validate a whole request before a caller changes any experiment state."""
+    cfg = (config or ScanConfig()).validated()
+    snr_db = _finite(snr_db, "snr_db")
+    cfo_hz = _finite(cfo_hz, "cfo_hz")
+    doppler_hz = _finite(doppler_hz, "doppler_hz")
+    if not -100 <= snr_db <= 160:
+        raise ValueError("snr_db must be between -100 and 160 dB")
+    if doppler_hz < 0:
+        raise ValueError("doppler_hz must be non-negative")
+    maximum_path_offset = 0.0 if cfg.channel_model == "awgn" else 0.8 * doppler_hz
+    if abs(cfo_hz) + maximum_path_offset >= cfg.fft_len * cfg.subcarrier_spacing / 2.0:
+        raise ValueError("CFO plus maximum path Doppler must remain below the sampling Nyquist frequency")
+    mod_order = str(mod_order).upper()
+    _bits_per_symbol(mod_order)
+    mode = str(receiver_mode).lower()
+    if mode not in RECEIVER_MODES:
+        raise ValueError("receiver_mode must be full_mmse or practical")
+    return {"snr_db": snr_db, "cfo_hz": cfo_hz, "doppler_hz": doppler_hz,
+            "mod_order": mod_order, "frames": _integer(frames, "frames", 1),
+            "seed": _integer(seed, "seed"), "receiver_mode": mode}
+
+
+def _wilson(errors, bits):
+    if bits <= 0:
+        return float("nan"), float("nan")
+    z = 1.959963984540054
+    p = errors / bits
+    denominator = 1.0 + z * z / bits
+    center = (p + z * z / (2.0 * bits)) / denominator
+    radius = z * math.sqrt(p * (1.0 - p) / bits + z * z / (4.0 * bits * bits)) / denominator
+    return (0.0 if errors == 0 else max(0.0, center - radius),
+            1.0 if errors == bits else min(1.0, center + radius))
 
 
 class WaveformScanSimulator:
-    """独立扫描仿真器：输入波形和信道参数，返回 BER。"""
+    """Synchronous paired frame source shared by live comparison and scans."""
 
     def __init__(self, config: ScanConfig | None = None):
-        self.cfg = config or ScanConfig()
-        self.M = int(self.cfg.fft_len)
-        self.T = int(self.cfg.n_slots)
-        self.sample_rate = self.M * float(self.cfg.subcarrier_spacing)
-
-        self.F = np.fft.fft(np.eye(self.M), axis=0) / np.sqrt(self.M)
+        self.cfg = (config or ScanConfig()).validated()
+        self.M, self.T = self.cfg.fft_len, self.cfg.n_slots
+        self.sample_rate = self.M * self.cfg.subcarrier_spacing
+        self.n_data = self.M
+        self.net_symbols = self.M * self.T
+        self.frame_samples = self.T * (self.M + self.cfg.cp_len)
+        self.frame_duration_s = self.frame_samples / self.sample_rate
+        self.F = np.fft.fft(np.eye(self.M), axis=0, norm="ortho")
         self.Fh = self.F.conj().T
+        self.A_tx, self.A_rx = self._build_afdm_mats(self.cfg.afdm_c1, self.cfg.afdm_c2)
 
-        # shifted 坐标中的 52 个 active、4 个 pilot、48 个 data
-        active_bins = np.concatenate([np.arange(-26, 0), np.arange(1, 27)])
-        pilot_bins = np.array([-21, -7, 7, 21])
-        active_shift_idx = active_bins + self.M // 2
-        pilot_shift_idx = pilot_bins + self.M // 2
-        pilot_set = set(pilot_shift_idx.tolist())
-        data_shift_idx = np.array([x for x in active_shift_idx if x not in pilot_set], dtype=np.int64)
-
-        self.data_shift_idx = data_shift_idx
-        self.data_nat_idx = (self.data_shift_idx + self.M // 2) % self.M
-        self.n_data = len(self.data_shift_idx)
-        self.net_symbols = self.n_data * self.T
-
-        self.A_tx, self.A_rx = self._build_afdm_mats(c1=0.05, c2=0.05)
-        self.U_dd_to_tf, self.U_tf_to_dd = self._build_otfs_mats()
-
-    def _build_afdm_mats(self, c1: float, c2: float):
+    def _build_afdm_mats(self, c1, c2):
+        # Standard DAFT coefficients, matching the independent AFDM study.
         n = np.arange(self.M)
-        D1 = np.diag(np.exp(-1j * 2.0 * np.pi * c1 * (n ** 2) / self.M))
-        D2 = np.diag(np.exp(-1j * 2.0 * np.pi * c2 * (n ** 2) / self.M))
-        A_tx = D1.conj().T @ self.Fh @ D2.conj().T
-        A_rx = D2 @ self.F @ D1
-        return A_tx.astype(np.complex128), A_rx.astype(np.complex128)
+        d1 = np.exp(-2j * np.pi * c1 * n * n)
+        d2 = np.exp(-2j * np.pi * c2 * n * n)
+        tx = d1.conj()[:, None] * self.Fh * d2.conj()[None, :]
+        return tx, tx.conj().T
 
     def _build_otfs_mats(self):
-        size = self.M * self.T
+        # DD=(delay M, Doppler T), column-wise vectorization.
+        # ISFFT: FFT along delay, IFFT along Doppler; SFFT is its adjoint.
+        ft = np.fft.fft(np.eye(self.T), axis=0, norm="ortho")
+        tx = np.kron(ft.conj().T, self.F)
+        return tx, tx.conj().T
 
-        def dd_to_tf_vec(v):
-            x = np.asarray(v, dtype=np.complex128).reshape(self.M, self.T, order="F")
-            y = np.fft.ifft(np.fft.fft(x, axis=1, norm="ortho"), axis=0, norm="ortho")
-            return y.reshape(-1, order="F")
+    @property
+    def U_dd_to_tf(self):
+        return self._build_otfs_mats()[0]
 
-        def tf_to_dd_vec(v):
-            x = np.asarray(v, dtype=np.complex128).reshape(self.M, self.T, order="F")
-            y = np.fft.ifft(np.fft.fft(x, axis=0, norm="ortho"), axis=1, norm="ortho")
-            return y.reshape(-1, order="F")
+    @property
+    def U_tf_to_dd(self):
+        return self._build_otfs_mats()[1]
 
-        eye = np.eye(size, dtype=np.complex128)
-        U = np.column_stack([dd_to_tf_vec(eye[:, k]) for k in range(size)])
-        Uh = np.column_stack([tf_to_dd_vec(eye[:, k]) for k in range(size)])
-        return U.astype(np.complex128), Uh.astype(np.complex128)
+    def _transmit(self, name, symbols):
+        if name == "OFDM":
+            return np.fft.ifft(symbols, axis=1, norm="ortho")
+        if name == "AFDM":
+            return symbols @ self.A_tx.T
+        dd = symbols.T
+        tf = np.fft.ifft(np.fft.fft(dd, axis=0, norm="ortho"), axis=1, norm="ortho")
+        return np.fft.ifft(tf, axis=0, norm="ortho").T
 
-    def _channel_matrix(self, delays, gains, fd_list, cfo_hz: float, slot_idx: int) -> np.ndarray:
-        n = np.arange(self.M, dtype=np.float64)
-        # 绝对采样偏移让 Doppler/CFO 相位随 slot 连续变化
-        n_abs = slot_idx * (self.M + self.cfg.cp_len) + n
-        H = np.zeros((self.M, self.M), dtype=np.complex128)
+    def _receive(self, name, time_symbols):
+        if name == "OFDM":
+            return np.fft.fft(time_symbols, axis=1, norm="ortho")
+        if name == "AFDM":
+            return time_symbols @ self.A_rx.T
+        tf = np.fft.fft(time_symbols.T, axis=0, norm="ortho")
+        return np.fft.fft(np.fft.ifft(tf, axis=0, norm="ortho"), axis=1, norm="ortho").T
 
-        for delay, gain, fd in zip(delays, gains, fd_list):
-            d = int(delay) % self.M
-            phase = np.exp(1j * 2.0 * np.pi * (float(fd) + float(cfo_hz)) * n_abs / self.sample_rate)
-            D = np.diag(phase)
-            S = np.zeros((self.M, self.M), dtype=np.complex128)
-            for row in range(self.M):
-                S[row, (row - d) % self.M] = 1.0
-            H += complex(gain) * D @ S
-        return H
+    def _channel_matrix(self, delays, gains, fd_list, cfo_hz, slot_idx):
+        row = np.arange(self.M)
+        absolute = slot_idx * (self.M + self.cfg.cp_len) + self.cfg.cp_len + row
+        matrix = np.zeros((self.M, self.M), dtype=np.complex128)
+        for delay, gain, doppler in zip(delays, gains, fd_list):
+            phase = np.exp(2j * np.pi * (doppler + cfo_hz) * absolute / self.sample_rate)
+            matrix[row, (row - int(delay)) % self.M] += gain * phase
+        return matrix
 
-    @staticmethod
-    def _add_awgn(y: np.ndarray, ebn0_db: float, bits_per_symbol: int, rng: np.random.Generator):
-        p = float(np.mean(np.abs(y) ** 2))
-        ebn0 = 10.0 ** (float(ebn0_db) / 10.0)
-        noise_var = max(p / max(bits_per_symbol * ebn0, 1e-12), 1e-12)
-        noise = np.sqrt(noise_var / 2.0) * (rng.standard_normal(y.shape) + 1j * rng.standard_normal(y.shape))
-        return y + noise, noise_var
+    def _validate_point(self, snr_db, cfo_hz, doppler_hz, mod_order, seed, frame_index, receiver_mode):
+        values = validate_parameters(snr_db, cfo_hz, doppler_hz, mod_order, seed=seed,
+                                      receiver_mode=receiver_mode, config=self.cfg)
+        frame_index = _integer(frame_index, "frame_index")
+        return (values["snr_db"], values["cfo_hz"], values["doppler_hz"], values["mod_order"],
+                values["seed"], frame_index, values["receiver_mode"])
 
-    def simulate_ber(
-        self,
-        waveform: str,
-        snr_db: float,
-        cfo_hz: float,
-        doppler_hz: float,
-        mod_order: str = "QPSK",
-        frames: int = 20,
-        seed: int | None = None,
-    ) -> float:
-        waveform = str(waveform).upper()
-        mod_order = str(mod_order).upper()
-        frames = int(max(1, frames))
-        rng = np.random.default_rng(seed)
+    def validate_params(self, *args, **kwargs):
+        return validate_parameters(*args, **kwargs, config=self.cfg)
+
+    def simulate_frame_set(self, waveforms, snr_db, cfo_hz, doppler_hz,
+                           mod_order="QPSK", seed=42, frame_index=0,
+                           receiver_mode="full_mmse", stop_event=None):
+        """Return a complete pair; cancellation never publishes a partial pair."""
+        names = _waveforms(waveforms)
+        snr_db, cfo_hz, doppler_hz, mod_order, seed, frame_index, receiver_mode = self._validate_point(
+            snr_db, cfo_hz, doppler_hz, mod_order, seed, frame_index, receiver_mode)
+        _check_cancel(stop_event)
+        bits_rng = np.random.default_rng(np.random.SeedSequence([seed, 0, frame_index]))
+        channel_rng = np.random.default_rng(np.random.SeedSequence([seed, 1, frame_index]))
+        noise_rng = np.random.default_rng(np.random.SeedSequence([seed, 2, frame_index]))
         bps = _bits_per_symbol(mod_order)
-
-        total_errors = 0
-        total_bits = 0
-
-        for _frame in range(frames):
-            delays, gains, fd_list = _normalized_sparse_channel(rng, doppler_hz)
-
-            if waveform == "OFDM":
-                e, b = self._simulate_ofdm_frame(rng, delays, gains, fd_list, snr_db, cfo_hz, mod_order, bps)
-            elif waveform == "AFDM":
-                e, b = self._simulate_afdm_frame(rng, delays, gains, fd_list, snr_db, cfo_hz, mod_order, bps)
-            elif waveform == "OTFS":
-                e, b = self._simulate_otfs_frame(rng, delays, gains, fd_list, snr_db, cfo_hz, mod_order, bps)
+        tx_bits = bits_rng.integers(0, 2, self.net_symbols * bps, dtype=np.uint8)
+        symbols = _qam_mod(tx_bits, mod_order).reshape(self.T, self.M)
+        if self.cfg.channel_model == "awgn":
+            delays, gains, dopplers = np.array([0]), np.array([1.0 + 0j]), np.array([0.0])
+        else:
+            delays, gains, dopplers = _normalized_sparse_channel(channel_rng, doppler_hz)
+        matrices = np.asarray([
+            self._channel_matrix(delays, gains, dopplers, cfo_hz, frame_index * self.T + slot)
+            for slot in range(self.T)
+        ])
+        unit_noise = (noise_rng.standard_normal(self.frame_samples)
+                      + 1j * noise_rng.standard_normal(self.frame_samples)) / math.sqrt(2.0)
+        # Same whole-burst energy, including the physically transmitted CP.
+        common_energy = float(self.frame_samples)
+        noise_variance = common_energy / (tx_bits.size * 10.0 ** (snr_db / 10.0))
+        noise = math.sqrt(noise_variance) * unit_noise
+        absolute_samples = frame_index * self.frame_samples + np.arange(self.frame_samples)
+        cp = self.cfg.cp_len
+        useful_indices = (np.arange(self.T)[:, None] * (self.M + cp) + cp + np.arange(self.M)[None, :])
+        receiver_note = ("所有波形使用理想 CSI 和完整 LMMSE"
+                         if receiver_mode == "full_mmse" else
+                         "含接收机复杂度差异：OFDM 单抽头；OTFS/AFDM 完整 LMMSE")
+        channel = {"delays": delays, "gains": gains, "dopplers_hz": dopplers, "matrices": matrices}
+        # Unitary modulation gives identity input covariance.  All complete
+        # receivers can therefore solve the same time-domain LMMSE problem,
+        # followed by their respective unitary demodulators.  Share the
+        # Hermitian decomposition rather than solving a large DD system or
+        # factoring the same channel once for each waveform.
+        decompositions = []
+        if receiver_mode == "full_mmse" or any(name != "OFDM" for name in names):
+            for h_time in matrices:
+                _check_cancel(stop_event)
+                eigenvalues, eigenvectors = np.linalg.eigh(h_time.conj().T @ h_time)
+                decompositions.append((np.maximum(eigenvalues, 0.0), eigenvectors))
+        output = {}
+        for name in names:
+            _check_cancel(stop_event)
+            raw_time = self._transmit(name, symbols)
+            prefixed = np.concatenate((raw_time[:, -cp:], raw_time), axis=1) if cp else raw_time.copy()
+            raw_energy = float(np.sum(np.abs(prefixed) ** 2))
+            scale = math.sqrt(common_energy / max(raw_energy, 1e-30))
+            tx_samples = (scale * prefixed).reshape(-1)
+            rx_clean = np.zeros(self.frame_samples, dtype=np.complex128)
+            for delay, gain, doppler in zip(delays, gains, dopplers):
+                delay = int(delay)
+                phase = np.exp(2j * np.pi * (doppler + cfo_hz) * absolute_samples / self.sample_rate)
+                if delay:
+                    rx_clean[delay:] += gain * phase[delay:] * tx_samples[:-delay]
+                else:
+                    rx_clean += gain * phase * tx_samples
+            rx_samples = rx_clean + noise
+            useful = rx_samples[useful_indices]
+            if receiver_mode == "practical" and name == "OFDM":
+                estimates = []
+                for slot, h_time in enumerate(matrices):
+                    _check_cancel(stop_event)
+                    diagonal = scale * np.diag(self.F @ h_time @ self.Fh)
+                    received = np.fft.fft(useful[slot], norm="ortho")
+                    estimates.append(received * np.conj(diagonal) /
+                                     (np.abs(diagonal) ** 2 + noise_variance + self.cfg.lmmse_diag_loading))
+                decoded = np.asarray(estimates)
             else:
-                raise ValueError(f"unsupported waveform: {waveform}")
+                estimated_time = []
+                for slot, h_time in enumerate(matrices):
+                    _check_cancel(stop_event)
+                    rhs = scale * h_time.conj().T @ useful[slot]
+                    eigenvalues, eigenvectors = decompositions[slot]
+                    denominator = scale * scale * eigenvalues + noise_variance + self.cfg.lmmse_diag_loading
+                    estimated_time.append(eigenvectors @ ((eigenvectors.conj().T @ rhs) / denominator))
+                decoded = self._receive(name, np.asarray(estimated_time))
+            rx_symbols = decoded.reshape(-1)
+            rx_bits = _qam_demod(rx_symbols, mod_order)
+            errors = int(np.count_nonzero(tx_bits != rx_bits))
+            reference = symbols.reshape(-1)
+            evm = 100.0 * math.sqrt(float(np.sum(np.abs(rx_symbols - reference) ** 2)) /
+                                    max(float(np.sum(np.abs(reference) ** 2)), 1e-30))
+            output[name] = {
+                "bit_errors": errors, "total_bits": int(tx_bits.size),
+                "ber": errors / tx_bits.size, "frame_error": int(errors > 0),
+                "evm_percent": evm, "rx_symbols": rx_symbols, "constellation": rx_symbols,
+                "tx_symbols": reference, "tx_bits": tx_bits, "rx_bits": rx_bits,
+                "noise_samples": noise, "unit_noise_samples": unit_noise,
+                "noise_variance": float(noise_variance), "channel": channel,
+                "tx_samples": tx_samples, "rx_samples": rx_samples, "rx_clean_samples": rx_clean,
+                "tx_energy": float(np.vdot(tx_samples, tx_samples).real), "normalization_scale": scale,
+                "frame_index": frame_index, "frame_time_s": frame_index * self.frame_duration_s,
+                "sample_rate_hz": self.sample_rate, "frame_duration_s": self.frame_duration_s,
+                "receiver_mode": receiver_mode, "receiver_note": receiver_note,
+                "model": "full_grid_cp_comparison", "data_symbols": self.net_symbols,
+                "pilot_symbols": 0, "cp_len": cp,
+                "afdm_c1": self.cfg.afdm_c1, "afdm_c2": self.cfg.afdm_c2,
+                "chirp_convention": CHIRP_CONVENTION, "prefix": PREFIX,
+                "public_config": {**asdict(self.cfg), "chirp_convention": CHIRP_CONVENTION,
+                                  "prefix": PREFIX},
+            }
+        _check_cancel(stop_event)
+        return output
 
-            total_errors += int(e)
-            total_bits += int(b)
+    def simulate_stats(self, waveforms, snr_db, cfo_hz, doppler_hz, mod_order="QPSK",
+                       frames=20, seed=42, receiver_mode="full_mmse", stop_event=None):
+        """Pool raw counters; cancelled work never becomes zero-error evidence."""
+        names = _waveforms(waveforms)
+        parameters = self.validate_params(snr_db, cfo_hz, doppler_hz, mod_order,
+                                           frames, seed, receiver_mode)
+        snr_db, cfo_hz, doppler_hz = (parameters[key] for key in ("snr_db", "cfo_hz", "doppler_hz"))
+        mod_order, frames, seed, receiver_mode = (
+            parameters[key] for key in ("mod_order", "frames", "seed", "receiver_mode"))
+        counters = {name: {"bit_errors": 0, "total_bits": 0, "frame_errors": 0,
+                           "frames": 0, "evm_square_sum": 0.0} for name in names}
+        for frame in range(frames):
+            paired = self.simulate_frame_set(names, snr_db, cfo_hz, doppler_hz,
+                                             mod_order, seed, frame, receiver_mode, stop_event)
+            _check_cancel(stop_event)
+            for name in names:
+                raw, aggregate = paired[name], counters[name]
+                aggregate["bit_errors"] += raw["bit_errors"]
+                aggregate["total_bits"] += raw["total_bits"]
+                aggregate["frame_errors"] += raw["frame_error"]
+                aggregate["frames"] += 1
+                aggregate["evm_square_sum"] += raw["evm_percent"] ** 2
+        for aggregate in counters.values():
+            aggregate["ber"] = aggregate["bit_errors"] / aggregate["total_bits"]
+            aggregate["fer"] = aggregate["frame_errors"] / aggregate["frames"]
+            aggregate["evm_percent"] = math.sqrt(aggregate.pop("evm_square_sum") / aggregate["frames"])
+            aggregate["ci_low"], aggregate["ci_high"] = _wilson(aggregate["bit_errors"], aggregate["total_bits"])
+            aggregate["receiver_mode"] = receiver_mode
+            aggregate.update(afdm_c1=self.cfg.afdm_c1, afdm_c2=self.cfg.afdm_c2,
+                             chirp_convention=CHIRP_CONVENTION, prefix=PREFIX)
+        return counters
 
-        return float(total_errors / max(total_bits, 1))
-
-    def _simulate_ofdm_frame(self, rng, delays, gains, fd_list, snr_db, cfo_hz, mod_order, bps):
-        bits = rng.integers(0, 2, size=self.net_symbols * bps, dtype=np.int8)
-        tx_symbols = _qam_mod(bits, mod_order).reshape(self.T, self.n_data)
-        rx_symbols = []
-
-        for t in range(self.T):
-            x_nat = np.zeros(self.M, dtype=np.complex128)
-            x_nat[self.data_nat_idx] = tx_symbols[t]
-            tx_time = self.Fh @ x_nat
-
-            Ht = self._channel_matrix(delays, gains, fd_list, cfo_hz=cfo_hz, slot_idx=t)
-            y_time = Ht @ tx_time
-            y_time, noise_var = self._add_awgn(y_time, snr_db, bps, rng)
-
-            y_nat = self.F @ y_time
-            Hf = self.F @ Ht @ self.Fh
-
-            # OFDM baseline: 只做单抽头频域均衡，ICI 作为干扰保留。
-            diag = np.diag(Hf)[self.data_nat_idx]
-            x_hat = y_nat[self.data_nat_idx] * np.conj(diag) / (np.abs(diag) ** 2 + noise_var + 1e-8)
-            rx_symbols.append(x_hat)
-
-        rx_bits = _qam_demod(np.concatenate(rx_symbols), mod_order)
-        n = min(len(bits), len(rx_bits))
-        return int(np.count_nonzero(bits[:n] != rx_bits[:n])), int(n)
-
-    def _simulate_afdm_frame(self, rng, delays, gains, fd_list, snr_db, cfo_hz, mod_order, bps):
-        bits = rng.integers(0, 2, size=self.net_symbols * bps, dtype=np.int8)
-        tx_symbols = _qam_mod(bits, mod_order).reshape(self.T, self.n_data)
-        rx_symbols = []
-
-        for t in range(self.T):
-            x = np.zeros(self.M, dtype=np.complex128)
-            x[self.data_shift_idx] = tx_symbols[t]
-            tx_time = self.A_tx @ x
-
-            Ht = self._channel_matrix(delays, gains, fd_list, cfo_hz=cfo_hz, slot_idx=t)
-            y_time = Ht @ tx_time
-            y_time, noise_var = self._add_awgn(y_time, snr_db, bps, rng)
-
-            y_daft = self.A_rx @ y_time
-            Heff = self.A_rx @ Ht @ self.A_tx
-            Hd = Heff[:, self.data_shift_idx]
-
-            gram = Hd.conj().T @ Hd + (noise_var + self.cfg.lmmse_diag_loading) * np.eye(self.n_data)
-            rhs = Hd.conj().T @ y_daft
-            x_hat = np.linalg.solve(gram, rhs)
-            rx_symbols.append(x_hat)
-
-        rx_bits = _qam_demod(np.concatenate(rx_symbols), mod_order)
-        n = min(len(bits), len(rx_bits))
-        return int(np.count_nonzero(bits[:n] != rx_bits[:n])), int(n)
-
-    def _simulate_otfs_frame(self, rng, delays, gains, fd_list, snr_db, cfo_hz, mod_order, bps):
-        bits = rng.integers(0, 2, size=self.net_symbols * bps, dtype=np.int8)
-        tx_data = _qam_mod(bits, mod_order)
-
-        dd = np.zeros((self.M, self.T), dtype=np.complex128)
-        dd[self.data_shift_idx[:, None], np.arange(self.T)[None, :]] = tx_data.reshape(self.n_data, self.T, order="F")
-        x_dd_vec = dd.reshape(-1, order="F")
-
-        x_tf_vec = self.U_dd_to_tf @ x_dd_vec
-        y_tf_vec = np.zeros_like(x_tf_vec)
-        Htf = np.zeros((self.M * self.T, self.M * self.T), dtype=np.complex128)
-
-        noise_vars = []
-        for t in range(self.T):
-            x_tf_slot = x_tf_vec[t * self.M:(t + 1) * self.M]
-            tx_time = self.Fh @ x_tf_slot
-            Ht = self._channel_matrix(delays, gains, fd_list, cfo_hz=cfo_hz, slot_idx=t)
-            y_time = Ht @ tx_time
-            y_time, noise_var = self._add_awgn(y_time, snr_db, bps, rng)
-            noise_vars.append(noise_var)
-            y_tf_vec[t * self.M:(t + 1) * self.M] = self.F @ y_time
-            Htf[t * self.M:(t + 1) * self.M, t * self.M:(t + 1) * self.M] = self.F @ Ht @ self.Fh
-
-        y_dd_vec = self.U_tf_to_dd @ y_tf_vec
-        Heff = self.U_tf_to_dd @ Htf @ self.U_dd_to_tf
-        data_flat_idx = []
-        for t in range(self.T):
-            for row in self.data_shift_idx:
-                data_flat_idx.append(int(row + t * self.M))
-        data_flat_idx = np.array(data_flat_idx, dtype=np.int64)
-
-        Hd = Heff[:, data_flat_idx]
-        noise_var = float(np.mean(noise_vars))
-        gram = Hd.conj().T @ Hd + (noise_var + self.cfg.lmmse_diag_loading) * np.eye(len(data_flat_idx))
-        rhs = Hd.conj().T @ y_dd_vec
-        x_hat = np.linalg.solve(gram, rhs)
-
-        rx_bits = _qam_demod(x_hat, mod_order)
-        n = min(len(bits), len(rx_bits))
-        return int(np.count_nonzero(bits[:n] != rx_bits[:n])), int(n)
+    def simulate_ber(self, waveform, snr_db, cfo_hz, doppler_hz, mod_order="QPSK",
+                     frames=20, seed=None, receiver_mode="full_mmse", stop_event=None):
+        """Compatibility scalar API, preserving true zero-error results."""
+        if seed is None:
+            seed = int(np.random.SeedSequence().generate_state(1)[0])
+        name = _waveforms([waveform])[0]
+        return float(self.simulate_stats([name], snr_db, cfo_hz, doppler_hz,
+                                        mod_order, frames, seed, receiver_mode, stop_event)[name]["ber"])
 
 
-def scan_axis(
-    axis_name: str,
-    axis_values: np.ndarray,
-    snr_db: float,
-    mod_order: str,
-    frames: int,
-    fixed_cfo_hz: float,
-    fixed_doppler_hz: float,
-    seed_base: int = 20260502,
-) -> Dict[str, np.ndarray]:
-    """一次性扫描某个横轴，返回三种波形 BER 数组。"""
+def scan_axis(axis_name, axis_values, snr_db, mod_order, frames, fixed_cfo_hz,
+              fixed_doppler_hz, seed_base=20260502, receiver_mode="full_mmse",
+              stop_event=None, on_point=None, config=None) -> Dict[str, np.ndarray]:
+    """Legacy array API with paired samples, raw BER and no artificial floor.
+
+    One seed serves all waveforms and all axis points (common random numbers),
+    making results independent of waveform/point iteration order. Statistics
+    with Wilson bounds are available from simulate_stats or the point callback.
+    """
     axis_name = str(axis_name).lower()
-    sim = WaveformScanSimulator()
-    out: Dict[str, np.ndarray] = {}
-
-    for w_idx, waveform in enumerate(["OFDM", "OTFS", "AFDM"]):
-        vals = []
-        for p_idx, val in enumerate(np.asarray(axis_values, dtype=np.float64)):
-            if axis_name == "cfo":
-                cfo_hz = float(val)
-                doppler_hz = float(fixed_doppler_hz)
-            elif axis_name == "doppler":
-                cfo_hz = float(fixed_cfo_hz)
-                doppler_hz = float(val)
-            else:
-                raise ValueError("axis_name must be 'cfo' or 'doppler'")
-
-            ber = sim.simulate_ber(
-                waveform=waveform,
-                snr_db=snr_db,
-                cfo_hz=cfo_hz,
-                doppler_hz=doppler_hz,
-                mod_order=mod_order,
-                frames=frames,
-                seed=seed_base + 10000 * w_idx + 100 * p_idx,
-            )
-            vals.append(max(float(ber), 1e-8))
-        out[waveform] = np.array(vals, dtype=np.float64)
-
-    return out
+    if axis_name not in {"cfo", "doppler"}:
+        raise ValueError("axis_name must be cfo or doppler")
+    axis_values = np.asarray(axis_values, dtype=float)
+    if axis_values.ndim != 1 or not axis_values.size or not np.all(np.isfinite(axis_values)):
+        raise ValueError("axis_values must be a nonempty finite one-dimensional array")
+    simulator = WaveformScanSimulator(config)
+    # Validate the complete sweep before computing or reporting any point.
+    for value in axis_values:
+        simulator.validate_params(snr_db, float(value) if axis_name == "cfo" else fixed_cfo_hz,
+                                  float(value) if axis_name == "doppler" else fixed_doppler_hz,
+                                  mod_order, frames, seed_base, receiver_mode)
+    out = {name: [] for name in WAVEFORMS}
+    for value in axis_values:
+        _check_cancel(stop_event)
+        cfo = float(value) if axis_name == "cfo" else fixed_cfo_hz
+        doppler = float(value) if axis_name == "doppler" else fixed_doppler_hz
+        stats = simulator.simulate_stats(WAVEFORMS, snr_db, cfo, doppler, mod_order,
+                                          frames, seed_base, receiver_mode, stop_event)
+        for name in WAVEFORMS:
+            out[name].append(stats[name]["ber"])
+        if on_point is not None:
+            on_point({"axis": axis_name, "axis_value": float(value), "strategies": stats})
+    return {name: np.asarray(values, dtype=float) for name, values in out.items()}

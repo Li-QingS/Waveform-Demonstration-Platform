@@ -1,563 +1,561 @@
-from .base_waveform_tab import BaseWaveformTab
-from PyQt5.QtWidgets import QLabel, QComboBox, QSpinBox, QHBoxLayout
-from PyQt5.QtCore import QTimer
-import pyqtgraph as pg
+"""OFDM in satellite-terrestrial channels: measured link and reproducible studies."""
+
+from dataclasses import asdict, replace
+import json
+import threading
+
 import numpy as np
-import time
+import pyqtgraph as pg
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtWidgets import (
+    QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
+    QVBoxLayout, QWidget,
+)
+
+from .base_waveform_tab import BaseWaveformTab
+from .ofdm_ntn_workers import OfdmNtnRunner
+from .ui_utils import compute_spectrum
+from ..simulation.ofdm_ntn import OfdmNtnConfig, config_summary, run_study
+from ..simulation.leo_ntn_channel import absolute_doppler_shift_hz, get_profile
+
+
+COLORS = {'pilot_ls': (0, 114, 189), 'ideal': (126, 47, 142),
+          'uncompensated': (217, 83, 25)}
+NAMES = {'pilot_ls': '导频 LS', 'ideal': '理想 CSI 参考', 'uncompensated': '关闭预补偿 + LS'}
 
 
 class OfdmTab(BaseWaveformTab):
+    study_point = pyqtSignal(int, object)
+    study_finished = pyqtSignal(int, str)
+
     def __init__(self):
-        super().__init__("OFDM")
-        self._add_ofdm_specific_controls()
-        self._connect_signals()
+        super().__init__('OFDM')
         self.tb = None
-        self._last_constellation = None
-        self._last_constellation_time = 0.0
-
-        self._sim_start_time = None
-        self._evm_time_hist = []
-        self._evm_value_hist = []
-        self._ber_snr_sum = {}
-        self._ber_snr_count = {}
-        self._snr_settle_start_time = None
-
-        # 默认观察均衡后星座；切换下拉框后会动态更新标题和数据源
-        self.constellation_plot.setTitle("星座图 (Post-EQ Constellation)")
-
-        # 与 sim.py 的 const sink 行为保持一致：固定显示范围，不自动缩放
-        self.constellation_plot.disableAutoRange()
-        self.constellation_plot.setXRange(-2.0, 2.0, padding=0)
-        self.constellation_plot.setYRange(-2.0, 2.0, padding=0)
-
-        # OFDM 实时曲线改为 EVM vs Time。底层仍复用 BaseWaveformTab
-        # 里创建的 ber_plot / ber_curve 对象，避免改变现有文件架构和 UI 结构。
-        self.ber_plot.setTitle("调制质量 (EVM vs Time)")
-        self.ber_plot.setLabel('left', 'EVM RMS', units='%')
-        self.ber_plot.setLabel('bottom', '时间', units='s')
-        self.ber_plot.setLogMode(y=False)
-
-        # OFDM 页面绘图样式：浅色背景 + MATLAB 风格配色
-        self._apply_matlab_light_plot_style()
-
-        self.update_timer = QTimer()
+        self._study_token = 0
+        self._study_stop = threading.Event()
+        self._study_results = []
+        self._study_config = None
+        self._study_axis = 'ebn0'
+        self._study_values = []
+        self._last_frame = 0
+        self._live_x, self._live_y, self._live_upper = [], [], []
+        self._build_controls()
+        self._build_plots()
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(160)
         self.update_timer.timeout.connect(self._refresh_plots)
-        self._update_constellation_title()
-        self._update_ofdm_info_panel(running=False)
-
-    def _apply_matlab_light_plot_style(self):
-        """仅对 OFDM 页面应用浅色背景和 MATLAB 风格配色。"""
-        matlab_blue = (0, 114, 189)
-        matlab_orange = (217, 83, 25)
-        matlab_yellow = (237, 177, 32)
-        matlab_purple = (126, 47, 142)
-        axis_color = (60, 60, 60)
-        background_color = (250, 250, 250)
-
-        for plot in (
-            self.spectrum_plot,
-            self.constellation_plot,
-            self.ber_plot,
-            self.ber_snr_plot,
-        ):
-            plot.setBackground(background_color)
-            plot.showGrid(x=True, y=True, alpha=0.35)
-            for axis_name in ("left", "bottom"):
-                axis = plot.getAxis(axis_name)
-                axis.setPen(pg.mkPen(axis_color, width=1.0))
-                axis.setTextPen(pg.mkPen(axis_color, width=1.0))
-            # 使用浅灰色网格，避免浅色背景下对比过弱或过强
-            plot.getPlotItem().getViewBox().setBorder(pg.mkPen((225, 225, 225), width=1.0))
-
-        # MATLAB 风格颜色映射
-        self.spectrum_curve.setPen(pg.mkPen(matlab_blue, width=2.0))
-        self.constellation_scatter.setPen(pg.mkPen(matlab_orange, width=0.8))
-        self.constellation_scatter.setBrush(pg.mkBrush(matlab_orange[0], matlab_orange[1], matlab_orange[2], 160))
-        self.ber_curve.setPen(pg.mkPen(matlab_yellow, width=2.0))
-        self.ber_curve.setSymbolPen(pg.mkPen(matlab_yellow, width=1.0))
-        self.ber_curve.setSymbolBrush(pg.mkBrush(matlab_yellow))
-        self.ber_snr_curve.setPen(pg.mkPen(matlab_purple, width=2.0))
-        self.ber_snr_curve.setSymbolPen(pg.mkPen(matlab_purple, width=1.0))
-        self.ber_snr_curve.setSymbolBrush(pg.mkBrush(matlab_purple))
-
-    def _add_ofdm_specific_controls(self):
-        fft_layout = QHBoxLayout()
-        fft_label = QLabel("FFT 点数:")
-        self.fft_spin = QSpinBox()
-        self.fft_spin.setRange(64, 4096)
-        self.fft_spin.setValue(64)
-        self.fft_spin.setEnabled(False)
-        fft_layout.addWidget(fft_label)
-        fft_layout.addWidget(self.fft_spin)
-
-        delay_layout = QHBoxLayout()
-        delay_label = QLabel("最大多径时延:")
-        self.delay_spin = QSpinBox()
-        self.delay_spin.setRange(0, 64)
-        self.delay_spin.setValue(5)
-        self.delay_spin.setSuffix(" samp")
-        delay_layout.addWidget(delay_label)
-        delay_layout.addWidget(self.delay_spin)
-
-        mod_layout = QHBoxLayout()
-        mod_label = QLabel("调制方式:")
-        self.mod_combo = QComboBox()
-        self.mod_combo.addItems(["QPSK", "16QAM", "64QAM"])
-        mod_layout.addWidget(mod_label)
-        mod_layout.addWidget(self.mod_combo)
-
-        observe_layout = QHBoxLayout()
-        observe_label = QLabel("星座观察:")
-        self.observe_combo = QComboBox()
-        self.observe_combo.addItems(["均衡后", "均衡前"])
-        observe_layout.addWidget(observe_label)
-        observe_layout.addWidget(self.observe_combo)
-
-        self.param_layout.insertLayout(0, observe_layout)
-        self.param_layout.insertLayout(0, mod_layout)
-        self.param_layout.insertLayout(0, delay_layout)
-        self.param_layout.insertLayout(0, fft_layout)
-
-    def _connect_signals(self):
         self.btn_start.clicked.connect(self._on_start_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
+        self.study_point.connect(self._on_study_point)
+        self.study_finished.connect(self._on_study_finished)
+        self._apply_preset(0)
+        self._set_ui_enabled(True)
+        self._update_ofdm_info_panel(False)
 
-        # 运行时联动：允许在仿真过程中动态修改信道参数
-        self.snr_spin.valueChanged.connect(self._on_snr_changed)
-        self.cfo_spin.valueChanged.connect(self._on_cfo_changed)
-        self.doppler_spin.valueChanged.connect(self._on_doppler_changed)
-        self.delay_spin.valueChanged.connect(self._on_delay_changed)
-        self.observe_combo.currentIndexChanged.connect(self._on_observe_mode_changed)
+    @staticmethod
+    def _combo(items):
+        box = QComboBox()
+        for text, data in items:
+            box.addItem(text, data)
+        return box
+
+    @staticmethod
+    def _number(lo, hi, value, decimals=2, suffix=''):
+        spin = QDoubleSpinBox()
+        spin.setRange(lo, hi)
+        spin.setDecimals(decimals)
+        spin.setValue(value)
+        spin.setSuffix(suffix)
+        return spin
+
+    def _page(self, title):
+        content = QWidget()
+        form = QFormLayout(content)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setVerticalSpacing(7)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        self.parameter_tabs.addTab(scroll, title)
+        return form
+
+    def _build_controls(self):
+        self.param_group.hide()
+        self.controls_scroll.hide()
+        self.parameter_tabs = QTabWidget()
+        self.controls_rail_layout.addWidget(self.parameter_tabs, 1)
+        self.controls_panel.setMinimumWidth(330)
+        self.controls_panel.setMaximumWidth(390)
+        link = self._page('星地场景')
+        self.preset_combo = self._combo([
+            ('LEO S 波段 · LOS', 's_los'), ('LEO S 波段 · NLOS', 's_nlos'),
+            ('LEO Ka 波段 · 高动态', 'ka'), ('AWGN 基准', 'awgn'),
+        ])
+        self.profile_combo = self._combo([(name, name) for name in (
+            'NTN-TDLC5-200', 'NTN-TDLA100-200', 'NTN-TDLC5-1200', 'AWGN')])
+        self.fc_spin = self._number(.1, 40, 2, 2, ' GHz')
+        self.velocity_spin = self._number(0, 40000, 28080, 0, ' km/h')
+        self.radial_spin = self._number(0, 1, .5, 3)
+        self.compensation_spin = self._number(0, 100, 99.9, 3, ' %')
+        self.cfo_spin.setRange(-200000, 200000)
+        self.cfo_spin.setValue(0)
+        self.doppler_spin.setValue(200)
+        self.delay_scale_spin = self._number(.01, 1000, 1, 2, ' 倍')
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2_000_000_000)
+        self.seed_spin.setValue(42)
+        for text, widget in (
+            ('场景预设', self.preset_combo), ('信道剖面', self.profile_combo),
+            ('载频', self.fc_spin), ('相对速度', self.velocity_spin),
+            ('径向投影', self.radial_spin), ('公共频移预补偿', self.compensation_spin),
+            ('额外残余 CFO', self.cfo_spin), ('散射多普勒扩展', self.doppler_spin),
+            ('时延缩放', self.delay_scale_spin), ('随机种子', self.seed_spin),
+        ):
+            link.addRow(text, widget)
+        self.compensation_spin.setToolTip('补偿可预测公共轨道频移的比例；不消除散射多普勒扩展。')
+        self.delay_scale_spin.setToolTip('1 倍使用标准剖面时延；其它倍数为工程压力测试，保留分数采样时延。')
+        self.radial_spin.setToolTip('相对速度沿视线方向的比例，不是卫星仰角。')
+        wave = self._page('波形与接收')
+        self.fft_combo = self._combo([(str(n), n) for n in (64, 128, 256, 512)])
+        self.fft_combo.setCurrentIndex(1)
+        self.spacing_combo = self._combo([(f'{n} kHz', n * 1000.) for n in (15, 30, 60)])
+        self.spacing_combo.setCurrentIndex(1)
+        self.cp_spin = QSpinBox(); self.cp_spin.setRange(0, 127); self.cp_spin.setValue(16)
+        self.mod_combo = self._combo([(s, s) for s in ('QPSK', '16QAM', '64QAM')])
+        self.estimator_combo = self._combo([('导频 LS / 频域插值', 'pilot_ls'), ('理想 CSI 参考', 'ideal')])
+        self.equalizer_combo = self._combo([('单抽头 MMSE', 'mmse'), ('单抽头 ZF', 'zf')])
+        self.observe_combo = self._combo([('均衡后', 'post'), ('均衡前', 'pre')])
+        for text, widget in (
+            ('Eb/N0', self.snr_spin), ('FFT 点数', self.fft_combo),
+            ('子载波间隔', self.spacing_combo), ('CP 采样数', self.cp_spin),
+            ('调制', self.mod_combo), ('信道估计', self.estimator_combo),
+            ('均衡器', self.equalizer_combo), ('星座观察', self.observe_combo),
+        ):
+            wave.addRow(text, widget)
+        assumption = QLabel('SISO 未编码 CP-OFDM；假设帧定时已对齐。导频参与估计，发送数据仅用于误码和 EVM 评估。')
+        assumption.setWordWrap(True)
+        wave.addRow(assumption)
+        study = self._page('性能研究')
+        self.axis_combo = self._combo([
+            ('Eb/N0 (dB)', 'ebn0'), ('额外残余 CFO (Hz)', 'residual_cfo'),
+            ('子载波间隔 (kHz)', 'spacing'), ('时延缩放 (倍)', 'delay_scale'),
+        ])
+        self.scan_values_edit = QLineEdit('0, 4, 8, 12, 16, 20')
+        self.scan_frames_spin = QSpinBox(); self.scan_frames_spin.setRange(1, 500); self.scan_frames_spin.setValue(40)
+        self.export_button = QPushButton('导出研究结果 (JSON)')
+        self.export_button.setEnabled(False)
+        study.addRow('研究变量', self.axis_combo)
+        study.addRow('扫描取值', self.scan_values_edit)
+        study.addRow('每点帧数', self.scan_frames_spin)
+        study.addRow(self.export_button)
+        note = QLabel('三条曲线使用相同发送比特、信道和噪声样本。BER 保留原始计数；零误码用三角标记显示 95% 统计上界。')
+        note.setWordWrap(True)
+        study.addRow(note)
+        self.study_progress = QLabel('尚未运行性能研究')
+        self.study_progress.setWordWrap(True)
+        study.addRow(self.study_progress)
+        self.btn_auto_ber_snr.setText('开始性能扫描')
+        self.btn_stop_ber_snr.setText('停止扫描')
+        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        self.fft_combo.currentIndexChanged.connect(self._on_fft_changed)
+        self.spacing_combo.currentIndexChanged.connect(lambda *_: self._update_ofdm_info_panel(self.tb is not None))
+        self.mod_combo.currentIndexChanged.connect(lambda *_: self._update_ofdm_info_panel(self.tb is not None))
+        self.axis_combo.currentIndexChanged.connect(self._on_axis_changed)
+        self.observe_combo.currentIndexChanged.connect(lambda: self._refresh_plots(force=True))
+        self.export_button.clicked.connect(self._export_study)
+        for widget in (self.snr_spin, self.fc_spin, self.velocity_spin, self.radial_spin,
+                       self.compensation_spin, self.cfo_spin, self.doppler_spin,
+                       self.delay_scale_spin, self.cp_spin):
+            widget.valueChanged.connect(lambda *_: self._update_ofdm_info_panel(self.tb is not None))
+
+    def _style_plot(self, plot):
+        plot.setBackground((250, 250, 250))
+        plot.showGrid(x=True, y=True, alpha=.35)
+        for name in ('left', 'bottom'):
+            plot.getAxis(name).setPen(pg.mkPen(60, 60, 60))
+            plot.getAxis(name).setTextPen(pg.mkPen(60, 60, 60))
+        plot.getViewBox().setBorder(pg.mkPen(225, 225, 225))
+        plot.setMinimumSize(230, 165)
+
+    def _build_plots(self):
+        layout = self.plot_panel.layout()
+        grid = layout.takeAt(0).layout(); grid.setParent(None)
+        grid.setVerticalSpacing(6)
+        info = layout.takeAt(0).widget(); info.setParent(None)
+        grid.removeWidget(self.ber_snr_plot)
+        self.ber_snr_plot.setParent(None)
+        self.channel_plot = pg.PlotWidget(title='标准时延 / 功率轮廓')
+        self.channel_plot.setLabel('bottom', '超额时延', units='ns')
+        self.channel_plot.setLabel('left', '路径功率', units='dB')
+        self.channel_scatter = self.channel_plot.plot(pen=None, symbol='o', symbolBrush=COLORS['pilot_ls'])
+        grid.addWidget(self.channel_plot, 1, 1)
+        live = QWidget(); live_layout = QVBoxLayout(live)
+        live_layout.setContentsMargins(4, 4, 4, 4)
+        live_layout.addLayout(grid, 4); live_layout.addWidget(info, 1)
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.addTab(live, '实时星地链路')
+        research = QWidget(); body = QVBoxLayout(research)
+        body.setContentsMargins(4, 4, 4, 4)
+        plots = QHBoxLayout()
+        self.ber_snr_plot.setTitle('实测 BER 与统计上界')
+        self.ber_snr_plot.setLabel('left', 'BER')
+        self.ber_snr_plot.setLogMode(y=True)
+        self.study_evm_plot = pg.PlotWidget(title='解调质量 (EVM)')
+        self.study_evm_plot.setLabel('left', 'EVM RMS', units='%')
+        self._study_curves, self._study_zero_curves, self._study_evm_curves = {}, {}, {}
+        for plot in (self.ber_snr_plot, self.study_evm_plot):
+            plot.addLegend(offset=(4, 4), labelTextSize='8pt', verSpacing=-3)
+            plots.addWidget(plot)
+        for key, color in COLORS.items():
+            self._study_curves[key] = self.ber_snr_plot.plot(pen=pg.mkPen(color, width=2), symbol='o', symbolSize=5, name=NAMES[key])
+            self._study_zero_curves[key] = self.ber_snr_plot.plot(pen=None, symbol='t', symbolSize=8, symbolBrush=color)
+            self._study_evm_curves[key] = self.study_evm_plot.plot(pen=pg.mkPen(color, width=2), symbol='o', symbolSize=5, name=NAMES[key])
+        body.addLayout(plots, 1)
+        self.result_table = QTableWidget(0, 7)
+        self.result_table.setHorizontalHeaderLabels(['扫描值', 'LS BER', '理想 CSI BER', '未补偿 BER', 'LS 错误/比特', 'LS 95% 区间', 'LS EVM (%)'])
+        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.result_table.setMaximumHeight(185)
+        self.result_table.verticalHeader().setDefaultSectionSize(24)
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        body.addWidget(self.result_table)
+        self.study_note = QLabel('Eb/N0 按发送整帧能量 / 信息比特定义，计入 CP 与导频能量。理想 CSI 仅为单抽头均衡参考，仍存在时变 ICI。')
+        self.study_note.setWordWrap(True)
+        self.study_note.setMinimumWidth(0)
+        body.addWidget(self.study_note)
+        self.plot_tabs.addTab(research, '性能研究')
+        layout.addWidget(self.plot_tabs)
+        self.spectrum_plot.setTitle('接收频谱')
+        self.constellation_plot.setTitle('接收星座')
+        self.constellation_plot.setXRange(-2, 2); self.constellation_plot.setYRange(-2, 2)
+        self.ber_plot.setTitle('累计实测 BER')
+        self.ber_plot.setLabel('left', 'BER'); self.ber_plot.setLogMode(y=True)
+        self.ber_curve.setPen(pg.mkPen(COLORS['pilot_ls'], width=2))
+        self.ber_curve.setSymbolPen(pg.mkPen(COLORS['pilot_ls']))
+        self.ber_curve.setSymbolBrush(pg.mkBrush(COLORS['pilot_ls']))
+        self.spectrum_curve.setPen(pg.mkPen(COLORS['pilot_ls'], width=2))
+        self.constellation_scatter.setPen(pg.mkPen(COLORS['uncompensated'], width=.8))
+        self.constellation_scatter.setBrush(pg.mkBrush(*COLORS['uncompensated'], 160))
+        self.live_zero_curve = self.ber_plot.plot(pen=None, symbol='t', symbolSize=7, symbolBrush=COLORS['pilot_ls'])
+        for plot in (self.spectrum_plot, self.constellation_plot, self.ber_plot, self.channel_plot,
+                     self.ber_snr_plot, self.study_evm_plot):
+            self._style_plot(plot)
+        self.rename_info_rows({'同步度量': 'EVM RMS', 'CFO估计': '残余 CFO',
+                               '数据符号': '归一化 CFO', '星座观察': 'CP 余量'})
+
+    def _apply_preset(self, index):
+        if not hasattr(self, 'fc_spin'):
+            return
+        key = self.preset_combo.itemData(index)
+        profile, fc, doppler = {
+            's_los': ('NTN-TDLC5-200', 2., 200.),
+            's_nlos': ('NTN-TDLA100-200', 2., 200.),
+            'ka': ('NTN-TDLC5-1200', 20., 1200.),
+            'awgn': ('AWGN', 2., 0.),
+        }[key]
+        self.profile_combo.setCurrentText(profile)
+        self.fc_spin.setValue(fc)
+        self.velocity_spin.setValue(0 if key == 'awgn' else 28080)
+        self.spacing_combo.setCurrentIndex(2 if key == 'ka' else 1)
+        self.doppler_spin.setValue(doppler)
+        self.compensation_spin.setValue(100. if key == 'awgn' else 99.9)
+        self.cfo_spin.setValue(0)
+        self.delay_scale_spin.setValue(1)
+        self._update_ofdm_info_panel(self.tb is not None)
+
+    def _on_profile_changed(self):
+        name = self.profile_combo.currentData()
+        self.doppler_spin.setValue(0 if name == 'AWGN' else get_profile(name).maximum_doppler_hz)
+        self._update_ofdm_info_panel(self.tb is not None)
+
+    def _on_fft_changed(self):
+        self.cp_spin.setMaximum(int(self.fft_combo.currentData()) - 1)
+        self._update_ofdm_info_panel(self.tb is not None)
+
+    def _on_axis_changed(self):
+        axis = self.axis_combo.currentData()
+        self.scan_values_edit.setText({
+            'ebn0': '0, 4, 8, 12, 16, 20', 'residual_cfo': '0, 300, 1500, 3000, 6000, 15000',
+            'spacing': '15, 30, 60', 'delay_scale': '1, 5, 10, 25, 50, 100',
+        }[axis])
+
+    def _collect_config(self):
+        return OfdmNtnConfig(
+            profile=self.profile_combo.currentData(), fft_len=int(self.fft_combo.currentData()),
+            cp_len=self.cp_spin.value(), subcarrier_spacing_hz=float(self.spacing_combo.currentData()),
+            modulation=self.mod_combo.currentText(), ebn0_db=self.snr_spin.value(),
+            carrier_frequency_hz=self.fc_spin.value() * 1e9, velocity_kmh=self.velocity_spin.value(),
+            radial_projection=self.radial_spin.value(), compensation_ratio=self.compensation_spin.value() / 100.,
+            residual_cfo_hz=self.cfo_spin.value(), doppler_spread_hz=self.doppler_spin.value(),
+            delay_scale=self.delay_scale_spin.value(), estimator=self.estimator_combo.currentData(),
+            equalizer=self.equalizer_combo.currentData(), seed=self.seed_spin.value(),
+        ).validated()
+
+    def _set_ui_enabled(self, controls_enabled):
+        busy = not controls_enabled or self._auto_ber_snr_active
+        self.btn_start.setEnabled(not busy)
+        self.btn_stop.setEnabled(self.tb is not None)
+        self.btn_auto_ber_snr.setEnabled(not busy)
+        self.btn_stop_ber_snr.setEnabled(self._auto_ber_snr_active)
+        if hasattr(self, 'parameter_tabs'):
+            for widget in self.parameter_tabs.findChildren((QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QPushButton)):
+                widget.setEnabled(not busy)
+        self.observe_combo.setEnabled(True)
+        self.export_button.setEnabled(bool(self._study_results) and not self._auto_ber_snr_active)
 
     def _on_start_clicked(self):
-        print("[OFDM] 正在启动 (基于GRC代码)...")
-        self._on_stop_clicked()
-
         try:
-            from waveform_sim.simulation.simple_ofdm_rx import OfdmTransceiver
-            self.tb = OfdmTransceiver(
-                fft_len=64,
-                cp_len=16,
-                snr_db=self.snr_spin.value(),
-                cfo_hz=self.cfo_spin.value(),
-                doppler_spread_hz=self.doppler_spin.value(),
-                delay_spread=self.delay_spin.value(),
-                mod_order=self.mod_combo.currentText()
-            )
-
+            config = self._collect_config()
+            self._stop_auto_ber_snr_sweep()
+            self._on_stop_clicked()
+            self._tasks_suspended = False
+            self.tb = OfdmNtnRunner(config)
+            self._last_frame = 0
+            self._live_x, self._live_y, self._live_upper = [], [], []
+            self.ber_curve.clear(); self.live_zero_curve.clear()
             self.tb.start()
-            self._sim_start_time = time.time()
-            self._evm_time_hist = []
-            self._evm_value_hist = []
-            self._reset_ber_snr_curve()
-            self._snr_settle_start_time = time.time()
-            self.ber_curve.setData([], [])
+            self.update_timer.start()
+            self.plot_tabs.setCurrentIndex(0)
             self._set_ui_enabled(False)
-            self.update_timer.start(300)
-            self._update_ofdm_info_panel(running=True)
-            print("[OFDM] 启动成功。")
-
-        except Exception as e:
-            print(f"[Error] {e}")
-            import traceback
-            traceback.print_exc()
+            self._update_ofdm_info_panel(True)
+        except Exception as exc:
+            self._on_stop_clicked()
+            self.update_info_panel(status_text=f'仿真未启动：{exc}')
 
     def _on_stop_clicked(self):
-        print("[OFDM] 停止中...")
         self.update_timer.stop()
-        if self.tb:
-            try:
-                self.tb.stop()
-                self.tb.wait()
-            except Exception:
-                pass
-            finally:
-                self.tb = None
-        self._last_constellation = None
-        self._last_constellation_time = 0.0
-        self._sim_start_time = None
-        self._evm_time_hist = []
-        self._evm_value_hist = []
-        self.constellation_scatter.setData(x=[], y=[])
-        self.ber_curve.setData([], [])
-        self._reset_ber_snr_curve()
+        if self.tb is not None:
+            self.tb.stop(); self.tb.wait(timeout=1.5); self.tb = None
         self._set_ui_enabled(True)
-        self._update_ofdm_info_panel(running=False)
+        self.update_info_panel(metrics={'运行状态': '已停止（保留结果）'})
 
-    def _set_ui_enabled(self, controls_enabled: bool):
-        self.btn_start.setEnabled(controls_enabled)
-        self.btn_stop.setEnabled(not controls_enabled)
+    @staticmethod
+    def _upper_limit(errors, bits):
+        if bits <= 0:
+            return float('nan')
+        z = 1.95996398454; p = errors / bits
+        return (p + z*z/(2*bits) + z*np.sqrt(p*(1-p)/bits+z*z/(4*bits*bits))) / (1+z*z/bits)
 
-        # Eb/N0 / CFO / 多普勒 / 观察模式 允许运行时修改；调制方式仍建议停机后再改。
-        self.snr_spin.setEnabled(True)
-        self.cfo_spin.setEnabled(True)
-        self.doppler_spin.setEnabled(True)
-        self.delay_spin.setEnabled(True)
-        self.observe_combo.setEnabled(True)
-        self.mod_combo.setEnabled(controls_enabled)
-
-    def _update_constellation_title(self, has_fresh: bool = True):
-        if self.observe_combo.currentText() == "均衡前":
-            title = "星座图 (Pre-EQ Constellation)"
-        else:
-            title = "星座图 (Post-EQ Constellation)"
-            if not has_fresh:
-                title += " - 无新帧"
-        self.constellation_plot.setTitle(title)
-
-    def _on_observe_mode_changed(self, _index):
-        self._last_constellation = None
-        self._last_constellation_time = 0.0
-        self._update_constellation_title()
-
-    def _on_snr_changed(self, value):
-        if self.tb:
-            try:
-                self.tb.set_snr_db(float(value))
-                self._last_constellation = None
-                self._last_constellation_time = 0.0
-                self._evm_time_hist = []
-                self._evm_value_hist = []
-                self.constellation_scatter.setData(x=[], y=[])
-                self.ber_curve.setData([], [])
-                self._snr_settle_start_time = time.time()
-                if self._sim_start_time is not None:
-                    self._sim_start_time = time.time()
-            except Exception:
-                pass
-
-    def _on_cfo_changed(self, value):
-        if self.tb:
-            try:
-                self.tb.set_cfo_hz(float(value))
-                self._last_constellation = None
-                self._last_constellation_time = 0.0
-                self._evm_time_hist = []
-                self._evm_value_hist = []
-                self.constellation_scatter.setData(x=[], y=[])
-                self.ber_curve.setData([], [])
-                self._reset_ber_snr_curve()
-                self._snr_settle_start_time = time.time()
-                if self._sim_start_time is not None:
-                    self._sim_start_time = time.time()
-            except Exception:
-                pass
-
-    def _reset_runtime_curves_after_channel_change(self):
-        self._last_constellation = None
-        self._last_constellation_time = 0.0
-        self._evm_time_hist = []
-        self._evm_value_hist = []
-        self.constellation_scatter.setData(x=[], y=[])
-        self.ber_curve.setData([], [])
-        self._reset_ber_snr_curve()
-        self._snr_settle_start_time = time.time()
-        if self._sim_start_time is not None:
-            self._sim_start_time = time.time()
-
-    def _on_doppler_changed(self, value):
-        if self.tb:
-            try:
-                self.tb.set_doppler_spread_hz(float(value))
-                self._reset_runtime_curves_after_channel_change()
-            except Exception:
-                pass
-
-    def _on_delay_changed(self, value):
-        if self.tb:
-            try:
-                self.tb.set_delay_spread(int(value))
-                self._reset_runtime_curves_after_channel_change()
-            except Exception:
-                pass
-
-    def _refresh_plots(self):
-        if not self.tb:
+    def _refresh_plots(self, force=False):
+        if self.tb is None or not hasattr(self.tb, 'snapshot'):
             return
+        frame = self.tb.snapshot()
+        if not frame:
+            return
+        if 'error' in frame:
+            self._on_stop_clicked()
+            self.update_info_panel(status_text=f'仿真失败：{frame["error"]}')
+            return
+        number = frame['frames']
+        if number == self._last_frame and not force:
+            return
+        config = self.tb.config
+        samples = frame['rx_samples']
+        fs = config.fft_len * config.subcarrier_spacing_hz
+        freq, psd = compute_spectrum(samples, fs)
+        self.spectrum_curve.setData(freq, psd)
+        points = np.asarray(frame['pre_eq_symbols'] if self.observe_combo.currentData() == 'pre' else frame['rx_symbols']).reshape(-1)[:1024]
+        self.constellation_scatter.setData(x=points.real, y=points.imag)
+        self.constellation_plot.setTitle('均衡前星座' if self.observe_combo.currentData() == 'pre' else '均衡后星座')
+        if number != self._last_frame:
+            self._last_frame = number
+            self._live_x.append(frame['elapsed_s'])
+            self._live_y.append(frame['cumulative_ber'])
+            self._live_upper.append(self._upper_limit(frame['cumulative_errors'], frame['cumulative_bits']))
+            self._live_x, self._live_y, self._live_upper = self._live_x[-240:], self._live_y[-240:], self._live_upper[-240:]
+        x, y, upper = map(np.asarray, (self._live_x, self._live_y, self._live_upper))
+        if np.any(y > 0):
+            self.ber_curve.setData(x, np.where(y > 0, y, np.nan), connect='finite')
+        else:
+            self.ber_curve.setData([], [])
+        zero = y == 0
+        self.live_zero_curve.setData(x[zero], upper[zero])
+        self.live_zero_curve.setToolTip('三角标记表示零误码样本的 95% Wilson 上界；原始 BER 仍为 0。')
+        self.update_info_panel(metrics={
+            '运行状态': f'运行中 · {number} 帧', 'Eb/N0': f'{config.ebn0_db:.1f} dB',
+            'BER': f'{frame["cumulative_ber"]:.3g} ({frame["cumulative_errors"]}/{frame["cumulative_bits"]})',
+            'FER': f'{frame["cumulative_fer"]:.3g}', '同步度量': f'{frame["evm_percent"]:.2f} %',
+        })
 
+    def _update_ofdm_info_panel(self, running=False):
+        if not hasattr(self, 'profile_combo') or not hasattr(self, 'study_note'):
+            return
         try:
-            # 频谱用更长样本做分段平均，才能看出 OFDM 的带宽形状和 DC/保护子载波特征
-            samples = self.tb.get_spectrum(num_samples=8192)
+            config = self._collect_config()
+            summary = config_summary(config)
+        except ValueError:
+            return
+        orbital = absolute_doppler_shift_hz(config.carrier_frequency_hz, config.velocity_kmh, config.radial_projection)
+        residual = orbital * (1-config.compensation_ratio) + config.residual_cfo_hz
+        cp_s = config.cp_len / (config.fft_len * config.subcarrier_spacing_hz)
+        profile = None if config.profile == 'AWGN' else get_profile(config.profile)
+        maximum_delay = 0. if profile is None else max(profile.delays_ns) * config.delay_scale * 1e-9
+        margin = cp_s - maximum_delay
+        if profile is None:
+            delays, powers = [0.], [0.]
+        else:
+            delays = np.array(profile.delays_ns) * config.delay_scale
+            powers = profile.powers_db
+        self.channel_scatter.setData(delays, powers)
+        self.update_info_panel(
+            metrics={'运行状态': '运行中' if running else '待运行', 'Eb/N0': f'{config.ebn0_db:.1f} dB', 'CFO估计': f'{residual:.2f} Hz'},
+            config={'波形': f'OFDM · {config.profile}', 'FFT/CP': f'{config.fft_len} / {config.cp_len}',
+                    '调制': config.modulation, '采样率': f'{config.fft_len*config.subcarrier_spacing_hz/1e6:.2f} MHz',
+                    '数据符号': f'{abs(residual)/config.subcarrier_spacing_hz:.4g}', '星座观察': f'{margin*1e6:.3f} μs'},
+            status_text=(f'公共轨道频移 {orbital/1000:.2f} kHz；预补偿后公共残余 {residual:.2f} Hz。\n'
+                         f'散射扩展 {config.doppler_spread_hz:.0f} Hz；CP {cp_s*1e6:.3f} μs，最大超额时延 {maximum_delay*1e6:.3f} μs。\n'
+                         + ('CP 不足，可能出现 ISI。\n' if margin < 0 else '')
+                         + '理想帧定时；未编码 SISO；按真实比特统计 BER。零误码三角标记为统计上界。'),
+        )
+        self.status_text_label.setToolTip(json.dumps(summary, ensure_ascii=False, indent=2))
 
-            if self.observe_combo.currentText() == "均衡前":
-                constellation = self.tb.get_pre_eq_constellation()
+    def _start_auto_ber_snr_sweep(self):
+        if self._auto_ber_snr_active:
+            return
+        try:
+            config = self._collect_config()
+            text = self.scan_values_edit.text().replace('，', ',')
+            values = [float(s.strip()) for s in text.split(',') if s.strip()]
+            if not 1 <= len(values) <= 31 or not np.all(np.isfinite(values)):
+                raise ValueError('请输入 1–31 个有限数值，以逗号分隔。')
+            if len(set(values)) != len(values):
+                raise ValueError('扫描取值不能重复。')
+            axis = self.axis_combo.currentData()
+            if axis == 'spacing':
+                values = [v * 1000 for v in values]
+            if axis in ('spacing', 'delay_scale') and min(values) <= 0:
+                raise ValueError('子载波间隔和时延缩放必须大于 0。')
+            field = {'ebn0': 'ebn0_db', 'residual_cfo': 'residual_cfo_hz',
+                     'spacing': 'subcarrier_spacing_hz', 'delay_scale': 'delay_scale'}[axis]
+            for value in values:
+                replace(config, **{field: value}).validated()
+        except ValueError as exc:
+            QMessageBox.information(self, '扫描参数', str(exc))
+            return
+        self._on_stop_clicked()
+        self._tasks_suspended = False
+        self._study_token += 1
+        token = self._study_token
+        self._study_stop = threading.Event()
+        stop = self._study_stop
+        self._study_config, self._study_axis, self._study_values = config, axis, values
+        self._study_results = []
+        self.result_table.setRowCount(0)
+        for curve in (*self._study_curves.values(), *self._study_zero_curves.values(), *self._study_evm_curves.values()):
+            curve.clear()
+        self._auto_ber_snr_active = True
+        self._set_ui_enabled(True)
+        self.plot_tabs.setCurrentIndex(1)
+        self.study_progress.setText(f'性能研究进行中：0 / {len(values)} 点')
+        label = self.axis_combo.currentText()
+        for plot in (self.ber_snr_plot, self.study_evm_plot):
+            plot.setLabel('bottom', label)
+        self.study_note.setText(
+            f'{config.profile} · FFT {config.fft_len} / CP {config.cp_len} · {config.modulation} · {self.scan_frames_spin.value()} 帧/点 · seed {config.seed}。'
+            '三策略使用相同样本；三角标记=零误码 95% 上界，非实测非零 BER。'
+            + (' 固定 FFT 比较间隔时，带宽和 CP 时长也随之变化。' if axis == 'spacing' else '')
+        )
+        frames = self.scan_frames_spin.value()
+        def emit_point(point):
+            if not stop.is_set() and not self._tasks_suspended:
+                try:
+                    self.study_point.emit(token, point)
+                except RuntimeError:
+                    stop.set()
+        def work():
+            message = '已完成'
+            try:
+                run_study(config, axis, values, frames, stop_event=stop, on_point=emit_point)
+                if stop.is_set():
+                    message = '已停止，保留已完成点'
+            except Exception as exc:
+                message = f'失败：{exc}'
+            if not self._tasks_suspended:
+                try:
+                    self.study_finished.emit(token, message)
+                except RuntimeError:
+                    stop.set()
+        self._ber_snr_sweep_thread = threading.Thread(target=work, daemon=True, name='ofdm-ntn-study')
+        self._ber_snr_sweep_thread.start()
+
+    def _stop_auto_ber_snr_sweep(self):
+        self._study_token += 1
+        self._study_stop.set()
+        worker = self._ber_snr_sweep_thread
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=1.7)
+        was_running = self._auto_ber_snr_active
+        self._auto_ber_snr_active = False
+        if hasattr(self, 'export_button'):
+            self._set_ui_enabled(self.tb is None)
+            if was_running:
+                self.study_progress.setText(f'已停止 · 保留 {len(self._study_results)} 个完整点')
+
+    def _on_study_point(self, token, point):
+        if token != self._study_token or self._tasks_suspended:
+            return
+        self._study_results.append(point)
+        scale = 1000. if self._study_axis == 'spacing' else 1.
+        x = np.array([p['axis_value']/scale for p in self._study_results])
+        for key in COLORS:
+            stats = [p['strategies'][key] for p in self._study_results]
+            y = np.array([s['ber'] for s in stats])
+            if np.any(y > 0):
+                self._study_curves[key].setData(x, np.where(y > 0, y, np.nan), connect='finite')
             else:
-                constellation = self.tb.get_constellation()
+                self._study_curves[key].setData([], [])
+            zero = y == 0
+            self._study_zero_curves[key].setData(x[zero], np.array([s['ci_high'] for s in stats])[zero])
+            self._study_evm_curves[key].setData(x, [s.get('evm_percent', np.nan) for s in stats])
+        values = point['strategies']; current = values['pilot_ls']
+        row = self.result_table.rowCount(); self.result_table.insertRow(row)
+        for col, text in enumerate((f'{point["axis_value"]/scale:g}', f'{current["ber"]:.3g}',
+                f'{values["ideal"]["ber"]:.3g}', f'{values["uncompensated"]["ber"]:.3g}',
+                f'{current["bit_errors"]}/{current["total_bits"]}',
+                f'[{current["ci_low"]:.2g}, {current["ci_high"]:.2g}]', f'{current.get("evm_percent", np.nan):.2f}')):
+            item = QTableWidgetItem(text); item.setToolTip(text)
+            self.result_table.setItem(row, col, item)
+        self.study_progress.setText(f'已完成 {len(self._study_results)} / {len(self._study_values)} 点')
 
-            evm_hist = self.tb.get_evm_history() if hasattr(self.tb, "get_evm_history") else None
-            fer_est = self.tb.get_fer_estimate()
-            ber_est = self.tb.get_ber_estimate() if hasattr(self.tb, "get_ber_estimate") else None
-            last_metrics = self.tb.get_last_metrics() if hasattr(self.tb, "get_last_metrics") else {}
-            evm_est = last_metrics.get("evm_percent", None)
-
-            if samples is None or len(samples) == 0:
-                return
-
-            samp_rate = getattr(self.tb, "samp_rate", float(len(samples)))
-
-            seg_len = 1024
-            if len(samples) < seg_len:
-                seg_len = len(samples)
-
-            n_seg = max(1, len(samples) // seg_len)
-            trimmed = samples[-n_seg * seg_len:]
-            blocks_ = trimmed.reshape(n_seg, seg_len)
-            window = np.hanning(seg_len).astype(np.float32)
-
-            psd = np.zeros(seg_len, dtype=np.float64)
-            for blk in blocks_:
-                spec = np.fft.fftshift(np.fft.fft(blk * window))
-                psd += np.abs(spec) ** 2
-
-            psd /= max(n_seg, 1)
-            spectrum_db = 10 * np.log10(psd + 1e-12)
-            freq_axis = np.linspace(-samp_rate / 2, samp_rate / 2, seg_len, endpoint=False)
-
-            self._update_ofdm_info_panel(
-                running=True,
-                metrics=last_metrics,
-                ber_est=ber_est,
-                fer_est=fer_est,
-                evm_percent=evm_est,
-                samp_rate=samp_rate,
+    def _on_study_finished(self, token, message):
+        if token != self._study_token or self._tasks_suspended:
+            return
+        self._auto_ber_snr_active = False
+        self._set_ui_enabled(self.tb is None)
+        self.study_progress.setText(f'{message} · {len(self._study_results)} / {len(self._study_values)} 点')
+        if self._study_results:
+            point = max(self._study_results, key=lambda p: p['axis_value'])
+            stats = point['strategies']
+            ls = stats['pilot_ls']
+            value = point['axis_value'] / (1000 if self._study_axis == 'spacing' else 1)
+            self.study_note.setText(
+                f'最大扫描值 {value:g}：LS BER={ls["ber"]:.3g}，理想 CSI={stats["ideal"]["ber"]:.3g}，'
+                f'关闭预补偿={stats["uncompensated"]["ber"]:.3g}；LS 共 {ls["bit_errors"]}/{ls["total_bits"]} 错误比特。'
+                f'95% Wilson 区间 [{ls["ci_low"]:.2g}, {ls["ci_high"]:.2g}]；零误码受样本量限制。'
+                + (' 间隔扫描固定 FFT，带宽和 CP 时长同时变化。' if self._study_axis == 'spacing' else '')
+            )
+            self.study_note.setToolTip(
+                '原始统计未强制单调、未用 EVM 反推 BER。区间按二项分布计数估计；相关衰落样本并不等同于独立信道试验。'
+                '每点采用固定帧数和同一随机路径实现，不代表所有信道平均性能。'
             )
 
-            self._record_ber_snr_point(last_metrics, ber_est)
-            ber_snr_data = self._get_ber_snr_data()
-
-            # 只显示“真正的均衡后星座”；如果本轮没新点，就沿用上一帧
-            now = time.time()
-            hold_sec = 0.35
-
-            if constellation is not None and len(constellation) >= 10:
-                self._last_constellation = constellation
-                self._last_constellation_time = now
-                has_fresh = True
-            elif self._last_constellation is not None and (now - self._last_constellation_time) <= hold_sec:
-                constellation = self._last_constellation
-                has_fresh = True
-            else:
-                constellation = None
-                has_fresh = False
-
-            self._update_constellation_title(has_fresh=has_fresh)
-
-            if evm_hist is not None and len(evm_hist) == 2:
-                evm_t, evm_v = evm_hist
-                evm_t = np.asarray(evm_t, dtype=np.float64)
-                evm_v = np.asarray(evm_v, dtype=np.float64)
-                finite_mask = np.isfinite(evm_t) & np.isfinite(evm_v)
-                evm_t = evm_t[finite_mask]
-                evm_v = evm_v[finite_mask]
-                if evm_t.size > 0 and evm_v.size > 0:
-                    if evm_t.size != evm_v.size:
-                        n_hist = min(evm_t.size, evm_v.size)
-                        evm_t = evm_t[:n_hist]
-                        evm_v = evm_v[:n_hist]
-                    recent_mask = (evm_t >= max(0.0, evm_t[-1] - 60.0))
-                    self._evm_time_hist = evm_t[recent_mask].tolist()
-                    self._evm_value_hist = np.maximum(evm_v[recent_mask], 0.0).tolist()
-                elif self._sim_start_time is not None and evm_est is not None:
-                    try:
-                        evm_est_f = float(evm_est)
-                    except Exception:
-                        evm_est_f = float("nan")
-                    if np.isfinite(evm_est_f):
-                        elapsed = max(0.0, time.time() - self._sim_start_time)
-                        self._evm_time_hist.append(elapsed)
-                        self._evm_value_hist.append(max(evm_est_f, 0.0))
-            elif self._sim_start_time is not None and evm_est is not None:
-                try:
-                    evm_est_f = float(evm_est)
-                except Exception:
-                    evm_est_f = float("nan")
-                if np.isfinite(evm_est_f):
-                    elapsed = max(0.0, time.time() - self._sim_start_time)
-                    self._evm_time_hist.append(elapsed)
-                    self._evm_value_hist.append(max(evm_est_f, 0.0))
-
-            if self._evm_time_hist:
-                latest_t = self._evm_time_hist[-1]
-                while self._evm_time_hist and (latest_t - self._evm_time_hist[0]) > 60.0:
-                    self._evm_time_hist.pop(0)
-                    self._evm_value_hist.pop(0)
-
-            if constellation is not None and len(constellation) > 0:
-                self.update_plots(
-                    spectrum_data=(freq_axis, spectrum_db),
-                    constellation_data=constellation,
-                    ber_data=(self._evm_time_hist, self._evm_value_hist),
-                    ber_snr_data=ber_snr_data,
-                )
-            else:
-                self.update_plots(
-                    spectrum_data=(freq_axis, spectrum_db),
-                    ber_data=(self._evm_time_hist, self._evm_value_hist),
-                    ber_snr_data=ber_snr_data,
-                )
-                self.constellation_scatter.setData(x=[], y=[])
-
-        except Exception as e:
-            print(f"[OFDM][refresh error] {e}")
-            import traceback
-            traceback.print_exc()
-
-
-    def _reset_ber_snr_curve(self):
-        """清空 BER-SNR 曲线；用于重新开始或信道条件变化时。"""
-        self._ber_snr_auto_mode = False
-        self._auto_ber_snr_active = False
-        self._ber_snr_sum = {}
-        self._ber_snr_count = {}
-        self._snr_settle_start_time = None
-        if hasattr(self, "ber_snr_curve"):
-            self.ber_snr_curve.setData([], [])
-
-    def _record_ber_snr_point(self, metrics, ber_est):
-        """把当前 SNR 下的 BER 估计累积到 BER-SNR 曲线。"""
-        if getattr(self, "_ber_snr_auto_mode", False):
+    def _export_study(self):
+        if not self._study_results:
             return
-        if ber_est is None:
+        path, _ = QFileDialog.getSaveFileName(self, '导出 OFDM 星地性能研究', 'ofdm_ntn_study.json', 'JSON (*.json)')
+        if not path:
             return
-
-        # SNR 刚切换时，仿真器会重置统计量；稍等一下再记录，避免把瞬态误差画进去。
-        if self._snr_settle_start_time is not None:
-            if (time.time() - self._snr_settle_start_time) < 1.0:
-                return
-            self._snr_settle_start_time = None
-
+        report = {'config': asdict(self._study_config), 'axis': self._study_axis,
+                  'values': self._study_values, 'results': self._study_results,
+                  'assumptions': 'SISO uncoded CP-OFDM; aligned frame timing; transmit-frame Eb/N0 including overhead; raw BER; Wilson 95% intervals.'}
         try:
-            snr_db = float(metrics.get("ebn0_db", self.snr_spin.value()))
-            ber_value = float(ber_est)
-        except Exception:
-            return
-
-        if not (np.isfinite(snr_db) and np.isfinite(ber_value)):
-            return
-
-        snr_key = round(snr_db, 1)
-        ber_value = max(ber_value, 1e-12)
-
-        self._ber_snr_sum[snr_key] = self._ber_snr_sum.get(snr_key, 0.0) + ber_value
-        self._ber_snr_count[snr_key] = self._ber_snr_count.get(snr_key, 0) + 1
-
-    def _get_ber_snr_data(self):
-        """返回按 SNR 排序后的 BER-SNR 曲线数据。"""
-        if not self._ber_snr_sum:
-            return ([], [])
-
-        snr_values = sorted(self._ber_snr_sum.keys())
-        ber_values = [
-            max(self._ber_snr_sum[snr] / max(self._ber_snr_count.get(snr, 1), 1), 1e-12)
-            for snr in snr_values
-        ]
-        return (snr_values, ber_values)
-
-
-    @staticmethod
-    def _format_scientific(value):
-        """格式化 BER/FER，便于在信息面板中显示。"""
-        try:
-            value = float(value)
-            if not np.isfinite(value):
-                return "--"
-            return f"{max(value, 1e-12):.2e}"
-        except Exception:
-            return "--"
-
-    @staticmethod
-    def _format_float(value, digits=2, suffix=""):
-        """安全格式化普通浮点数。"""
-        try:
-            value = float(value)
-            if not np.isfinite(value):
-                return "--"
-            return f"{value:.{digits}f}{suffix}"
-        except Exception:
-            return "--"
-
-    @staticmethod
-    def _format_percent(value, digits=2):
-        """安全格式化 EVM 百分比。"""
-        try:
-            value = float(value)
-            if not np.isfinite(value):
-                return "--"
-            return f"{value:.{digits}f}%"
-        except Exception:
-            return "--"
-
-    def _update_ofdm_info_panel(
-        self,
-        running: bool,
-        metrics=None,
-        ber_est=None,
-        fer_est=None,
-        evm_percent=None,
-        samp_rate=None,
-    ):
-        """刷新底部 OFDM 信息面板。"""
-        metrics = metrics or {}
-
-        elapsed_text = "--"
-        if running and self._sim_start_time is not None:
-            elapsed_text = f"{max(0.0, time.time() - self._sim_start_time):.1f} s"
-
-        fft_len = int(self.fft_spin.value()) if hasattr(self, "fft_spin") else 64
-        cp_len = int(getattr(self.tb, "cp_len", 16)) if self.tb is not None else 16
-        data_symbols = metrics.get("net_data_symbols", 7 * 48)
-        if samp_rate is None and self.tb is not None:
-            samp_rate = getattr(self.tb, "samp_rate", None)
-
-        if samp_rate is None:
-            samp_rate_text = "--"
-        elif float(samp_rate) >= 1e6:
-            samp_rate_text = f"{float(samp_rate) / 1e6:.2f} MSa/s"
-        else:
-            samp_rate_text = f"{float(samp_rate) / 1e3:.1f} kSa/s"
-
-        ebn0_db = metrics.get("ebn0_db", self.snr_spin.value())
-        sync_metric = metrics.get("sync_metric", None)
-        cfo_est = metrics.get("total_cfo_hz", metrics.get("coarse_cfo_hz", None))
-        if evm_percent is None:
-            evm_percent = metrics.get("evm_percent", None)
-        evm_text = self._format_percent(evm_percent, digits=2)
-
-        self.update_info_panel(
-            metrics={
-                "运行状态": "运行中" if running else "未启动",
-                "Eb/N0": self._format_float(ebn0_db, digits=1, suffix=" dB"),
-                "BER": self._format_scientific(ber_est),
-                "FER": self._format_scientific(fer_est),
-                "同步度量": self._format_float(sync_metric, digits=3),
-                "CFO估计": self._format_float(cfo_est, digits=1, suffix=" Hz"),
-            },
-            config={
-                "波形": "OFDM",
-                "FFT/CP": f"{fft_len} / {cp_len}",
-                "调制": self.mod_combo.currentText(),
-                "采样率": samp_rate_text,
-                "数据符号": str(data_symbols),
-                "星座观察": self.observe_combo.currentText(),
-            },
-            status_text=(
-                f"已运行 {elapsed_text}。EVM-时间曲线显示最近 60 s 的均衡后调制质量，当前 EVM={evm_text}；"
-                "BER-SNR 曲线由左侧按钮启动独立自动扫描生成；"
-                "频谱图采用分段平均，星座图可在均衡前/均衡后之间切换。"
-                if running else
-                "点击开始仿真后，左下角曲线显示 EVM vs Time，底部仍显示 Eb/N0、BER、FER、同步度量、CFO 估计和帧资源配置；"
-                "点击“自动绘制 BER-SNR”后，右下角会独立扫描形成曲线。"
-            ),
-        )
-
-    def _create_ber_snr_sweep_transceiver(self, snr_db: float):
-        from waveform_sim.simulation.simple_ofdm_rx import OfdmTransceiver
-        return OfdmTransceiver(
-            fft_len=64,
-            cp_len=16,
-            snr_db=float(snr_db),
-            cfo_hz=self.cfo_spin.value(),
-            doppler_spread_hz=self.doppler_spin.value(),
-            delay_spread=self.delay_spin.value(),
-            mod_order=self.mod_combo.currentText(),
-        )
+            with open(path, 'w', encoding='utf-8') as stream:
+                json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, '导出失败', str(exc))

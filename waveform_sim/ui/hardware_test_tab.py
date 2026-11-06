@@ -31,10 +31,13 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QLayout,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -71,6 +74,33 @@ BORDER_COLOR = (225, 225, 225)
 
 
 from .ui_utils import compute_spectrum, format_metric, has_signal, safe_float
+
+
+class _HardwareStatusText(QPlainTextEdit):
+    """A bounded status viewport that keeps complete device errors readable."""
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(54)
+        self.setText(text)
+
+    def setText(self, text):
+        value = str(text)
+        # Preserve the operator's selection/scroll position during identical
+        # 100 ms refreshes. New status starts at its first line.
+        if self.toPlainText() != value:
+            self.setPlainText(value)
+            self.verticalScrollBar().setValue(0)
+        self.setToolTip(value)
+
+    def text(self):
+        return self.toPlainText()
+
 
 class HardwareTestTab(QWidget):
     """OFDM、OTFS、AFDM 共用的 USRP 真机测试页面。"""
@@ -110,25 +140,31 @@ class HardwareTestTab(QWidget):
         root.setContentsMargins(4, 4, 4, 4)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        self.main_splitter = splitter
         splitter.addWidget(self._create_controls_panel())
         splitter.addWidget(self._create_right_panel())
-        splitter.setSizes([500, 980])
+        splitter.setSizes([360, 1000])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
 
-    def _create_controls_panel(self) -> QScrollArea:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(470)
-        scroll.setMaximumWidth(610)
-
+    def _create_controls_panel(self) -> QWidget:
+        rail = QWidget()
+        rail.setMinimumWidth(325)
+        rail.setMaximumWidth(410)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 0, 0, 0)
+        rail_layout.setSpacing(6)
         panel = QWidget()
+        self.controls_panel = panel
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         # ---------- 波形与算法 ----------
-        waveform_group = QGroupBox("波形与解调配置")
+        waveform_group = QGroupBox("测试波形")
         waveform_grid = QGridLayout(waveform_group)
         waveform_grid.setHorizontalSpacing(8)
         waveform_grid.setVerticalSpacing(8)
@@ -151,15 +187,56 @@ class HardwareTestTab(QWidget):
 
         waveform_grid.addWidget(QLabel("测试波形"), 0, 0)
         waveform_grid.addWidget(self.waveform_combo, 0, 1)
-        waveform_grid.addWidget(QLabel("调制方式"), 1, 0)
-        waveform_grid.addWidget(self.mod_order_combo, 1, 1)
-        waveform_grid.addWidget(QLabel("均衡器"), 2, 0)
-        waveform_grid.addWidget(self.equalizer_combo, 2, 1)
-        waveform_grid.addWidget(QLabel("星座显示"), 3, 0)
-        waveform_grid.addWidget(self.const_mode_combo, 3, 1)
-        waveform_grid.addWidget(QLabel("TX 图"), 4, 0)
-        waveform_grid.addWidget(self.tx_plot_combo, 4, 1)
         layout.addWidget(waveform_group)
+
+        self.config_tabs = QTabWidget()
+        self.config_tabs.setMinimumHeight(160)
+        self.config_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.config_tabs, 1)
+        self.config_scrolls = []
+        link_page = QWidget()
+        link_layout = QVBoxLayout(link_page)
+        waveform_page = QWidget()
+        waveform_layout = QVBoxLayout(waveform_page)
+        display_page = QWidget()
+        display_layout = QVBoxLayout(display_page)
+        for title, content, content_layout in (
+            ("链路配置", link_page, link_layout),
+            ("波形与文本", waveform_page, waveform_layout),
+            ("显示", display_page, display_layout),
+        ):
+            content_layout.setContentsMargins(5, 5, 5, 5)
+            content_layout.setSpacing(8)
+            # A short tab viewport scrolls real content instead of squeezing
+            # group frames and controls below their minimum content height.
+            content_layout.setSizeConstraint(QLayout.SetMinAndMaxSize)
+            content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setFrameShape(QScrollArea.NoFrame)
+            scroll.setWidget(content)
+            self.config_scrolls.append(scroll)
+            self.config_tabs.addTab(scroll, title)
+        self.controls_scroll = self.config_scrolls[0]
+        self.config_tabs.currentChanged.connect(self._on_config_tab_changed)
+
+        modem_group = QGroupBox("解调参数")
+        modem_grid = QGridLayout(modem_group)
+        modem_grid.addWidget(QLabel("调制方式"), 0, 0)
+        modem_grid.addWidget(self.mod_order_combo, 0, 1)
+        modem_grid.addWidget(QLabel("均衡器"), 1, 0)
+        modem_grid.addWidget(self.equalizer_combo, 1, 1)
+        waveform_layout.addWidget(modem_group)
+
+        display_group = QGroupBox("图表显示")
+        display_grid = QGridLayout(display_group)
+        display_grid.addWidget(QLabel("星座显示"), 0, 0)
+        display_grid.addWidget(self.const_mode_combo, 0, 1)
+        display_grid.addWidget(QLabel("TX 图"), 1, 0)
+        display_grid.addWidget(self.tx_plot_combo, 1, 1)
+        display_layout.addWidget(display_group)
+        display_layout.addStretch(1)
 
         # ---------- USRP ----------
         hw_group = QGroupBox("USRP 硬件配置")
@@ -202,7 +279,8 @@ class HardwareTestTab(QWidget):
         hw_grid.addWidget(self.tx_antenna_combo, 6, 1)
         hw_grid.addWidget(QLabel("RX 天线"), 7, 0)
         hw_grid.addWidget(self.rx_antenna_combo, 7, 1)
-        layout.addWidget(hw_group)
+        link_layout.addWidget(hw_group)
+        link_layout.addStretch(1)
 
         # ---------- AFDM 专用参数 ----------
         self.afdm_group = QGroupBox("AFDM 专用参数")
@@ -215,31 +293,36 @@ class HardwareTestTab(QWidget):
         afdm_grid.addWidget(self.c2_spin, 1, 1)
         afdm_note = QLabel("仅 AFDM 后端使用；OFDM / OTFS 会忽略该组参数。")
         afdm_note.setWordWrap(True)
+        afdm_note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         afdm_grid.addWidget(afdm_note, 2, 0, 1, 2)
-        layout.addWidget(self.afdm_group)
+        waveform_layout.addWidget(self.afdm_group)
 
         # ---------- 文本 ----------
         text_group = QGroupBox("发送文本 / 文本文件")
         text_layout = QVBoxLayout(text_group)
         text_buttons = QHBoxLayout()
         self.btn_load_text = QPushButton("加载文本文件")
-        self.btn_reset_text = QPushButton("恢复当前波形默认文本")
+        self.btn_reset_text = QPushButton("恢复默认文本")
         text_buttons.addWidget(self.btn_load_text)
         text_buttons.addWidget(self.btn_reset_text)
 
         self.file_path_label = QLabel("可直接编辑下方文本，或加载 .txt 文件")
         self.file_path_label.setWordWrap(True)
+        self.file_path_label.setMinimumWidth(0)
+        self.file_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         self.tx_text_edit = QTextEdit()
         self.tx_text_edit.setPlainText(_DEFAULT_TEXTS["OFDM"])
+        self.tx_text_edit.setMinimumHeight(90)
         self.tx_text_edit.setMaximumHeight(110)
 
         text_layout.addLayout(text_buttons)
         text_layout.addWidget(self.file_path_label)
         text_layout.addWidget(self.tx_text_edit)
-        layout.addWidget(text_group)
+        waveform_layout.addWidget(text_group)
+        waveform_layout.addStretch(1)
 
         # ---------- 操作 ----------
-        action_group = QGroupBox("操作控制")
+        action_group = QGroupBox("运行控制")
         action_grid = QGridLayout(action_group)
         self.btn_connect = QPushButton("连接 / 配置 USRP")
         self.btn_apply = QPushButton("应用当前参数")
@@ -248,32 +331,56 @@ class HardwareTestTab(QWidget):
         self.btn_disconnect = QPushButton("释放 USRP")
         self.btn_clear_log = QPushButton("清空日志")
 
-        action_grid.addWidget(self.btn_connect, 0, 0, 1, 2)
-        action_grid.addWidget(self.btn_apply, 1, 0)
-        action_grid.addWidget(self.btn_start_test, 1, 1)
-        action_grid.addWidget(self.btn_stop_test, 2, 0)
-        action_grid.addWidget(self.btn_disconnect, 2, 1)
-        action_grid.addWidget(self.btn_clear_log, 3, 0, 1, 2)
-        layout.addWidget(action_group)
+        action_grid.addWidget(self.btn_connect, 0, 0)
+        action_grid.addWidget(self.btn_apply, 0, 1)
+        action_grid.addWidget(self.btn_start_test, 1, 0)
+        action_grid.addWidget(self.btn_stop_test, 1, 1)
+        action_grid.addWidget(self.btn_disconnect, 2, 0, 1, 2)
+        action_grid.setContentsMargins(6, 6, 6, 6)
+        action_grid.setSpacing(4)
 
-        layout.addStretch(1)
-        scroll.setWidget(panel)
-        self._apply_control_style(scroll)
-        return scroll
+        rail_layout.addWidget(panel, 1)
+        rail_layout.addWidget(action_group)
+        self._apply_control_style(rail)
+        for group in rail.findChildren(QGroupBox):
+            group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            group.layout().setSizeConstraint(QLayout.SetMinimumSize)
+        for control in rail.findChildren(QComboBox):
+            control.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            control.setMinimumContentsLength(9)
+            control.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for control in rail.findChildren(QLineEdit):
+            control.setMinimumWidth(0)
+            control.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return rail
+
+    def _on_config_tab_changed(self, index):
+        if 0 <= index < len(self.config_scrolls):
+            self.controls_scroll = self.config_scrolls[index]
 
     def _create_right_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        self.decode_status_label = _HardwareStatusText("解调状态：未连接")
+        layout.addWidget(self.decode_status_label)
 
         splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        self.results_splitter = splitter
         layout.addWidget(splitter)
 
         # ---------- 2x2 plots ----------
         plot_panel = QWidget()
+        plot_panel.setMinimumSize(470, 330)
         grid = QGridLayout(plot_panel)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(8)
+        for position in (0, 1):
+            grid.setRowStretch(position, 1)
+            grid.setColumnStretch(position, 1)
 
         self.tx_plot = pg.PlotWidget(title="发送端基带显示")
         self.tx_plot.setLabel("left", "幅度 / PSD")
@@ -292,19 +399,28 @@ class HardwareTestTab(QWidget):
         self.constellation_plot.setLabel("bottom", "I")
         self.constellation_plot.setAspectLocked(True)
 
-        grid.addWidget(self.tx_plot, 0, 0)
-        grid.addWidget(self.rx_spectrum_plot, 0, 1)
-        grid.addWidget(self.ber_plot, 1, 0)
-        grid.addWidget(self.constellation_plot, 1, 1)
+        from .fdidm_plot_widgets import _PlotGridCell
+        for plot, row, column in (
+            (self.tx_plot, 0, 0), (self.rx_spectrum_plot, 0, 1),
+            (self.ber_plot, 1, 0), (self.constellation_plot, 1, 1),
+        ):
+            cell = _PlotGridCell(plot)
+            cell.setMinimumSize(230, 160)
+            grid.addWidget(cell, row, column)
         splitter.addWidget(plot_panel)
 
-        # ---------- 状态与文本 ----------
+        # Text evidence and logs share one bounded area so the live charts
+        # remain the primary view at the minimum supported window size.
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setMinimumHeight(134)
+        self.result_tabs.setMaximumHeight(190)
+        splitter.addWidget(self.result_tabs)
+
+        # ---------- 文本对照 ----------
         text_panel = QWidget()
         text_grid = QGridLayout(text_panel)
-        self.decode_status_label = QLabel("解调状态：未连接")
-        self.decode_status_label.setWordWrap(True)
-        self.decode_status_label.setMinimumHeight(44)
-        self.decode_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        text_grid.setContentsMargins(4, 4, 4, 4)
+        text_grid.setSpacing(4)
 
         self.tx_text_view = QTextEdit()
         self.tx_text_view.setReadOnly(True)
@@ -315,23 +431,25 @@ class HardwareTestTab(QWidget):
         self.rx_text_view.setReadOnly(True)
         self.rx_text_view.setMaximumHeight(110)
 
-        text_grid.addWidget(self.decode_status_label, 0, 0, 1, 2)
-        text_grid.addWidget(QLabel("发送文本"), 1, 0)
-        text_grid.addWidget(QLabel("接收解调文本"), 1, 1)
-        text_grid.addWidget(self.tx_text_view, 2, 0)
-        text_grid.addWidget(self.rx_text_view, 2, 1)
-        splitter.addWidget(text_panel)
+        text_grid.addWidget(QLabel("发送文本"), 0, 0)
+        text_grid.addWidget(QLabel("接收解调文本"), 0, 1)
+        text_grid.addWidget(self.tx_text_view, 1, 0)
+        text_grid.addWidget(self.rx_text_view, 1, 1)
+        self.result_tabs.addTab(text_panel, "文本对照")
 
         # ---------- 日志 ----------
         log_panel = QWidget()
-        log_layout = QVBoxLayout(log_panel)
+        log_layout = QHBoxLayout(log_panel)
+        log_layout.setContentsMargins(4, 4, 4, 4)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(230)
-        log_layout.addWidget(QLabel("硬件测试日志"))
-        log_layout.addWidget(self.log_text)
-        splitter.addWidget(log_panel)
-        splitter.setSizes([570, 180, 230])
+        self.log_text.document().setMaximumBlockCount(2000)
+        log_layout.addWidget(self.log_text, 1)
+        log_layout.addWidget(self.btn_clear_log, 0, Qt.AlignTop)
+        self.result_tabs.addTab(log_panel, "测试日志")
+        splitter.setSizes([650, 145])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
 
         # curves/items
         self.tx_curve = self.tx_plot.plot(pen=pg.mkPen(MATLAB_BLUE, width=2))
@@ -603,25 +721,34 @@ class HardwareTestTab(QWidget):
             QApplication.restoreOverrideCursor()
             self._update_button_states()
 
-    def _dispose_backend(self, clear_plots: bool = True):
+    def _dispose_backend(self, clear_plots: bool = True, *, strict: bool = False):
         self.update_timer.stop()
         backend = self.backend
-        self.backend = None
-        self.backend_waveform = None
-        self._backend_identity = None
-        self.test_running = False
-        self._backend_started_once = False
 
         if backend is not None:
             try:
                 backend.stop()
             except Exception as exc:
                 self._log(f"停止后端时出现异常：{type(exc).__name__}: {exc}")
+                if strict:
+                    if self.test_running:
+                        self.update_timer.start()
+                    raise
             try:
                 if hasattr(backend, "wait"):
                     backend.wait()
             except Exception as exc:
                 self._log(f"等待后端退出时出现异常：{type(exc).__name__}: {exc}")
+                if strict:
+                    if self.test_running:
+                        self.update_timer.start()
+                    raise
+        self.backend = None
+        self.backend_waveform = None
+        self._backend_identity = None
+        self.test_running = False
+        self._backend_started_once = False
+        if backend is not None:
             del backend
             gc.collect()
 
@@ -1086,8 +1213,20 @@ class HardwareTestTab(QWidget):
     # =========================================================
     # Qt cleanup
     # =========================================================
+    def suspend_tasks(self):
+        """Release the radio when leaving this page, keeping the evidence."""
+        had_backend = self.backend is not None
+        self._dispose_backend(clear_plots=False, strict=True)
+        if had_backend:
+            self.decode_status_label.setText("解调状态：已停止并释放 USRP；结果已保留。")
+            self._log("离开测试页面，已停止并释放 USRP；再次测试请连接设备。")
+
     def closeEvent(self, event):
-        self._dispose_backend(clear_plots=False)
+        try:
+            self.suspend_tasks()
+        except Exception:
+            event.ignore()
+            return
         super().closeEvent(event)
 
 

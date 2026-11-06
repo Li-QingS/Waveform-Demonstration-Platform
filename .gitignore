@@ -5,8 +5,18 @@ __pycache__/
 .venv/
 venv/
 
+# 本机 AI 凭据、环境配置与临时任务记录
+.env
+.env.*
+!.env.example
+*.dpapi
+/.superpowers/
+/docs/superpowers/
+
 # 工程化运行产物
 runs/
+/output/
+/artifacts/
 *.pyc
 .pytest_cache/
 
@@ -16,6 +26,8 @@ runs/
 
 # 调试日志
 *.log
+/log/*
+!/log/.gitkeep
 
 # 本地诊断/截图产物（不进入版本库）
 /log/*.json
@@ -32,6 +44,7 @@ runs/
 /pair_*.png
 /tmp_check.png
 /artifacts/gmi_paper_example.png
+/artifacts/ui-refresh/
 /commit_ui.py
 /head_ui.py
 /orig_ui.py

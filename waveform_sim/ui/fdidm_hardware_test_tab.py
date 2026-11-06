@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
+import gc
 import math
 import time
 from collections import deque
@@ -15,11 +15,11 @@ try:
 except Exception:
     gl = None
     _PG_OPENGL_AVAILABLE = False
-from PyQt5.QtCore import Qt, QTimer, QSignalBlocker
+from PyQt5.QtCore import Qt, QTimer, QSignalBlocker, QEvent
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton, QTabWidget,
     QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QSplitter,
-    QScrollArea, QSizePolicy, QCheckBox, QFileDialog, QDialog,
+    QScrollArea, QSizePolicy, QCheckBox, QFileDialog, QDialog, QLayout,
 )
 
 from ..hardware.fdidm_hardtest import FDIDMHardwareTest, FDIDM_GAIN_MAX_DB
@@ -32,7 +32,42 @@ AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
 
 
+class _ControlScrollArea(QScrollArea):
+    """Keep the form inside the viewport when the vertical bar appears.
+
+    The first workspace show can otherwise leave the content at the old
+    width for a layout pass. Horizontal scrolling is intentionally disabled,
+    so that stale width would hide the right edges of the form controls.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fitting_width = False
+        self.viewport().installEventFilter(self)
+        self.verticalScrollBar().rangeChanged.connect(self._fit_width)
+
+    def eventFilter(self, watched, event):
+        if watched is self.viewport() and event.type() in (QEvent.Resize, QEvent.Show):
+            self._fit_width()
+        return super().eventFilter(watched, event)
+
+    def _fit_width(self, *_args):
+        content = self.widget()
+        if content is None or self._fitting_width:
+            return
+        width = self.viewport().width()
+        if width < max(1, content.minimumSizeHint().width()):
+            return
+        self._fitting_width = True
+        try:
+            content.setMaximumWidth(width)
+            content.resize(width, content.height())
+        finally:
+            self._fitting_width = False
+
+
 from .fdidm_plot_widgets import _AlphaBetaSurfaceCanvas
+from .base_waveform_tab import ElidedValueLabel
 from .hardware_advantage_observer import (
     MODE_OFF,
     MODE_ON,
@@ -57,6 +92,7 @@ class FDIDMHardwareTestTab(QWidget):
         self._suppress_param_signals = False
         self._last_adaptive_recommendation_seq = 0
         self._last_backend_alpha_beta = None
+        self._last_status_snapshot = {}
         self._adaptive_toggle_pending = False
         self.observer = AdvantageObservationSession()
         self._timeline_event_items = []
@@ -93,10 +129,13 @@ class FDIDMHardwareTestTab(QWidget):
         self._surface_metric_meta = {key: {"label": label, "direction": direction}
                                      for label, key, direction in self._surface_metric_items}
         self._ui_log_entries = deque(maxlen=5000)
+        self._ai_backend_log_snapshot = ""
+        self._ai_analysis_dialog = None
         self._ab_surface_window = None
         self._ab_surface_window_canvas = None
         self._ab_surface_window_metric_combo = None
         self._init_ui()
+        self._init_ai_controls()
         self._init_plot_style()
         self._connect_signals()
         self._apply_debounce_timer = QTimer(self)
@@ -106,13 +145,88 @@ class FDIDMHardwareTestTab(QWidget):
         self.update_timer.timeout.connect(self._refresh_plots)
 
     # ---------------- UI ----------------
+    def _init_ai_controls(self):
+        from .fdidm_ai_analysis import FDIDMAIFloatingButton
+
+        self.ai_floating_button = FDIDMAIFloatingButton(self._open_ai_analysis, self)
+        self._position_ai_floating_button()
+
+    def _position_ai_floating_button(self):
+        button = getattr(self, "ai_floating_button", None)
+        if button is None:
+            return
+        if getattr(self, "_global_ai_assistant", None) is not None:
+            button.hide()
+            return
+        if not button.user_moved:
+            button.move(max(0, self.width() - button.width() - 18),
+                        max(0, self.height() - button.height() - 62))
+        button.clamp_to_parent()
+        button.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_ai_floating_button()
+
+    def _open_ai_analysis(self):
+        global_assistant = getattr(self, "_global_ai_assistant", None)
+        if global_assistant is not None:
+            return global_assistant.open()
+        from .fdidm_ai_analysis import FDIDMAIAnalysisDialog
+
+        if self._ai_analysis_dialog is None:
+            self._ai_analysis_dialog = FDIDMAIAnalysisDialog(
+                self._get_ai_log_snapshot, self, chart_context_provider=self._get_ai_chart_context)
+        self._ai_analysis_dialog.show()
+        self._ai_analysis_dialog.raise_()
+        self._ai_analysis_dialog.activateWindow()
+
+    def set_global_ai_assistant(self, assistant):
+        self._global_ai_assistant = assistant
+        self.ai_floating_button.hide()
+
+    def _get_ai_chart_context(self):
+        from .fdidm_ai_context import build_fdidm_chart_context
+
+        return build_fdidm_chart_context(self)
+
+    def _get_ai_log_snapshot(self):
+        """Read diagnostics without exporting files or modifying the live receiver."""
+        if self.backend is not None:
+            # A newly configured backend must never inherit an old run's DEBUG log.
+            self._ai_backend_log_snapshot = ""
+            if hasattr(self.backend, "get_debug_log"):
+                try:
+                    entries = self.backend.get_debug_log(max_entries=5000, min_level="DEBUG")
+                    self._ai_backend_log_snapshot = "\n".join(
+                        f"{entry['seq']:06d} {entry['t']:10.3f}s "
+                        f"{entry['level']:<5} {entry['msg']}" for entry in entries
+                    )
+                except Exception:
+                    self._ai_backend_log_snapshot = "后端诊断日志读取失败；以下仅含可用的界面日志。"
+        backend_text = self._ai_backend_log_snapshot
+        ui_entries = list(self._ui_log_entries)
+        if backend_text:
+            # INFO backend entries are also echoed into the UI deque. Sending
+            # them twice wastes context and can distort the model's counts.
+            ui_entries = [entry for entry in ui_entries if "] BE[" not in entry]
+        parts = []
+        if backend_text:
+            parts.append("--- 后端最近 DEBUG 日志（最多 5000 条） ---\n" + backend_text)
+        if ui_entries:
+            parts.append("--- 当前页面界面日志（最近记录，可能包含多次测试） ---\n" + "\n".join(ui_entries))
+        return "\n\n".join(parts)
+
     def _init_ui(self):
         layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        self.main_splitter = splitter
         layout.addWidget(splitter)
         splitter.addWidget(self._create_controls_panel())
         splitter.addWidget(self._create_right_panel())
-        splitter.setSizes([380, 1180])
+        splitter.setSizes([360, 1180])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         try:
@@ -121,19 +235,24 @@ class FDIDMHardwareTestTab(QWidget):
             pass
 
     def _create_controls_panel(self):
-        scroll = QScrollArea()
+        rail = QWidget()
+        rail.setMinimumWidth(340)
+        rail.setMaximumWidth(400)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 0, 0, 0)
+        rail_layout.setSpacing(6)
+        scroll = _ControlScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(360)
-        scroll.setMaximumWidth(470)
+        scroll.setFrameShape(QScrollArea.NoFrame)
 
         panel = QWidget()
         self.controls_panel = panel
         self.controls_scroll = scroll
         layout = QVBoxLayout(panel)
-        # The collapsed operator rail should fit the smallest supported
-        # window without a vertical scrollbar.  Detailed controls are kept in
-        # the advanced drawer, so a compact outer rhythm remains readable.
+        # Let the scroll area take excess height.  Compressing the groups
+        # below their form contents makes their borders overlap the controls.
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
         layout.setContentsMargins(3, 3, 3, 3)
         layout.setSpacing(3)
 
@@ -148,7 +267,8 @@ class FDIDMHardwareTestTab(QWidget):
         self.samp_rate_label = QLabel("采样率")
         hw.addWidget(self.samp_rate_label, 1, 0); hw.addWidget(self.samp_rate_spin, 1, 1)
         hw.addWidget(QLabel("中心频率"), 2, 0); hw.addWidget(self.fc_spin, 2, 1)
-        self.rf_port_note = QLabel("B210 端口建议：A:TX/RX，A:RX2；增益上限 45 dB")
+        self.rf_port_note = QLabel("B210：A:TX/RX → A:RX2；增益 ≤45 dB")
+        self.rf_port_note.setToolTip("B210 端口建议：A:TX/RX，A:RX2；增益上限 45 dB")
         self.rf_port_note.setWordWrap(True)
         hw.addWidget(self.rf_port_note, 3, 0, 1, 2)
         self.btn_antenna_preset = QPushButton("B210 天线/增益预设")
@@ -233,9 +353,9 @@ class FDIDMHardwareTestTab(QWidget):
         fd.addWidget(self.tdl_spread_label, 11, 0); fd.addWidget(self.tdl_spread_spin, 11, 1)
         fd.addWidget(self.tdl_snr_label, 11, 2); fd.addWidget(self.tdl_snr_spin, 11, 3)
         fd.addWidget(self.prerender_tdl_check, 12, 0, 1, 4)
-        self.btn_ofdm = QPushButton("OFDM\n0/0")
-        self.btn_otfs = QPushButton("OTFS\n1/1")
-        self.btn_reco = QPushButton("推荐\n0.5/1")
+        self.btn_ofdm = QPushButton("OFDM 0/0")
+        self.btn_otfs = QPushButton("OTFS 1/1")
+        self.btn_reco = QPushButton("推荐 0.5/1")
         self.btn_apply_params = QPushButton("应用参数")
         fd.addWidget(self.btn_ofdm, 13, 0, 1, 2)
         fd.addWidget(self.btn_otfs, 13, 2, 1, 2)
@@ -262,7 +382,7 @@ class FDIDMHardwareTestTab(QWidget):
         # two parameters that explain the adaptive result.
         self.advanced_group = QGroupBox("高级参数")
         self.advanced_group.setMinimumHeight(0)
-        self.advanced_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.advanced_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         layout.addWidget(self.advanced_group)
 
 
@@ -291,19 +411,19 @@ class FDIDMHardwareTestTab(QWidget):
         self.adaptive_status_label = QLabel("自适应：关闭")
         self.adaptive_status_label.setWordWrap(True)
         self.adaptive_status_label.setStyleSheet("color: #444444;")
-        adapt.addWidget(self.adaptive_enable_check, 0, 0, 1, 4)
-        adapt.addWidget(QLabel("GMI 接收机"), 1, 0); adapt.addWidget(self.gmi_receiver_combo, 1, 1)
-        adapt.addWidget(QLabel("波形库预算"), 1, 2); adapt.addWidget(self.gmi_catalogue_combo, 1, 3)
-        adapt.addWidget(QLabel("鲁棒等级"), 2, 0); adapt.addWidget(self.gmi_robustness_combo, 2, 1)
-        adapt.addWidget(self.btn_adaptive_evaluate, 2, 2, 1, 2)
-        adapt.addWidget(self.adaptive_status_label, 3, 0, 1, 4)
+        adapt.addWidget(self.adaptive_enable_check, 0, 0, 1, 2)
+        adapt.addWidget(self.btn_adaptive_evaluate, 0, 2, 1, 2)
+        adapt.addWidget(QLabel("GMI 接收机"), 1, 0); adapt.addWidget(self.gmi_receiver_combo, 1, 1, 1, 3)
+        adapt.addWidget(QLabel("波形库预算"), 2, 0); adapt.addWidget(self.gmi_catalogue_combo, 2, 1, 1, 3)
+        adapt.addWidget(QLabel("鲁棒等级"), 3, 0); adapt.addWidget(self.gmi_robustness_combo, 3, 1, 1, 3)
+        adapt.addWidget(self.adaptive_status_label, 4, 0, 1, 4)
         adapt_note = QLabel("净 GMI 负责选择；EVM/SER/CRC 只做 A-B-B-A 非回归验证。")
         adapt_note.setWordWrap(True)
         adapt_note.setToolTip(
             "候选只由公共 CSI 和接收机模型计算的净 GMI 下界产生；"
             "payload、EVM、SER、CRC 不参与在线选择，只用于真链路提交保护。"
         )
-        adapt.addWidget(adapt_note, 4, 0, 1, 4)
+        adapt.addWidget(adapt_note, 5, 0, 1, 4)
         # Keep the default rail decision-oriented; the methodology remains on
         # hover and in exported evidence instead of occupying another row.
         adapt_note.setVisible(False)
@@ -321,7 +441,7 @@ class FDIDMHardwareTestTab(QWidget):
         # optional diagnostics are collapsed.
         self.tx_gain_label = QLabel("TX gain")
         self.rx_gain_label = QLabel("RX gain")
-        gain_group = QGroupBox("RF gain")
+        gain_group = QGroupBox("RF 增益")
         gain = QGridLayout(gain_group)
         gain.setHorizontalSpacing(6)
         gain.setVerticalSpacing(6)
@@ -369,25 +489,49 @@ class FDIDMHardwareTestTab(QWidget):
         self._advanced_layout = QVBoxLayout(self.advanced_group)
         self._advanced_layout.setContentsMargins(6, 8, 6, 6)
         self._advanced_layout.setSpacing(6)
+        self._advanced_layout.setSizeConstraint(QLayout.SetMinimumSize)
 
         def _move_grid_rows(source_group, rows, title):
+            """Move a group of form rows without inheriting four-column widths.
+
+            Read each layout item once: itemAtPosition on a spanning item can
+            otherwise lose its original span when the widget is reinserted.
+            The lab forms use a label/value pair per row, with standalone
+            notes/checks spanning the width and pairs of action buttons.
+            """
             source_layout = source_group.layout()
             moved_group = QGroupBox(title)
             moved_layout = QGridLayout(moved_group)
             moved_layout.setHorizontalSpacing(6)
             moved_layout.setVerticalSpacing(4)
+            moved_layout.setColumnStretch(1, 1)
+            row_widgets = {}
+            for index in range(source_layout.count()):
+                row, column, _row_span, _column_span = source_layout.getItemPosition(index)
+                item = source_layout.itemAt(index)
+                if row in rows and item.widget() is not None:
+                    row_widgets.setdefault(row, []).append((column, item.widget()))
+            for items in row_widgets.values():
+                for _column, widget in items:
+                    source_layout.removeWidget(widget)
             destination_row = 0
             for source_row in rows:
-                row_had_widget = False
-                for column in range(4):
-                    item = source_layout.itemAtPosition(source_row, column)
-                    widget = item.widget() if item is not None else None
-                    if widget is None:
-                        continue
-                    source_layout.removeWidget(widget)
-                    moved_layout.addWidget(widget, destination_row, column)
-                    row_had_widget = True
-                if row_had_widget:
+                widgets = [widget for _column, widget in sorted(row_widgets.get(source_row, []))]
+                cursor = 0
+                while cursor < len(widgets):
+                    widget = widgets[cursor]
+                    following = widgets[cursor + 1] if cursor + 1 < len(widgets) else None
+                    if isinstance(widget, QLabel) and following is not None:
+                        moved_layout.addWidget(widget, destination_row, 0)
+                        moved_layout.addWidget(following, destination_row, 1)
+                        cursor += 2
+                    elif isinstance(widget, QPushButton) and isinstance(following, QPushButton):
+                        moved_layout.addWidget(widget, destination_row, 0)
+                        moved_layout.addWidget(following, destination_row, 1)
+                        cursor += 2
+                    else:
+                        moved_layout.addWidget(widget, destination_row, 0, 1, 2)
+                        cursor += 1
                     destination_row += 1
             self._advanced_layout.addWidget(moved_group)
             return moved_group
@@ -398,8 +542,11 @@ class FDIDMHardwareTestTab(QWidget):
         self._advanced_hw_group = _move_grid_rows(self.hw_group, [1], "采样率")
         self._advanced_fd_group = _move_grid_rows(
             self.fd_group,
-            [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17],
-            "FDIDM/信道高级参数")
+            [1, 2, 3, 4, 5, 6, 7, 8], "波形与处理")
+        self._advanced_channel_group = _move_grid_rows(
+            self.fd_group, [10, 11, 12], "注入信道")
+        self._advanced_actions_group = _move_grid_rows(
+            self.fd_group, [13, 14, 15, 16, 17], "参数应用与性能面")
         # Remove optional editor groups from the main layout before parenting
         # them under the collapsed group.  They are reinserted automatically
         # when the operator checks “显示高级参数”.
@@ -410,7 +557,11 @@ class FDIDMHardwareTestTab(QWidget):
         layout.removeWidget(self.advanced_group)
 
         self.btn_toggle_advanced = QCheckBox("显示高级参数")
-        layout.insertWidget(1, self.btn_toggle_advanced)
+        # Keep RF bring-up together; optional lab controls follow the common
+        # link, waveform and adaptive settings instead of splitting them.
+        layout.removeWidget(self.gain_group)
+        layout.insertWidget(1, self.gain_group)
+        layout.addWidget(self.btn_toggle_advanced)
         self.btn_toggle_advanced.toggled.connect(self._toggle_advanced_controls)
         self.advanced_group.setVisible(False)
         self.modem_group.setVisible(False)
@@ -419,7 +570,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.channel_estimator_combo.setVisible(False)
         self._toggle_advanced_controls(False)
 
-        btn_group = QGroupBox("控制")
+        btn_group = QGroupBox("运行控制")
         # A two-column command pad keeps the always-visible controls compact;
         # the previous vertical stack consumed an entire screen on the narrow
         # side panel even though each action is only one click.
@@ -446,17 +597,22 @@ class FDIDMHardwareTestTab(QWidget):
         # tooltip, but it does not consume scarce height in the default
         # operator rail.  It is made visible only after an export action.
         self.log_status_label.setVisible(False)
-        layout.addWidget(btn_group)
         layout.addStretch()
         for compact_layout in (hw, fd, adapt, gain, btn_l):
             compact_layout.setContentsMargins(5, 6, 5, 5)
             compact_layout.setVerticalSpacing(3)
         self._compact_left_controls(panel)
+        for group in panel.findChildren(QGroupBox):
+            group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self._on_channel_mode_changed()
         self._on_device_changed()
         scroll.setWidget(panel)
-        self._apply_control_style(scroll)
-        return scroll
+        # Commands stay outside the scrolling configuration area, including
+        # while the advanced drawer is expanded.
+        rail_layout.addWidget(scroll, 1)
+        rail_layout.addWidget(btn_group)
+        self._apply_control_style(rail)
+        return rail
 
     def _create_right_panel(self):
         panel = QWidget()
@@ -465,80 +621,20 @@ class FDIDMHardwareTestTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # 右栏四层：①优势观测横条（固定紧凑）②诊断图页签（主伸展，单幅满幅）
-        # ③时间轴（左右并排）④文本区。页签替代旧 2×2 网格：每次只呈现一幅诊断图，
-        # 幅面约为原四宫格单格的 4 倍，且彻底避免 OpenGL sizeHint 把网格挤变形。
-        self.comparison_result_group = QGroupBox("优势观测（测试启动即记录 · 在线切换自动配对）")
-        self.comparison_result_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.comparison_result_group.setMinimumHeight(190)
-        self.comparison_result_group.setMaximumHeight(2000)
-        result_grid = QGridLayout(self.comparison_result_group)
-        result_grid.setVerticalSpacing(2)
-        result_grid.setHorizontalSpacing(12)
-        self.btn_start_observation = QPushButton("重新开始观测")
-        self.btn_stop_observation = QPushButton("结束观测")
-        self.btn_export_observation = QPushButton("导出报告")
-        for btn in (self.btn_start_observation, self.btn_stop_observation, self.btn_export_observation):
-            btn.setMinimumWidth(96)
-            btn.setMinimumHeight(28)
-        self.btn_stop_observation.setEnabled(False)
-        self.btn_export_observation.setEnabled(False)
-        self.btn_start_observation.setEnabled(False)
-        self.observation_state_label = QLabel("观测：等待硬件测试启动（启动后自动记录）")
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(8)
-        ctrl_row.addWidget(self.btn_start_observation)
-        ctrl_row.addWidget(self.btn_stop_observation)
-        ctrl_row.addWidget(self.btn_export_observation)
-        ctrl_row.addWidget(self.observation_state_label, 1)
-        result_grid.addLayout(ctrl_row, 0, 0, 1, 3)
-
-        big_style = "font-size: 18px; font-weight: 700;"
-        # 主结论只显示 GMI；EVM/SER/CRC 留在下一行作为真链路证据。
-        self.observation_before_label = QLabel("当前净 GMI：—")
-        self.observation_after_label = QLabel("候选净 GMI：—")
-        self.observation_improvement_label = QLabel("保守增益：—")
-        self.observation_before_label.setStyleSheet(big_style + " color:#333333;")
-        self.observation_after_label.setStyleSheet(big_style + " color:#333333;")
-        self.observation_improvement_label.setStyleSheet(big_style + " color:#167c3a;")
-        # 单行省略：宽度不足时裁切而不是换行把横条撑高
-        for lbl in (self.observation_before_label, self.observation_after_label,
-                    self.observation_improvement_label):
-            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        result_grid.addWidget(self.observation_before_label, 1, 0)
-        result_grid.addWidget(self.observation_after_label, 1, 1)
-        result_grid.addWidget(self.observation_improvement_label, 1, 2)
-
-        # 第二行：徽标与 EVM 变化按自然宽度，注记吃剩余宽度
-        self.observation_badge_label = QLabel("可信度：—")
-        self.observation_evm_label = QLabel("EVM：—")
-        self.observation_evm_label.setStyleSheet("color:#555555; font-size: 14px;")
-        self.observation_note_label = QLabel("")
-        self.observation_note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.adaptive_state_label = QLabel("自适应：等待硬件测试")
-        self.adaptive_state_label.setStyleSheet("color:#555555; font-size: 12px;")
-        self.adaptive_state_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        result_grid.addWidget(self.observation_badge_label, 2, 0, 1, 2)
-        result_grid.addWidget(self.observation_evm_label, 2, 2)
-        state_row = QHBoxLayout()
-        state_row.setSpacing(12)
-        state_row.addWidget(self.adaptive_state_label, 3)
-        state_row.addWidget(self.observation_note_label, 2)
-        result_grid.addLayout(state_row, 3, 0, 1, 3)
-        layout.addWidget(self.comparison_result_group, 0)
-
         # 观测页签的三张图各自回答一个问题：
         # 1) 效果图：同一局部信道窗口内，FDIDM ON 相对 OFF 的变化；
         # 2) 质量图：EVM 随时间是否稳定；
         # 3) 动作图：α/β 何时改变、是否真的应用。
         # 三个 ViewBox 独立缩放，避免操作一张图改变其它图的坐标。
-        self.timeline_effect_plot = pg.PlotWidget(
-            title="FDIDM 效果：相邻 OFF→ON 局部窗口")
+        self.timeline_effect_plot = pg.PlotWidget(title="局部 OFF→ON 效果")
+        self.timeline_effect_plot.setToolTip("FDIDM 效果：相邻 OFF→ON 局部窗口；OFF 基线为 100%，ON 越低越好。")
         # Compatibility alias for callers/tests written before the effect
         # chart was given its explicit name.
         self.timeline_ser_plot = self.timeline_effect_plot
-        self.timeline_evm_plot = pg.PlotWidget(title="解调误差趋势：数据辅助 EVM")
-        self.timeline_ab_plot = pg.PlotWidget(title="自适应动作：α/β（标记=已应用）")
+        self.timeline_evm_plot = pg.PlotWidget(title="数据辅助 EVM 趋势")
+        self.timeline_evm_plot.setToolTip("解调误差趋势：使用已知发送数据辅助计算的 EVM，而非判决参考 EVM。")
+        self.timeline_ab_plot = pg.PlotWidget(title="自适应动作 α / β")
+        self.timeline_ab_plot.setToolTip("自适应动作：α/β 随时间变化；三角标记表示已实际应用。")
         # Each observation plot owns its ViewBox and interaction range.
         for _plot in (self.timeline_effect_plot, self.timeline_evm_plot, self.timeline_ab_plot):
             _plot.setMouseEnabled(x=True, y=True)
@@ -548,28 +644,33 @@ class FDIDMHardwareTestTab(QWidget):
             _view_box = _plot.getPlotItem().getViewBox()
             _view_box.setXLink(None)
             _view_box.setYLink(None)
-        self.timeline_effect_plot.setLabel("left", "相对 OFF 基线", units="%")
+        self.timeline_effect_plot.setLabel("left", "相对 OFF", units="%")
         self.timeline_evm_plot.setLabel("left", "数据辅助 EVM", units="%")
         self.timeline_ab_plot.setLabel("left", "参数值")
-        self.timeline_effect_plot.setLabel("bottom", "指标（EVM / SER）")
+        self.timeline_effect_plot.setLabel("bottom", "指标")
         self.timeline_evm_plot.setLabel("bottom", "观测时间 (s)")
         self.timeline_ab_plot.setLabel("bottom", "观测时间 (s)")
 
         self.observation_stats_group = QGroupBox("窗口汇总")
         stats_layout = QVBoxLayout(self.observation_stats_group)
-        self.observation_stats_label = QLabel("开始观测后此处显示各窗口汇总")
+        self.observation_stats_label = QLabel("硬件测试启动后自动记录各窗口汇总")
         self.observation_stats_label.setWordWrap(True)
         self.observation_stats_label.setMinimumSize(0, 0)
-        # Long validation explanations belong in the tooltip/export.  Bound
-        # the inline card so it cannot claim an entire grid row and squeeze
-        # the three plots; the label itself remains fully readable via its
-        # tooltip when text exceeds the compact card height.
-        self.observation_stats_label.setMaximumHeight(120)
-        self.observation_stats_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.observation_stats_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+        self.observation_stats_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.observation_stats_label.setStyleSheet("color:#555555; font-size: 12px;")
         stats_layout.setContentsMargins(6, 6, 6, 6)
-        stats_layout.addWidget(self.observation_stats_label, 1)
-        self.observation_stats_group.setMaximumHeight(170)
+        self.observation_stats_scroll = QScrollArea()
+        self.observation_stats_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.observation_stats_scroll.setWidgetResizable(True)
+        self.observation_stats_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        stats_content = QWidget()
+        stats_content_layout = QVBoxLayout(stats_content)
+        stats_content_layout.setContentsMargins(0, 0, 0, 0)
+        stats_content_layout.addWidget(self.observation_stats_label)
+        stats_content_layout.addStretch(1)
+        self.observation_stats_scroll.setWidget(stats_content)
+        stats_layout.addWidget(self.observation_stats_scroll, 1)
 
         self.ab_surface_panel = self._create_ab_surface_panel()
         self.rx_spectrum_plot = pg.PlotWidget(title="RX 频谱")
@@ -641,6 +742,15 @@ class FDIDMHardwareTestTab(QWidget):
         self.plot_tabs.setCurrentIndex(1)
         layout.addWidget(self.plot_tabs, 1)
 
+        # Keep the real validation state visible on both chart pages. This
+        # row is independent of the optional text comparison's height limit.
+        self.adaptive_state_label = QLabel("自适应：等待硬件测试")
+        self.adaptive_state_label.setWordWrap(True)
+        self.adaptive_state_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+        self.adaptive_state_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.adaptive_state_label.setStyleSheet("color:#555555; font-size:12px;")
+        layout.addWidget(self.adaptive_state_label, 0)
+
         text_panel = QWidget()
         text_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         text_panel.setMaximumHeight(120)
@@ -648,17 +758,26 @@ class FDIDMHardwareTestTab(QWidget):
         text_grid.setContentsMargins(0, 0, 0, 0)
         text_grid.setHorizontalSpacing(8)
         text_grid.setVerticalSpacing(2)
-        self.decode_status_label = QLabel("解调状态：未开始")
+        self.decode_status_label = ElidedValueLabel("解调状态：未开始")
         self.decode_status_label.setMinimumHeight(22)
         self.decode_status_label.setMaximumHeight(24)
         self.decode_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.btn_show_text = QCheckBox("显示文本对照")
+        text_grid.addWidget(self.decode_status_label, 0, 0)
+        text_grid.addWidget(self.btn_show_text, 0, 1, Qt.AlignRight)
+        self.text_result_panel = QWidget()
+        text_result_grid = QGridLayout(self.text_result_panel)
+        text_result_grid.setContentsMargins(0, 0, 0, 0)
+        text_result_grid.setSpacing(2)
         self.tx_text_view = QTextEdit(); self.tx_text_view.setReadOnly(True); self.tx_text_view.setMaximumHeight(64)
         self.rx_text_view = QTextEdit(); self.rx_text_view.setReadOnly(True); self.rx_text_view.setMaximumHeight(64)
-        text_grid.addWidget(self.decode_status_label, 0, 0, 1, 2)
-        text_grid.addWidget(QLabel("发送文本"), 1, 0)
-        text_grid.addWidget(QLabel("接收文本"), 1, 1)
-        text_grid.addWidget(self.tx_text_view, 2, 0)
-        text_grid.addWidget(self.rx_text_view, 2, 1)
+        text_result_grid.addWidget(QLabel("发送文本"), 0, 0)
+        text_result_grid.addWidget(QLabel("接收文本"), 0, 1)
+        text_result_grid.addWidget(self.tx_text_view, 1, 0)
+        text_result_grid.addWidget(self.rx_text_view, 1, 1)
+        text_grid.addWidget(self.text_result_panel, 1, 0, 1, 2)
+        self.text_result_panel.setVisible(False)
+        self.btn_show_text.toggled.connect(self.text_result_panel.setVisible)
         layout.addWidget(text_panel, 0)
 
         self.rx_curve = self.rx_spectrum_plot.plot(pen=pg.mkPen(MATLAB_ORANGE, width=2))
@@ -716,9 +835,11 @@ class FDIDMHardwareTestTab(QWidget):
             brush=pg.mkBrush(250, 250, 250, 215),
             pen=pg.mkPen((190, 190, 190), width=1),
         )
-        self.timeline_effect_legend.setParentItem(self.timeline_effect_plot.getPlotItem())
-        self.timeline_effect_legend.addItem(self.timeline_baseline_bars, "OFF 局部基线（100%）")
-        self.timeline_effect_legend.addItem(self.timeline_candidate_bars, "ON FDIDM（低于100%更好）")
+        # Anchor inside the data view. PlotItem coordinates include its title
+        # and axes, so the same offset there puts the legend over the title.
+        self.timeline_effect_legend.setParentItem(self.timeline_effect_plot.getViewBox())
+        self.timeline_effect_legend.addItem(self.timeline_baseline_bars, "OFF 基线 100%")
+        self.timeline_effect_legend.addItem(self.timeline_candidate_bars, "ON 候选（越低越好）")
         self.timeline_ser_curve.setVisible(False)
         self.timeline_evm_curve = self.timeline_evm_plot.plot(
             pen=pg.mkPen(MATLAB_ORANGE, width=2), name="EVM%", connect="finite")
@@ -849,19 +970,18 @@ class FDIDMHardwareTestTab(QWidget):
     def _compact_left_controls(self, panel):
         for combo in panel.findChildren(QComboBox):
             self._compact_combo(combo, 8)
-            combo.setMaximumHeight(28)
         for edit in panel.findChildren((QSpinBox, QDoubleSpinBox)):
             edit.setMinimumWidth(80)
             edit.setMaximumWidth(140)
-            edit.setMaximumHeight(28)
+            edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for button in panel.findChildren(QPushButton):
-            # Keep the command pad and presets dense while retaining a clear
-            # hit target; advanced controls can still be expanded when needed.
-            button.setMaximumHeight(30)
-        for note_name in ("rf_port_note", "log_status_label"):
-            note = getattr(self, note_name, None)
-            if note is not None:
-                note.setMaximumHeight(32)
+            # Native size hints include text and stylesheet padding. A hard
+            # maximum below that hint clips the button's outline and label.
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for note in panel.findChildren(QLabel):
+            if note.wordWrap():
+                note.setMinimumWidth(0)
+                note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
 
     def _dspin(self, lo, hi, val, dec, suffix="", step=None):
         s = QDoubleSpinBox()
@@ -918,9 +1038,6 @@ class FDIDMHardwareTestTab(QWidget):
         self.btn_connect.clicked.connect(self._on_connect_clicked)
         self.btn_start_test.clicked.connect(self._on_start_test_clicked)
         self.btn_stop_test.clicked.connect(self._on_stop_test_clicked)
-        self.btn_start_observation.clicked.connect(self._start_observation_clicked)
-        self.btn_stop_observation.clicked.connect(self._stop_observation_clicked)
-        self.btn_export_observation.clicked.connect(self._export_observation_clicked)
         self.btn_export_log.clicked.connect(self._on_export_log_clicked)
         self.btn_apply_params.clicked.connect(self._apply_params_to_backend)
         self.btn_ofdm.clicked.connect(lambda: self._set_indices(0.0, 0.0))
@@ -962,7 +1079,7 @@ class FDIDMHardwareTestTab(QWidget):
             # widget out of the collapsed layout is important: Qt otherwise
             # includes a hidden group's child sizeHint in the scroll area's
             # preferred height.
-            panel_layout.insertWidget(2, self.advanced_group)
+            panel_layout.insertWidget(panel_layout.indexOf(self.btn_toggle_advanced) + 1, self.advanced_group)
         elif not checked and advanced_index >= 0:
             panel_layout.removeWidget(self.advanced_group)
         self.advanced_group.setVisible(checked)
@@ -970,6 +1087,7 @@ class FDIDMHardwareTestTab(QWidget):
         self.text_group.setVisible(checked)
         self.samp_rate_spin.setVisible(bool(checked))
         self.channel_estimator_combo.setVisible(bool(checked))
+        self._advanced_channel_group.setVisible(checked and self._selected_channel_mode() != "rf")
         self.btn_toggle_advanced.setText("收起高级参数" if checked else "显示高级参数")
         panel_layout.invalidate()
         panel_layout.activate()
@@ -1042,19 +1160,19 @@ class FDIDMHardwareTestTab(QWidget):
                 self._create_backend()
             else:
                 self._configure_backend(self.tx_text_edit.toPlainText())
-            initial_status = self.backend.get_status()
-            self._log_frame_structure_warning(initial_status)
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.clear()
             self.decode_status_label.setText("解调状态：运行中，等待接收帧…")
             self._reset_runtime_curves()
             self.backend.start()
+            initial_status = self.backend.get_status()
+            self._log_frame_structure_warning(initial_status)
             self.test_running = True
             self.btn_start_test.setEnabled(False)
             self.btn_stop_test.setEnabled(True)
             self._set_test_controls_enabled(False)
             self.update_timer.start(100)
-            self._begin_observation(automatic=True)
+            self._begin_observation(initial_status)
             self._log("v35 测试已启动。")
             self._log(self._backend_summary())
         except Exception as e:
@@ -1071,9 +1189,13 @@ class FDIDMHardwareTestTab(QWidget):
             self.btn_connect.setEnabled(True)
             self._log(f"开始测试失败: {type(e).__name__}: {e}")
 
-    def _on_stop_test_clicked(self):
+    def _on_stop_test_clicked(self, _checked=False, *, preserve_plots=False, strict=False):
+        was_running = self.test_running
         self.test_running = False
         self.update_timer.stop()
+        self._apply_debounce_timer.stop()
+        self._pending_apply = False
+        self._adaptive_toggle_pending = False
         if self.backend is not None:
             try:
                 self.backend.stop()
@@ -1081,20 +1203,53 @@ class FDIDMHardwareTestTab(QWidget):
                     self.backend.wait()
             except Exception as e:
                 self._log(f"停止后端时出错: {e}")
+                if strict:
+                    self.test_running = was_running
+                    if was_running:
+                        self.update_timer.start(100)
+                    raise
         self.btn_start_test.setEnabled(True)
         self.btn_stop_test.setEnabled(False)
         self.btn_connect.setEnabled(True)
         self._set_hw_controls_enabled(True)
         self._set_test_controls_enabled(True)
-        self._clear_plots()
+        if not preserve_plots:
+            self._clear_plots()
         if self.observer.active:
             self.observer.stop()
-        self.btn_start_observation.setEnabled(False)
-        self.btn_stop_observation.setEnabled(False)
-        self.btn_export_observation.setEnabled(bool(self.observer.windows() or self.observer.events()))
         self._update_observation_display()
         self.decode_status_label.setText("解调状态：已停止")
         self._log("停止 FDIDM 测试。")
+
+    def suspend_tasks(self):
+        """Stop pending work and release UHD without erasing the last result."""
+        if self._ai_analysis_dialog is not None:
+            self._ai_analysis_dialog.suspend_analysis()
+        self._apply_debounce_timer.stop()
+        self._pending_apply = False
+        self._adaptive_toggle_pending = False
+        if self.backend is not None or self.test_running or self.observer.active:
+            self._on_stop_test_clicked(preserve_plots=True, strict=True)
+            self._get_ai_log_snapshot()
+            self.backend = None
+            self._last_backend_alpha_beta = None
+            self.btn_start_test.setEnabled(False)
+            self.decode_status_label.setText("解调状态：已停止并释放 USRP；结果已保留。")
+            self._log("离开测试页面，已释放 USRP；再次测试请连接设备。")
+            gc.collect()
+        else:
+            self.update_timer.stop()
+        if self._ab_surface_window is not None:
+            self._ab_surface_window.close()
+            self._clear_ab_surface_window_refs()
+
+    def closeEvent(self, event):
+        try:
+            self.suspend_tasks()
+        except Exception:
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _on_reset_hcache_clicked(self):
         if self.backend is None:
@@ -1156,64 +1311,22 @@ class FDIDMHardwareTestTab(QWidget):
         except Exception as e:
             self._log(f"导出日志失败: {type(e).__name__}: {e}")
 
-    # ---------------- 优势观测（手动开关 + 自动配对统计） ----------------
-    def _observation_context(self):
-        if self.backend is not None:
-            try:
-                # start() also uses cumulative counters as its baseline, so the
-                # complete snapshot is intentional here.  The observer itself
-                # narrows exported context to the evidence allow-list.
-                return dict(self.backend.get_status())
-            except Exception:
-                pass
-        return {}
-
-    def _begin_observation(self, *, automatic: bool) -> None:
+    # ---------------- 自动图表记录与局部窗口统计 ----------------
+    def _begin_observation(self, status=None) -> None:
+        """Start the chart session automatically with the hardware test."""
+        # A new test must never inherit the previous run's cumulative frame
+        # counters. The start handler supplies its fresh post-start snapshot.
+        snapshot = dict(status or {})
+        self._last_status_snapshot = snapshot
         enabled = bool(self.adaptive_enable_check.isChecked())
-        self.observer.start(enabled, self._observation_context())
+        self.observer.start(enabled, snapshot)
         self._obs_t0 = self.observer.started_at()
         self._clear_timeline()
-        self.btn_start_observation.setEnabled(bool(self.test_running))
-        self.btn_stop_observation.setEnabled(True)
-        self.btn_export_observation.setEnabled(False)
-        origin = "硬件测试启动，已自动开始" if automatic else "已重新开始"
         self._log(
-            f"{origin}优势观测（自适应初始：{'开启' if enabled else '关闭'}）；"
+            f"硬件测试启动，已自动开始图表记录（自适应初始：{'开启' if enabled else '关闭'}）；"
             "在线切换时自动分段并以精确错误计数配对。"
         )
-        self._update_observation_display()
-
-    def _start_observation_clicked(self):
-        if self.backend is None or not self.test_running:
-            self._log("请先启动硬件测试；观测会在测试启动时自动开始。")
-            return
-        self._begin_observation(automatic=False)
-
-    def _stop_observation_clicked(self):
-        self.observer.stop()
-        self.btn_start_observation.setEnabled(bool(self.test_running))
-        self.btn_stop_observation.setEnabled(False)
-        self.btn_export_observation.setEnabled(bool(self.observer.windows() or self.observer.events()))
-        self._log("结束优势观测；结果保留，可导出报告。")
-        self._update_observation_display()
-
-    def _export_observation_clicked(self):
-        data = self.observer.to_export_dict()
-        if not data.get("windows") and not data.get("toggle_events"):
-            self._log("尚无观测数据可导出；请先开始观测并开关自适应。")
-            return
-        log_dir = Path(__file__).resolve().parents[2] / "log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        default_name = str(log_dir / f"fdidm_advantage_{time.strftime('%Y%m%d_%H%M%S')}.json")
-        path, _ = QFileDialog.getSaveFileName(self, "导出优势观测报告", default_name, "JSON (*.json);;All Files (*)")
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=float)
-            self._log(f"优势观测报告已导出：{path}")
-        except Exception as e:
-            self._log(f"导出观测报告失败: {type(e).__name__}: {e}")
+        self._update_observation_display(snapshot)
 
     def _clear_timeline(self):
         self._obs_t.clear(); self._obs_ser.clear(); self._obs_evm.clear()
@@ -1520,19 +1633,6 @@ class FDIDMHardwareTestTab(QWidget):
         ys = [p[1] for p in self._timeline_apply_points]
         self.timeline_apply_scatter.setData(x=xs, y=ys)
 
-    def _set_observation_note(self, text):
-        """Keep the result strip legible while preserving the full evidence.
-
-        The observation header is deliberately one line tall so it never steals
-        height from the four plots.  A validation reason can be much longer
-        than that row, therefore its unabridged form belongs in the tooltip and
-        exported report rather than being silently clipped by Qt.
-        """
-        full_text = str(text or "")
-        compact_text = full_text if len(full_text) <= 46 else f"{full_text[:45]}…"
-        self.observation_note_label.setText(compact_text)
-        self.observation_note_label.setToolTip(full_text)
-
     def _update_adaptive_state_row(self, status):
         gmi = dict(status.get("gmi_adaptation", {}) or {})
         if not gmi:
@@ -1544,7 +1644,8 @@ class FDIDMHardwareTestTab(QWidget):
         gain = float(gmi.get("gain_lower_nats", 0.0))
         threshold = float(gmi.get("threshold_nats", 0.0))
         search = str(gmi.get("state", "—"))
-        valid = str(status.get("adaptive_validation_state", "—"))
+        validation = dict(status.get("adaptive_validation", {}) or {})
+        valid = str(validation.get("state") or status.get("adaptive_validation_state") or "—")
         search_name = {
             "disabled": "关闭", "idle": "等待", "queued": "等待评分", "scoring": "GMI 评分中",
             "waiting_channel": "等待可信 CSI", "candidate_ready": "候选已就绪",
@@ -1567,8 +1668,7 @@ class FDIDMHardwareTestTab(QWidget):
             f"GMI：{receiver_name} · token {current_token[-6:] if current_token else '—'} · {stage} · "
             f"净增益下界 {gain:.3g}"
         )
-        reason = str(status.get("adaptive_validation_reason", "") or gmi.get("reason", ""))
-        self.adaptive_state_label.setText(txt)
+        reason = str(validation.get("result_reason") or status.get("adaptive_validation_reason") or gmi.get("reason", ""))
         detail = (
             f"receiver={receiver}；current token={current_token or '—'}；candidate token={candidate_token or '—'}；"
             f"搜索={search_name}（{search}）；验证={valid_name}（{valid}）；"
@@ -1576,7 +1676,7 @@ class FDIDMHardwareTestTab(QWidget):
         )
         if reason:
             detail += f"；验证说明：{reason}"
-        self.adaptive_state_label.setToolTip(detail)
+        self._set_adaptive_state_display(txt, detail, valid, reason)
 
     def _update_legacy_adaptive_state_row(self, status):
         """Render historical SER-search status without granting it control.
@@ -1588,16 +1688,10 @@ class FDIDMHardwareTestTab(QWidget):
         a = float(status.get("alpha", np.nan))
         b = float(status.get("beta", np.nan))
         search = str(status.get("adaptive_alpha_beta_state", "—"))
-        valid = str(status.get("adaptive_validation_state", "—"))
+        validation = dict(status.get("adaptive_validation", {}) or {})
+        valid = str(validation.get("state") or status.get("adaptive_validation_state") or "—")
         alpha_obs = status.get("adaptive_alpha_observable")
         beta_obs = status.get("adaptive_beta_observable")
-        if alpha_obs is None or beta_obs is None:
-            try:
-                legacy = self.backend.get_alpha_beta_adaptation_status()
-                alpha_obs = legacy.get("alpha_observable")
-                beta_obs = legacy.get("beta_observable")
-            except Exception:
-                pass
 
         def yn(value):
             return "—" if value is None else ("✓" if bool(value) else "×")
@@ -1617,258 +1711,51 @@ class FDIDMHardwareTestTab(QWidget):
         }.get(valid, valid)
         index_text = "—" if not (np.isfinite(a) and np.isfinite(b)) else f"{a:.2f}/{b:.2f}"
         stage = valid_name if valid not in {"", "idle", "disabled"} else search_name
-        self.adaptive_state_label.setText(
-            f"自适应：α/β={index_text} · {stage} · 可观测 α{yn(alpha_obs)} β{yn(beta_obs)}"
-        )
-        reason = str(status.get("adaptive_validation_reason", "") or "")
+        txt = f"自适应：α/β={index_text} · {stage} · 可观测 α{yn(alpha_obs)} β{yn(beta_obs)}"
+        reason = str(validation.get("result_reason") or status.get("adaptive_validation_reason") or "")
         detail = (
             f"legacy_ser；当前 α/β={index_text}；搜索状态={search_name}（{search}）；"
             f"验证状态={valid_name}（{valid}）；α可观测={yn(alpha_obs)}；β可观测={yn(beta_obs)}"
         )
         if reason:
             detail += f"；验证说明：{reason}"
+        self._set_adaptive_state_display(txt, detail, valid, reason)
+
+    def _set_adaptive_state_display(self, text, detail, validation_state, reason):
+        """Keep validation warnings visible after removal of the result cards."""
+        warning = {
+            "rollback_failed": "回滚失败：请立即停止测试",
+            "aborted": "验证中断：未确认回滚",
+        }.get(validation_state, "")
+        color = "#555555"
+        if warning:
+            text = f"{warning} · {text}"
+            color = "#a33b3b"
+        elif validation_state == "regressed":
+            color = "#a33b3b"
+        elif validation_state == "inconclusive" or validation_state.endswith(("_applying", "_settling", "_collecting")):
+            color = "#b06a00"
+        if reason and validation_state not in {"", "—", "idle", "disabled"}:
+            compact_reason = reason if len(reason) <= 96 else f"{reason[:95]}…"
+            text += f"\n原因：{compact_reason}"
+        self.adaptive_state_label.setText(text)
         self.adaptive_state_label.setToolTip(detail)
+        weight = "font-weight:600;" if warning else ""
+        self.adaptive_state_label.setStyleSheet(f"color:{color}; font-size:12px; {weight}")
 
-    def _update_observation_display(self, *_args):
-        status = _args[0] if _args and isinstance(_args[0], dict) else {}
-
-        def finite_float(value):
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                return np.nan
-            return number if np.isfinite(number) else np.nan
-
-        def fmt(value, suffix="", precision=".3g"):
-            number = finite_float(value)
-            return "—" if not np.isfinite(number) else f"{format(number, precision)}{suffix}"
-
-        def fmt_count(value):
-            number = finite_float(value)
-            return "—" if not np.isfinite(number) else f"{number:.0f}"
-
-        started = bool(self.observer.windows() or self.observer.events())
-        state_txt = "进行中" if self.observer.active else ("已结束" if started else "未开始")
-        self.observation_state_label.setText(
-            f"观测：{state_txt} | 窗口 {len(self.observer.windows())} | 开关事件 {len(self.observer.events())}"
-            f" | 剔除 {self.observer.excluded_window_count()} 个异常窗口")
-        pair = self.observer.latest_pair()
-        validation = dict(status.get("adaptive_validation", {}) or {})
-        validation_state = str(validation.get("state", "") or status.get("adaptive_validation_state", ""))
-        validation_reason = str(validation.get("result_reason", "") or "")
-        gmi = dict(status.get("gmi_adaptation", {}) or {})
-        if gmi and (gmi.get("enabled") or gmi.get("resource_id")):
-            scores = {str(item.get("token_id", "")): dict(item) for item in gmi.get("scores", [])}
-            current_id = str(gmi.get("current_token_id", ""))
-            candidate_id = str(gmi.get("candidate_token_id", ""))
-            current_score = scores.get(current_id, {})
-            candidate_score = scores.get(candidate_id, {})
-            current_net = finite_float(current_score.get("lower_bound_nats"))
-            candidate_net = finite_float(candidate_score.get("lower_bound_nats"))
-            gain_lower = finite_float(gmi.get("gain_lower_nats"))
-            self.observation_before_label.setText(f"当前净 GMI {fmt(current_net, '', '.4g')}")
-            self.observation_after_label.setText(f"候选净 GMI {fmt(candidate_net, '', '.4g')}")
-            self.observation_improvement_label.setText(f"GMI 保守增益 {fmt(gain_lower, '', '+.3g')}")
-            allowed = bool(gmi.get("switch_allowed", False))
-            receiver = str(gmi.get("receiver_mode", "diagonal"))
-            confidence = "候选可验证" if allowed else ("完整接收机对照" if receiver == "full_matched" else "保持当前")
-            self.observation_badge_label.setText(f"置信状态：{confidence} · {validation_state or gmi.get('state', '—')}")
-            self.observation_badge_label.setStyleSheet(
-                f"color:{'#167c3a' if allowed else '#555555'}; font-weight:600;"
-            )
-            abba = dict(validation.get("abba_evidence", {}) or {})
-            baseline = dict(abba.get("baseline", {}) or {})
-            candidate = dict(abba.get("candidate", {}) or {})
-            self.observation_evm_label.setText(
-                f"EVM {fmt(baseline.get('data_aided_evm_mean'), '%', '.2f')} → "
-                f"{fmt(candidate.get('data_aided_evm_mean'), '%', '.2f')}"
-            )
-            reason = str(validation_reason or gmi.get("reason", ""))
-            self._set_observation_note(reason or "等待可信 CSI 与 A-B-B-A 真链路证据")
-            self.observation_before_label.setToolTip(f"token={current_id or '—'}；resource={gmi.get('resource_id', '—')}")
-            self.observation_after_label.setToolTip(f"token={candidate_id or '—'}；library={gmi.get('library_id', '—')}")
-            self.observation_improvement_label.setToolTip(
-                f"gain_lower={gain_lower:.6g}；threshold={finite_float(gmi.get('threshold_nats')):.6g} nats/charged-sample"
-            )
-            self._update_observation_stats(validation)
-            return
-        validation_display_applied = False
-        exact_windows_applied = False
-        self.observation_improvement_label.setToolTip("")
-        if validation_state in {"rollback_failed", "aborted", "inconclusive", "improved", "regressed", "candidate_collecting", "baseline_collecting", "rollback_applying"} and validation:
-            measured = dict(validation.get("measured", {}) or {})
-            if validation_state == "rollback_failed":
-                self.observation_improvement_label.setText("回滚失败：请立即停止测试")
-                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#a33b3b;")
-                validation_display_applied = True
-            elif validation_state == "aborted":
-                self.observation_improvement_label.setText("验证中断：未确认回滚")
-                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#a33b3b;")
-                validation_display_applied = True
-            elif validation_state == "inconclusive" and ("pilot" in validation_reason.lower() or "channel" in validation_reason.lower() or "导频" in validation_reason):
-                self.observation_improvement_label.setText("导频条件变化：无法归因")
-                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
-                validation_display_applied = True
-            elif validation_state == "improved":
-                evm_delta = float(measured.get("evm_delta_pp", np.nan))
-                lower = float(measured.get("ser_gain_lower_bound_db", np.nan))
-                if np.isfinite(lower):
-                    self.observation_improvement_label.setText(f"SER ≥{lower:.2f} dB")
-                    self.observation_improvement_label.setToolTip(f"SER 置信区间下界：{lower:.2f} dB")
-                    validation_display_applied = True
-                elif np.isfinite(evm_delta) and evm_delta < 0 and abs(float(measured.get("measured_ser_gain_db", 0.0) or 0.0)) < 1e-9:
-                    self.observation_improvement_label.setText(f"EVM 改善 {abs(evm_delta):.2f} pp")
-                    self.observation_improvement_label.setToolTip(f"解调误差 EVM 改善 {abs(evm_delta):.2f} 个百分点")
-                    validation_display_applied = True
-            elif validation_state in {"candidate_collecting", "baseline_collecting", "rollback_applying"}:
-                # Backend validation is authoritative even before the UI observer
-                # has accumulated a local OFF→ON pair.  Keep the cards useful by
-                # showing the exact windows and an explicit in-progress state.
-                labels = {
-                    "baseline_collecting": "真实链路验证：采集关闭基线",
-                    "candidate_collecting": "真实链路验证：采集候选窗口",
-                    "rollback_applying": "真实链路验证：正在回滚基线",
-                }
-                self.observation_improvement_label.setText(labels[validation_state])
-                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
-                validation_display_applied = True
-            elif validation_state == "inconclusive":
-                self.observation_improvement_label.setText("无法归因：等待同上下文窗口")
-                self.observation_improvement_label.setStyleSheet("font-size: 15px; font-weight: 600; color:#b06a00;")
-                validation_display_applied = True
-
-            # The backend may expose exact validation windows before the local
-            # observer has finalized a pair.  Populate the cards/tooltips from
-            # those windows instead of resetting them to placeholders below.
-            baseline = dict(validation.get("baseline_window", {}) or {})
-            candidate = dict(validation.get("candidate_window", {}) or {})
-            if baseline or candidate:
-                exact_windows_applied = True
-                old_a = finite_float(validation.get("old_alpha", 0.0))
-                old_b = finite_float(validation.get("old_beta", 0.0))
-                new_a = finite_float(validation.get("candidate_alpha", 0.0))
-                new_b = finite_float(validation.get("candidate_beta", 0.0))
-                self.observation_before_label.setToolTip(f"局部基线 α/β={old_a:.2f}/{old_b:.2f}")
-                self.observation_after_label.setToolTip(f"候选 α/β={new_a:.2f}/{new_b:.2f}")
-                if baseline:
-                    self.observation_before_label.setText(f"局部 OFF 基线 SER {fmt(baseline.get('ser'))}")
-                if candidate:
-                    self.observation_after_label.setText(f"FDIDM ON 候选 SER {fmt(candidate.get('ser'))}")
-                bevm = baseline.get("data_aided_evm_mean", baseline.get("evm_mean", np.nan))
-                aevm = candidate.get("data_aided_evm_mean", candidate.get("evm_mean", np.nan))
-                self.observation_evm_label.setText(
-                    f"数据辅助EVM {fmt(bevm, '%', '.2f')} → {fmt(aevm, '%', '.2f')}")
-                self.observation_evm_label.setToolTip(
-                    "解调误差 EVM：同一验证周期内，相邻 OFF 基线与 ON 候选的实测值")
-                bk, bn = baseline.get("ser_errors", np.nan), baseline.get("ser_symbols", np.nan)
-                ak, an = candidate.get("ser_errors", np.nan), candidate.get("ser_symbols", np.nan)
-                self.observation_badge_label.setToolTip(
-                    f"基线 SER 错误计数：{fmt_count(bk)}/{fmt_count(bn)}；"
-                    f"候选 SER 错误计数：{fmt_count(ak)}/{fmt_count(an)}")
-                min_frames = fmt_count(validation.get("min_frames"))
-                base_frames = fmt_count(baseline.get("valid_frames"))
-                cand_frames = fmt_count(candidate.get("valid_frames"))
-                self.observation_badge_label.setText(
-                    f"真实 A/B 窗口 · OFF {base_frames} 帧 / ON {cand_frames} 帧 · 最少 {min_frames} 帧")
-                self.observation_badge_label.setStyleSheet("color:#555555; font-weight:600;")
-                if validation_reason:
-                    self._set_observation_note(validation_reason)
-        if pair is None:
-            if not validation_display_applied:
-                self.observation_before_label.setText("局部 OFF 基线：—")
-                self.observation_after_label.setText("FDIDM ON 候选：—")
-                self.observation_improvement_label.setText("效果结论：—")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#555555;")
-                self.observation_badge_label.setText("可信度：—")
-                self.observation_badge_label.setStyleSheet("")
-                self._set_observation_note(
-                    "等待同一信道上下文中的相邻 OFF→ON 窗口；不使用启动时固定基线")
-            if not exact_windows_applied:
-                self.observation_before_label.setToolTip("")
-                self.observation_after_label.setToolTip("")
-                self.observation_evm_label.setText("数据辅助EVM：— → —")
-                self.observation_evm_label.setToolTip("解调误差 EVM：等待有效局部配对")
-                self.observation_badge_label.setToolTip("")
-            self._update_observation_stats(validation)
-            return
-
-        b, a = pair.before, pair.after
-        if not exact_windows_applied:
-            self.observation_before_label.setText(f"局部 OFF 基线 SER {fmt(b.ser)}")
-            self.observation_after_label.setText(f"FDIDM ON 候选 SER {fmt(a.ser)}")
-            self.observation_before_label.setToolTip(
-                f"局部基线 α/β={b.alpha_mean:.2f}/{b.beta_mean:.2f}")
-            self.observation_after_label.setToolTip(
-                f"候选 α/β={a.alpha_mean:.2f}/{a.beta_mean:.2f}")
-            self.observation_evm_label.setText(
-                f"数据辅助EVM {fmt(b.evm_mean, '%')} → {fmt(a.evm_mean, '%')}"
-                f"（判决EVM {fmt(b.decision_evm_mean, '%')} → {fmt(a.decision_evm_mean, '%')}）")
-            self.observation_evm_label.setToolTip("解调误差 EVM：数据辅助 EVM 与判决 EVM")
-        # 样本不足的窗口不产生改善结论（F3/AC3）
-        insufficient = a.grade == "insufficient" or b.grade == "insufficient"
-        waveform_changed = not (
-            np.isclose(b.alpha_mean, a.alpha_mean, rtol=0.0, atol=1e-6)
-            and np.isclose(b.beta_mean, a.beta_mean, rtol=0.0, atol=1e-6)
-        )
-        if not validation_display_applied:
-            # A changed SER/EVM is still a valid measured result even when the
-            # operator reused the same alpha/beta values.  Only call out
-            # "未切换候选波形" for an otherwise inconclusive pair; this keeps
-            # the collecting/insufficient state distinct from a real result.
-            if insufficient:
-                self.observation_improvement_label.setText("SER 改善：样本不足")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#b8860b;")
-            elif pair.outcome == "improved" and pair.comparable and np.isfinite(pair.ser_improvement_db):
-                self.observation_improvement_label.setText(
-                    f"实测优势：{pair.ser_improvement_db:+.2f} dB")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#167c3a;")
-            elif pair.outcome == "regressed":
-                delta = ("—" if not np.isfinite(pair.ser_improvement_db)
-                         else f"{pair.ser_improvement_db:+.2f} dB")
-                self.observation_improvement_label.setText(
-                    f"实测退化：{delta}（候选已回滚）")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#a33b3b;")
-            elif not waveform_changed and pair.outcome == "inconclusive":
-                delta = ("—" if not np.isfinite(pair.ser_improvement_db)
-                         else f"{pair.ser_improvement_db:+.2f} dB")
-                self.observation_improvement_label.setText(
-                    f"无结论：未切换候选波形（SER变化 {delta}）")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#b06a00;")
-            elif np.isfinite(pair.ser_improvement_db):
-                self.observation_improvement_label.setText(
-                    f"无结论（SER变化 {pair.ser_improvement_db:+.2f} dB）")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#b06a00;")
-            else:
-                self.observation_improvement_label.setText("无结论")
-                self.observation_improvement_label.setStyleSheet(
-                    "font-size: 15px; font-weight: 600; color:#b06a00;")
-        if not exact_windows_applied:
-            badge_map = {"trusted": ("可信", "#167c3a"), "reference": ("参考", "#777777"),
-                         "insufficient": ("样本不足", "#b8860b")}
-            name, color = badge_map.get(a.grade, ("—", "#333333"))
-            count_mark = "估算" if a.estimated_k else "精确"
-            k_mark = "≈" if a.estimated_k else ""
-            self.observation_badge_label.setText(
-                f"{name} · {count_mark}计数（{k_mark}{a.ser_k:.0f}/{a.ser_n} 符号错误 · {a.frames} 帧）")
-            self.observation_badge_label.setStyleSheet(f"color:{color}; font-weight:600;")
-        notes = []
-        if insufficient:
-            notes.append("每段需累计 ≥10 个错误符号才形成结论，≥100 为可信（继续运行积累）")
-        if self.observer.excluded_window_count():
-            notes.append(f"已剔除异常窗口 {self.observer.excluded_window_count()} 个")
-        if not pair.comparable:
-            notes.append(f"{pair.comparability_note}（可比性受限，结论仅供参考）")
-        if pair.validation_reason:
-            notes.append(pair.validation_reason)
-        if validation_reason and validation_reason not in notes:
-            notes.append(validation_reason)
-        self._set_observation_note("；".join(notes))
+    def _update_observation_display(self, status=None):
+        """Refresh chart evidence and safety state from one shared snapshot."""
+        if status is not None:
+            self._last_status_snapshot = dict(status)
+        snapshot = self._last_status_snapshot
+        self._update_adaptive_state_row(snapshot)
+        validation = dict(snapshot.get("adaptive_validation", {}) or {})
+        state = snapshot.get("adaptive_validation_state")
+        if state not in {None, "", "—", "idle", "disabled"}:
+            validation.setdefault("state", state)
+        reason = snapshot.get("adaptive_validation_reason")
+        if reason:
+            validation.setdefault("result_reason", reason)
         self._update_observation_stats(validation)
 
     def _update_observation_stats(self, validation=None):
@@ -1885,11 +1772,16 @@ class FDIDMHardwareTestTab(QWidget):
         name_map = {MODE_ON: "开启后", MODE_OFF: "开启前"}
         wins = self.observer.windows()
         if not wins and not validation:
-            self.observation_stats_label.setText("开始观测后此处显示各窗口汇总")
+            self.observation_stats_label.setText("硬件测试启动后自动记录各窗口汇总")
             self.observation_stats_label.setToolTip(
                 "动态信道采用相邻 OFF→ON 局部基线；raw/FEC BER 与功率合同将在采样后显示")
             return
-        lines = ["固定基线：否（动态信道采用相邻 OFF→ON 局部基线）"]
+        state = "记录中" if self.observer.active else "已停止（保留结果）"
+        lines = [
+            f"图表{state}｜窗口 {len(wins)}｜开关事件 {len(self.observer.events())}｜"
+            f"剔除 {self.observer.excluded_window_count()} 个异常窗口",
+            "固定基线：否（动态信道采用相邻 OFF→ON 局部基线）",
+        ]
         detail_lines = ["raw/FEC BER 与功率合同明细："]
         for w in wins[-4:]:
             agg = w.aggregate
@@ -1918,8 +1810,9 @@ class FDIDMHardwareTestTab(QWidget):
                     f"回退={ctx_num('tx_power_backoff_db', '.2f')} dB")
 
         if validation:
-            baseline = dict(validation.get("baseline_window", {}) or {})
-            candidate = dict(validation.get("candidate_window", {}) or {})
+            abba = dict(validation.get("abba_evidence", {}) or {})
+            baseline = dict(validation.get("baseline_window") or abba.get("baseline") or {})
+            candidate = dict(validation.get("candidate_window") or abba.get("candidate") or {})
 
             def window_line(label, window):
                 if not window:
@@ -1952,7 +1845,7 @@ class FDIDMHardwareTestTab(QWidget):
                 f"{'功率/上下文可比' if pair.comparable else pair.comparability_note}｜"
                 f"剔除窗口 {self.observer.excluded_window_count()}")
         self.observation_stats_label.setText("\n".join(lines))
-        self.observation_stats_label.setToolTip("\n".join(detail_lines))
+        self.observation_stats_label.setToolTip("\n".join(lines + detail_lines))
 
     def _on_adaptive_enable_changed(self, state):
         enabled = bool(state)
@@ -1967,7 +1860,7 @@ class FDIDMHardwareTestTab(QWidget):
             else:
                 self._log(
                     f"已{'开启' if enabled else '关闭'} α/β 自适应；当前观测已停止，"
-                    "可点击“重新开始观测”后再切换形成配对。")
+                    "重新启动硬件测试后会自动记录新的图表会话。")
         self._on_adaptive_config_changed()
 
 
@@ -2002,6 +1895,7 @@ class FDIDMHardwareTestTab(QWidget):
     def _create_backend(self):
         self._last_debug_seq = 0
         self.backend = FDIDMHardwareTest(**self._backend_kwargs(self.tx_text_edit.toPlainText()))
+        self._ai_backend_log_snapshot = ""
 
     def _backend_kwargs(self, tx_text: str):
         return dict(
@@ -2159,6 +2053,7 @@ class FDIDMHardwareTestTab(QWidget):
         """Show TDL parameters only for a link mode that actually uses TDL."""
         mode = self._selected_channel_mode()
         has_tdl = mode != "rf"
+        self._advanced_channel_group.setVisible(has_tdl and self.btn_toggle_advanced.isChecked())
         for widget in (
             self.tdl_ds_label, self.tdl_ds_spin,
             self.tdl_fd_label, self.tdl_fd_spin,
@@ -2217,8 +2112,7 @@ class FDIDMHardwareTestTab(QWidget):
             self.observer.on_sample(status)
             if self.observer.active:
                 self._append_timeline_sample(status)
-                self._update_adaptive_state_row(status)
-            self._update_observation_display()
+            self._update_observation_display(status)
             samp_rate = self._extract_samp_rate(status)
             self._apply_stable_plot_ranges(samp_rate)
             err = status.get("last_error", "")
@@ -2230,7 +2124,9 @@ class FDIDMHardwareTestTab(QWidget):
             rx_freq, rx_psd = self._compute_spectrum(rx_signal, samp_rate, 1024)
             self.rx_curve.setData(rx_freq, rx_psd)
             stale = bool(status.get("rx_spectrum_stale", True)); age = float(status.get("rx_spectrum_stale_sec", np.nan))
-            self.rx_spectrum_plot.setTitle(f"RX频谱[{self._selected_rx_spectrum_source()}] stale={stale} age={age:.1f}s")
+            self.rx_spectrum_plot.setTitle(f"RX 频谱 · {'等待新帧' if stale else '实时'}")
+            self.rx_spectrum_plot.setToolTip(
+                f"RX 频谱源：{self._selected_rx_spectrum_source()}；stale={stale}；距最近样本 {age:.1f}s")
             self._update_evm_plot(float(status.get("evm_percent", np.nan)))
             self.evm_plot.setTitle("EVM 曲线")
             const = self.backend.get_rx_constellation(512, source=self._current_data(self.const_mode_combo, "post_equalized"))
@@ -2238,10 +2134,11 @@ class FDIDMHardwareTestTab(QWidget):
                 self.constellation_scatter.setData(x=np.real(const), y=np.imag(const))
             else:
                 self.constellation_scatter.setData(x=[], y=[])
-            self.constellation_plot.setTitle(
-                f"星座[{self._current_data(self.const_mode_combo, 'post_equalized')}] "
-                f"{status.get('constellation_source','none')}/{status.get('constellation_points',0)}pts"
-            )
+            self.constellation_plot.setTitle(f"接收星座 · {status.get('constellation_points',0)} 点")
+            self.constellation_plot.setToolTip(
+                f"显示方式：{self.const_mode_combo.currentText()}；"
+                f"数据源：{status.get('constellation_source','none')}；"
+                f"原始模式：{self._current_data(self.const_mode_combo, 'post_equalized')}")
             self.tx_text_view.setPlainText(self.tx_text_edit.toPlainText())
             self.rx_text_view.setPlainText(self.backend.get_rx_text())
             self._update_decode_status(stats, status)
@@ -2303,7 +2200,7 @@ class FDIDMHardwareTestTab(QWidget):
             return self.backend.get_alpha_beta_performance_surface(metric)
         # Compatibility fallback for older backends: expose only the current
         # point, using the status dictionary already displayed elsewhere.
-        st = status or self.backend.get_status()
+        st = self.backend.get_status() if status is None else status
         metrics = {
             "evm_instant_percent": float(st.get("evm_instant_percent", np.nan)),
             "evm_average_percent": float(st.get("evm_average_percent", np.nan)),
@@ -2446,7 +2343,8 @@ class FDIDMHardwareTestTab(QWidget):
         reason = str(gmi.get("reason", "") or "")
         ready = bool(gmi.get("switch_allowed", False))
         seq = int(gmi.get("sequence", 0))
-        validation_state = str(status.get("adaptive_validation_state", "") or "")
+        validation = dict(status.get("adaptive_validation", {}) or {})
+        validation_state = str(validation.get("state") or status.get("adaptive_validation_state") or "")
 
         if label is not None:
             if not enabled:
@@ -2479,7 +2377,7 @@ class FDIDMHardwareTestTab(QWidget):
         if validation_state in {
             "a1_applying", "a1_settling", "a1_collecting", "b1_applying", "b1_settling",
             "b1_collecting", "b2_collecting", "a2_applying", "a2_settling", "a2_collecting",
-            "commit_applying", "rollback_applying", "rollback_failed",
+            "commit_applying", "rollback_applying", "rollback_failed", "aborted",
         }:
             return
         if (not enabled or not ready or seq <= int(self._last_adaptive_recommendation_seq)):

@@ -1,26 +1,22 @@
-# waveform_compare_tab.py
 # -*- coding: utf-8 -*-
+"""Paired live and scan workers for the common waveform comparison engine.
+
+A complete set of waveforms is the publication unit. A cancelled frame or scan
+point is never exposed as a comparison with mismatched sample budgets.
 """
-波形对比页面。
+from __future__ import annotations
 
-保留原有实时对比 UI：
-- 顶部统一参数设置
-- 左右两个波形实时对比面板
-- 每个面板包含接收端星座图 + BER-Time 曲线
-
-新增自动扫描 UI：
-- 独立分页中增加两个 MATLAB 风格扫描图
-- BER vs CFO
-- BER vs Doppler Spread
-- 每张图包含 OFDM / OTFS / AFDM 三条曲线
-- 扫描结果来自 simulation.compare_scan_backend 中的独立 Monte-Carlo 后端，
-  不读取当前实时后端的 BER。
-"""
-
+from collections import deque
+from copy import deepcopy
+import math
 import threading
-import traceback
+import time
+
 import numpy as np
 
+from waveform_sim.simulation.compare_scan_backend import (
+    CHIRP_CONVENTION, PREFIX, ScanConfig, WaveformScanSimulator, validate_parameters,
+)
 
 
 MATLAB_BLUE = (0, 114, 189)
@@ -32,277 +28,360 @@ LIGHT_PLOT_BACKGROUND = (250, 250, 250)
 AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
 
+_WAVEFORMS = ("OFDM", "OTFS", "AFDM")
+_RECEIVERS = ("full_mmse", "practical")
 
 
-class _WaveformRunner:
-    """统一封装 OFDM / OTFS / AFDM 的启动、停止、热更新和数据抓取。"""
+def _integer(value, name, minimum=0):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return int(value)
 
-    def __init__(self):
-        self.wave_type = None
-        self.tb = None
 
-    def is_running(self):
-        return self.tb is not None
+def _run_config(waveforms, snr_db, cfo_hz, doppler_hz, mod_order, seed, receiver_mode,
+                afdm_c1=None, afdm_c2=None):
+    if isinstance(waveforms, str):
+        raise ValueError("waveforms must be a sequence of waveform names")
+    names = tuple(str(name).upper().strip() for name in waveforms)
+    if not names or any(name not in _WAVEFORMS for name in names):
+        raise ValueError("Only OFDM, OTFS and AFDM are supported")
+    config = {
+        "waveforms": names,
+        "snr_db": float(snr_db),
+        "cfo_hz": float(cfo_hz),
+        "doppler_hz": float(doppler_hz),
+        "mod_order": str(mod_order).upper().strip(),
+        "seed": _integer(seed, "seed"),
+        "receiver_mode": str(receiver_mode).lower().strip(),
+    }
+    if not all(np.isfinite(config[key]) for key in ("snr_db", "cfo_hz", "doppler_hz")):
+        raise ValueError("Channel parameters must be finite")
+    if config["doppler_hz"] < 0:
+        raise ValueError("doppler_hz must be non-negative")
+    if config["mod_order"] not in ("QPSK", "16QAM", "64QAM"):
+        raise ValueError("Unsupported modulation")
+    if config["receiver_mode"] not in _RECEIVERS:
+        raise ValueError("receiver_mode must be full_mmse or practical")
+    # Use the numerical engine's bounds as well as the public worker schema,
+    # so a rejected physical setup never starts a live thread.
+    resources = ScanConfig(afdm_c1=afdm_c1, afdm_c2=afdm_c2).validated()
+    validated = validate_parameters(
+        **{key: value for key, value in config.items() if key != "waveforms"}, config=resources,
+    )
+    validated.pop("frames")
+    config.update(validated)
+    config.update(afdm_c1=resources.afdm_c1, afdm_c2=resources.afdm_c2,
+                  chirp_convention=CHIRP_CONVENTION, prefix=PREFIX)
+    return config
 
-    def start(self, wave_type: str, snr_db: float, cfo_hz: float,
-              doppler_hz: float, mod_order: str):
-        self.stop()
-        self.wave_type = wave_type
 
-        if wave_type == "OFDM":
-            from waveform_sim.simulation.simple_ofdm_rx import OfdmTransceiver
-            self.tb = OfdmTransceiver(
-                fft_len=64,
-                cp_len=16,
-                snr_db=snr_db,
-                cfo_hz=cfo_hz,
-                doppler_spread_hz=doppler_hz,
-                mod_order=mod_order,
-                payload_symbols=8,
-            )
+def _simulator_config(config):
+    """Reconstruct the immutable waveform settings used by both worker modes."""
+    return ScanConfig(afdm_c1=config["afdm_c1"], afdm_c2=config["afdm_c2"]).validated()
 
-        elif wave_type == "OTFS":
-            from waveform_sim.simulation.simple_otfs_rx import OTFSTransceiver
-            self.tb = OTFSTransceiver(
-                delay_spread=5,
-                doppler_spread=doppler_hz,
-                snr_db=snr_db,
-                mod_order=mod_order,
-                cfo_hz=cfo_hz,
-                n_subcarriers=64,
-                n_symbols=8,
-                sample_rate=960000.0,
-                equalizer="MMSE",
-            )
 
-        elif wave_type == "AFDM":
-            from waveform_sim.simulation.simple_afdm_rx import AFDMTransceiver
-            try:
-                self.tb = AFDMTransceiver(
-                    c1=0.05,
-                    c2=0.05,
-                    snr_db=snr_db,
-                    mod_order=mod_order,
-                    doppler_freq=doppler_hz,
-                    cfo_hz=cfo_hz,
-                )
-            except TypeError:
-                self.tb = AFDMTransceiver(
-                    c1=0.05,
-                    c2=0.05,
-                    snr_db=snr_db,
-                    mod_order=mod_order,
-                    doppler_freq=doppler_hz,
-                )
-                if hasattr(self.tb, "_cfo_hz"):
-                    self.tb._cfo_hz = float(cfo_hz)
+def _wilson_interval(errors, bits):
+    """Conditional two-sided 95% counting interval, including zero errors."""
+    if not bits:
+        return 0.0, 1.0
+    z = 1.959963984540054
+    probability = errors / bits
+    z2 = z * z
+    divisor = 1.0 + z2 / bits
+    centre = (probability + z2 / (2.0 * bits)) / divisor
+    radius = z * math.sqrt(probability * (1.0 - probability) / bits + z2 / (4.0 * bits * bits)) / divisor
+    return max(0.0, centre - radius), min(1.0, centre + radius)
 
-            if hasattr(self.tb, "reset_ber_stats"):
-                try:
-                    self.tb.reset_ber_stats()
-                except Exception:
-                    pass
-        else:
-            raise ValueError(f"不支持的波形类型: {wave_type}")
 
-        self.tb.start()
+def _new_counts():
+    return {"bit_errors": 0, "total_bits": 0, "frames": 0, "frame_errors": 0, "evm_square_sum": 0.0}
 
-    def stop(self):
-        if self.tb is not None:
-            try:
-                self.tb.stop()
-            except Exception:
-                pass
 
-            try:
-                self.tb.wait()
-            except Exception:
-                pass
+def _count_frame(counts, frame):
+    errors = _integer(frame["bit_errors"], "bit_errors")
+    bits = _integer(frame["total_bits"], "total_bits", minimum=1)
+    evm = float(frame["evm_percent"])
+    if errors > bits or not np.isfinite(evm) or evm < 0.0:
+        raise ValueError("Invalid raw frame metrics")
+    counts["bit_errors"] += errors
+    counts["total_bits"] += bits
+    counts["frames"] += 1
+    counts["frame_errors"] += int(errors > 0)
+    counts["evm_square_sum"] += evm * evm
 
-            self.tb = None
 
-    def update_runtime_params(self, snr_db: float, cfo_hz: float,
-                              doppler_hz: float):
-        """运行时热更新公共参数。调制方式不在运行中切换。"""
-        if self.tb is None:
-            return
+def _metrics(counts):
+    bits = counts["total_bits"]
+    frames = counts["frames"]
+    low, high = _wilson_interval(counts["bit_errors"], bits)
+    return {
+        "bit_errors": counts["bit_errors"], "total_bits": bits, "frames": frames,
+        "frame_errors": counts["frame_errors"],
+        "ber": counts["bit_errors"] / bits if bits else 0.0,
+        "fer": counts["frame_errors"] / frames if frames else 0.0,
+        "ci_low": low, "ci_high": high,
+        "evm_percent": math.sqrt(counts["evm_square_sum"] / frames) if frames else 0.0,
+    }
 
-        try:
-            if self.wave_type == "OFDM":
-                if hasattr(self.tb, "set_snr_db"):
-                    self.tb.set_snr_db(float(snr_db))
-                if hasattr(self.tb, "set_cfo_hz"):
-                    self.tb.set_cfo_hz(float(cfo_hz))
-                if hasattr(self.tb, "set_doppler_spread_hz"):
-                    self.tb.set_doppler_spread_hz(float(doppler_hz))
 
-            elif self.wave_type == "OTFS":
-                if hasattr(self.tb, "update_params"):
-                    self.tb.update_params(
-                        snr_db=float(snr_db),
-                        doppler_spread=float(doppler_hz),
-                        cfo_hz=float(cfo_hz),
-                    )
+def _frame_set(simulator, config, frame_index, stop_event):
+    """Use the exact same call contract for live frames and scan frames."""
+    if stop_event.is_set():
+        raise InterruptedError("Comparison cancelled")
+    result = simulator.simulate_frame_set(
+        waveforms=config["waveforms"], snr_db=config["snr_db"],
+        cfo_hz=config["cfo_hz"], doppler_hz=config["doppler_hz"],
+        mod_order=config["mod_order"], seed=config["seed"], frame_index=frame_index,
+        receiver_mode=config["receiver_mode"], stop_event=stop_event,
+    )
+    if stop_event.is_set():
+        raise InterruptedError("Comparison cancelled")
+    names = tuple(dict.fromkeys(config["waveforms"]))
+    if any(name not in result for name in names):
+        raise RuntimeError("Incomplete paired waveform frame")
+    budgets = {_integer(result[name]["total_bits"], "total_bits", minimum=1) for name in names}
+    if len(budgets) != 1:
+        raise RuntimeError("Waveforms do not have equal information-bit budgets")
+    return result
 
-            elif self.wave_type == "AFDM":
-                if hasattr(self.tb, "update_params"):
-                    try:
-                        self.tb.update_params(
-                            snr_db=float(snr_db),
-                            doppler_freq=float(doppler_hz),
-                            cfo_hz=float(cfo_hz),
-                            adaptive_chirp_enabled=True,
-                        )
-                    except TypeError:
-                        self.tb.update_params(
-                            snr_db=float(snr_db),
-                            doppler_freq=float(doppler_hz),
-                        )
-                        if hasattr(self.tb, "_cfo_hz"):
-                            self.tb._cfo_hz = float(cfo_hz)
-        except Exception:
-            pass
 
-    def snapshot(self):
-        """返回当前接收端解调星座图和 BER 数据。"""
-        if self.tb is None:
-            return {
-                "constellation": np.zeros(0, dtype=np.complex64),
-                "ber_t": np.array([], dtype=np.float64),
-                "ber_v": np.array([], dtype=np.float64),
-            }
+class _PairedWaveformRunner:
+    """One thread publishes both live panels from the same complete frame set.
 
-        constellation = np.zeros(0, dtype=np.complex64)
-        ber_t = np.array([], dtype=np.float64)
-        ber_v = np.array([], dtype=np.float64)
+    stop() requests cancellation. wait() must confirm termination before a
+    caller discards this runner or starts a replacement session. A timeout
+    retains the live thread reference and raises instead of losing ownership.
+    """
 
-        try:
-            if hasattr(self.tb, "get_constellation"):
-                constellation = np.asarray(
-                    self.tb.get_constellation(),
-                    dtype=np.complex64
-                )
-        except Exception:
-            constellation = np.zeros(0, dtype=np.complex64)
-
-        try:
-            if hasattr(self.tb, "get_estimated_ber"):
-                hist = self.tb.get_estimated_ber()
-                if hist is not None and len(hist) == 2:
-                    ber_t = np.asarray(hist[0], dtype=np.float64)
-                    ber_v = np.asarray(hist[1], dtype=np.float64)
-        except Exception:
-            ber_t = np.array([], dtype=np.float64)
-            ber_v = np.array([], dtype=np.float64)
-
-        if ber_t.size == 0 or ber_v.size == 0:
-            try:
-                if hasattr(self.tb, "get_ber_history"):
-                    hist = self.tb.get_ber_history()
-                    if hist is not None and len(hist) == 2:
-                        ber_t = np.asarray(hist[0], dtype=np.float64)
-                        ber_v = np.asarray(hist[1], dtype=np.float64)
-            except Exception:
-                ber_t = np.array([], dtype=np.float64)
-                ber_v = np.array([], dtype=np.float64)
-
-        if ber_t.size > 0 and ber_v.size > 0:
-            n = min(ber_t.size, ber_v.size)
-            ber_t = ber_t[:n]
-            ber_v = np.maximum(ber_v[:n], 1e-6)
-        else:
-            ber_t = np.array([], dtype=np.float64)
-            ber_v = np.array([], dtype=np.float64)
-
-        return {
-            "constellation": constellation,
-            "ber_t": ber_t,
-            "ber_v": ber_v,
+    def __init__(self, frame_interval_s=0.05, history_len=600):
+        interval = float(frame_interval_s)
+        if not np.isfinite(interval) or interval < 0:
+            raise ValueError("frame_interval_s must be finite and non-negative")
+        self.frame_interval_s = interval
+        self.history_len = _integer(history_len, "history_len", minimum=1)
+        self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._snapshot = {
+            "left": self._empty_panel(), "right": self._empty_panel(),
+            "error": "", "done": True, "cancelled": False, "config": {},
         }
 
+    @staticmethod
+    def _empty_panel():
+        return {
+            "constellation": np.zeros(0, dtype=np.complex128),
+            "ber_t": np.zeros(0, dtype=float), "ber_v": np.zeros(0, dtype=float),
+            "ber_upper": np.zeros(0, dtype=float), **_metrics(_new_counts()),
+        }
+
+    def is_running(self):
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self, waveforms, snr_db, cfo_hz, doppler_hz, mod_order,
+              seed=42, receiver_mode="full_mmse", afdm_c1=None, afdm_c2=None):
+        config = _run_config(waveforms, snr_db, cfo_hz, doppler_hz, mod_order, seed, receiver_mode,
+                             afdm_c1, afdm_c2)
+        if len(config["waveforms"]) != 2:
+            raise ValueError("The live comparison requires exactly two waveform selections")
+        with self._lifecycle_lock:
+            if self.is_running():
+                raise RuntimeError("上次配对仿真尚未退出，请先停止并等待任务结束。")
+            self._stop_event = threading.Event()
+            with self._lock:
+                self._snapshot = {
+                    "left": self._empty_panel(), "right": self._empty_panel(),
+                    "error": "", "done": False, "cancelled": False, "config": deepcopy(config),
+                }
+            self._thread = threading.Thread(
+                target=self._run, args=(config, self._stop_event),
+                name="paired-waveform-comparison", daemon=True,
+            )
+            try:
+                self._thread.start()
+            except Exception as exc:
+                with self._lock:
+                    self._snapshot.update(done=True, error=f"{type(exc).__name__}: {exc}")
+                raise
+
+    def stop(self):
+        self._stop_event.set()
+
+    def wait(self, timeout=1.5):
+        with self._lifecycle_lock:
+            thread = self._thread
+            if thread is None:
+                return
+            if thread.ident is None and not thread.is_alive():
+                # Thread.start() can fail before an OS thread is created.
+                # There is then no live resource to join or discard.
+                return
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise RuntimeError("配对仿真线程尚未退出；已保留任务引用，请稍后重试。")
+
+    def snapshot(self):
+        with self._lock:
+            return deepcopy(self._snapshot)
+
+    def _run(self, config, stop_event):
+        error = ""
+        cancelled = False
+        names = tuple(dict.fromkeys(config["waveforms"]))
+        counts = {name: _new_counts() for name in names}
+        histories = {name: {key: deque(maxlen=self.history_len) for key in ("t", "ber", "upper")} for name in names}
+        started_at = time.monotonic()
+        try:
+            simulator = WaveformScanSimulator(_simulator_config(config))
+            frame_index = 0
+            while not stop_event.is_set():
+                result = _frame_set(simulator, config, frame_index, stop_event)
+                elapsed = time.monotonic() - started_at
+                panels = {}
+                for name in names:
+                    raw = result[name]
+                    _count_frame(counts[name], raw)
+                    metrics = _metrics(counts[name])
+                    history = histories[name]
+                    history["t"].append(elapsed)
+                    history["ber"].append(metrics["ber"])
+                    history["upper"].append(metrics["ci_high"])
+                    constellation = np.asarray(raw.get("constellation", raw.get("rx_symbols", [])), dtype=np.complex128).reshape(-1)
+                    panels[name] = {
+                        "constellation": constellation.copy(),
+                        "ber_t": np.asarray(history["t"], dtype=float),
+                        "ber_v": np.asarray(history["ber"], dtype=float),
+                        "ber_upper": np.asarray(history["upper"], dtype=float), **metrics,
+                    }
+                # No intermediate side is visible if another waveform failed.
+                with self._lock:
+                    if stop_event.is_set():
+                        raise InterruptedError("Comparison cancelled")
+                    self._snapshot.update(
+                        left=deepcopy(panels[config["waveforms"][0]]),
+                        right=deepcopy(panels[config["waveforms"][1]]),
+                    )
+                frame_index += 1
+                if stop_event.wait(self.frame_interval_s):
+                    break
+        except InterruptedError:
+            cancelled = True
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            with self._lock:
+                self._snapshot.update(error=error, done=True, cancelled=cancelled or (stop_event.is_set() and not error))
+
+
 class _ScanWorker(threading.Thread):
-    """自动扫描后台线程，调用独立扫描后端，不读取实时后端 BER。"""
+    """Point-major, paired Monte-Carlo scan; only complete points are published."""
 
     def __init__(self, result_store: dict, result_lock: threading.Lock,
                  stop_event: threading.Event, params: dict):
-        super().__init__(daemon=True)
+        super().__init__(name="paired-waveform-scan", daemon=True)
         self.result_store = result_store
         self.result_lock = result_lock
         self.stop_event = stop_event
-        self.params = params
+        self.params = deepcopy(params)
 
-    def _put_result(self, family: str, waveform: str, x, y, text: str):
+    def _put_point(self, family, value, counts, text):
+        metrics = {name: _metrics(counts[name]) for name in _WAVEFORMS}
         with self.result_lock:
-            self.result_store[family][waveform] = (
-                np.asarray(x, dtype=np.float64),
-                np.maximum(np.asarray(y, dtype=np.float64), 1e-8),
-            )
+            if self.stop_event.is_set():
+                raise InterruptedError("Scan cancelled")
+            destination = self.result_store.setdefault(family, {})
+            updated = {}
+            for name in _WAVEFORMS:
+                previous = destination.get(name, {})
+                point = {"x": float(value), **metrics[name]}
+                updated[name] = {
+                    key: np.append(np.asarray(previous.get(key, []), dtype=(np.int64 if key in (
+                        "bit_errors", "total_bits", "frames", "frame_errors"
+                    ) else float)), val)
+                    for key, val in point.items()
+                }
+            # Replace the family atomically rather than one waveform at a time.
+            self.result_store[family] = updated
             self.result_store["status"] = text
 
     def run(self):
+        error = ""
+        cancelled = False
+        completed_points = 0
+        with self.result_lock:
+            self.result_store.update(done=False, error="", cancelled=False, config=deepcopy(self.params))
+            self.result_store.setdefault("cfo", {})
+            self.result_store.setdefault("doppler", {})
         try:
-            from waveform_sim.simulation.compare_scan_backend import WaveformScanSimulator
-
-            sim = WaveformScanSimulator()
-            waveforms = ["OFDM", "OTFS", "AFDM"]
-
-            frames = int(self.params["frames"])
-            snr_db = float(self.params["snr_db"])
-            mod_order = str(self.params["mod_order"])
-            fixed_cfo = float(self.params["fixed_cfo"])
-            fixed_doppler = float(self.params["fixed_doppler"])
-            cfo_axis = np.asarray(self.params["cfo_axis"], dtype=np.float64)
-            doppler_axis = np.asarray(self.params["doppler_axis"], dtype=np.float64)
-
-            for family, axis_values in (("cfo", cfo_axis), ("doppler", doppler_axis)):
-                for w_idx, waveform in enumerate(waveforms):
-                    y_values = []
-                    for i, value in enumerate(axis_values):
-                        if self.stop_event.is_set():
-                            return
-
-                        if family == "cfo":
-                            cfo_hz = float(value)
-                            doppler_hz = fixed_doppler
-                        else:
-                            cfo_hz = fixed_cfo
-                            doppler_hz = float(value)
-
-                        seed = (
-                            20260503
-                            + 100000 * (0 if family == "cfo" else 1)
-                            + 10000 * w_idx
-                            + i
-                        )
-                        ber = sim.simulate_ber(
-                            waveform=waveform,
-                            snr_db=snr_db,
-                            cfo_hz=cfo_hz,
-                            doppler_hz=doppler_hz,
-                            mod_order=mod_order,
-                            frames=frames,
-                            seed=seed,
-                        )
-                        y_values.append(max(float(ber), 1e-8))
-
-                        self._put_result(
-                            family,
-                            waveform,
-                            axis_values[:i + 1],
-                            np.array(y_values, dtype=np.float64),
-                            f"扫描中：{family.upper()} / {waveform} / "
-                            f"{i + 1}/{len(axis_values)} 点，每点 {frames} 帧 Monte-Carlo。"
-                        )
-
+            config = _run_config(
+                _WAVEFORMS, self.params["snr_db"], self.params["fixed_cfo"],
+                self.params["fixed_doppler"], self.params["mod_order"],
+                self.params.get("seed", 42), self.params.get("receiver_mode", "full_mmse"),
+                self.params.get("afdm_c1"), self.params.get("afdm_c2"),
+            )
+            resources = _simulator_config(config)
+            frames = _integer(self.params["frames"], "frames", minimum=1)
+            axes = {}
+            for family in ("cfo", "doppler"):
+                values = np.asarray(self.params[f"{family}_axis"], dtype=float)
+                if values.ndim != 1 or values.size == 0 or not np.all(np.isfinite(values)):
+                    raise ValueError("扫描坐标必须是非空的一维有限数值数组。")
+                if family == "doppler" and np.any(values < 0):
+                    raise ValueError("多普勒扩展不能为负。")
+                for value in values:
+                    validate_parameters(
+                        snr_db=config["snr_db"],
+                        cfo_hz=float(value) if family == "cfo" else config["cfo_hz"],
+                        doppler_hz=float(value) if family == "doppler" else config["doppler_hz"],
+                        mod_order=config["mod_order"], frames=frames,
+                        seed=config["seed"], receiver_mode=config["receiver_mode"],
+                        config=resources,
+                    )
+                axes[family] = values.copy()
             with self.result_lock:
-                self.result_store["done"] = True
-                self.result_store["status"] = (
-                    "扫描完成：自动扫描结果来自独立 Monte-Carlo 后端，"
-                    "实时对比图仍然保留在原页面中。"
-                )
-
+                self.result_store["config"] = {
+                    **deepcopy(self.params), **config,
+                    "frames": frames, "cfo_axis": axes["cfo"].copy(), "doppler_axis": axes["doppler"].copy(),
+                }
+            if self.stop_event.is_set():
+                raise InterruptedError("Scan cancelled")
+            with self.result_lock:
+                self.result_store["status"] = "正在准备统一的三波形配对比较..."
+            simulator = WaveformScanSimulator(resources)
+            total_points = sum(len(values) for values in axes.values())
+            for family, values in axes.items():
+                for value in values:
+                    point_config = dict(config)
+                    point_config["cfo_hz" if family == "cfo" else "doppler_hz"] = float(value)
+                    counts = {name: _new_counts() for name in _WAVEFORMS}
+                    for frame_index in range(frames):
+                        result = _frame_set(simulator, point_config, frame_index, self.stop_event)
+                        for name in _WAVEFORMS:
+                            _count_frame(counts[name], result[name])
+                        with self.result_lock:
+                            self.result_store["status"] = (
+                                f"扫描中：{family.upper()}={float(value):g}，"
+                                f"配对帧 {frame_index + 1}/{frames}；已完成 {completed_points}/{total_points} 点。"
+                            )
+                    self._put_point(
+                        family, value, counts,
+                        f"扫描中：已完成 {completed_points + 1}/{total_points} 个完整配对点，每点 {frames} 帧。",
+                    )
+                    completed_points += 1
+            status = f"扫描完成：{completed_points} 个配对点，三波形共享比特、信道和噪声样本。"
+        except InterruptedError:
+            cancelled = True
+            status = f"扫描已取消，保留 {completed_points} 个完整配对点。"
         except Exception as exc:
-            traceback.print_exc()
+            error = f"{type(exc).__name__}: {exc}"
+            status = f"扫描失败：{error}；已保留 {completed_points} 个完整配对点。"
+        finally:
+            cancelled = cancelled or (self.stop_event.is_set() and not error)
+            if cancelled and not error:
+                status = f"扫描已取消，保留 {completed_points} 个完整配对点。"
             with self.result_lock:
-                self.result_store["done"] = True
-                self.result_store["status"] = f"扫描失败：{exc}"
+                self.result_store.update(done=True, error=error, cancelled=cancelled, status=status)

@@ -2,7 +2,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QPushButton, QLabel,
                              QDoubleSpinBox, QSplitter,
                              QGridLayout, QSizePolicy, QPlainTextEdit, QScrollArea)
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QTextCursor
 import threading
 import time
@@ -48,12 +48,41 @@ class ScrollableStatusText(QPlainTextEdit):
         return None
 
 
+class ElidedValueLabel(QLabel):
+    """A compact summary value with the complete text available on hover."""
+
+    def __init__(self, text="--", parent=None):
+        self._full_text = str(text)
+        super().__init__(self._full_text, parent)
+        self.setMinimumWidth(30)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setToolTip(self._full_text)
+
+    def text(self):
+        # Callers and exported snapshots still receive the unabridged value.
+        return self._full_text
+
+    def setText(self, text):
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self._update_elision()
+
+    def _update_elision(self):
+        super().setText(self.fontMetrics().elidedText(
+            self._full_text, Qt.ElideRight, max(1, self.contentsRect().width())
+        ))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elision()
+
+
 class BaseWaveformTab(QWidget):
     ber_snr_sweep_point = pyqtSignal(float, float)
     ber_snr_sweep_finished = pyqtSignal(str)
     # 右侧图形不再固定死尺寸；下面的数值作为最小尺寸，窗口放大时自动扩展。
-    SMALL_PLOT_WIDTH = 360
-    SMALL_PLOT_HEIGHT = 230
+    SMALL_PLOT_WIDTH = 270
+    SMALL_PLOT_HEIGHT = 175
     WIDE_PLOT_WIDTH = 760
     WIDE_PLOT_HEIGHT = 230
     INFO_PANEL_WIDTH = 760
@@ -71,6 +100,7 @@ class BaseWaveformTab(QWidget):
     def __init__(self, waveform_name="Unknown"):
         super().__init__()
         self.waveform_name = waveform_name
+        self._tasks_suspended = False
         self.metric_value_labels = {}
         self.config_value_labels = {}
         # 保存信息面板左侧名称 QLabel，子类可重命名，避免 FDIDM 页面出现
@@ -96,6 +126,7 @@ class BaseWaveformTab(QWidget):
 
         # 使用分割器，允许用户调整左右宽度；右侧区域随窗口放大优先扩展。
         splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = splitter
         splitter.setChildrenCollapsible(False)
         main_layout.addWidget(splitter)
 
@@ -115,19 +146,28 @@ class BaseWaveformTab(QWidget):
         控制项较多时使用滚动区域，避免窗口高度较小时控件互相挤压；
         窗口放大后右侧绘图区会优先自适应扩展。
         """
+        rail = QWidget()
+        rail.setMinimumWidth(300)
+        rail.setMaximumWidth(390)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 0, 0, 0)
+        rail_layout.setSpacing(8)
+        self.controls_rail_layout = rail_layout
+
         scroll = QScrollArea()
+        self.controls_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(300)
-        scroll.setMaximumWidth(430)
-        scroll.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
+        self.controls_content_layout = layout
 
         param_group = QGroupBox("基本参数")
+        self.param_group = param_group
         self.param_layout = QVBoxLayout()
         self.param_layout.setContentsMargins(8, 8, 8, 8)
         self.param_layout.setSpacing(6)
@@ -166,7 +206,8 @@ class BaseWaveformTab(QWidget):
         param_group.setLayout(self.param_layout)
         layout.addWidget(param_group)
 
-        btn_group = QGroupBox("操作")
+        btn_group = QGroupBox("运行控制")
+        self.run_controls_group = btn_group
         btn_layout = QVBoxLayout()
         btn_layout.setContentsMargins(8, 8, 8, 8)
         btn_layout.setSpacing(6)
@@ -174,22 +215,30 @@ class BaseWaveformTab(QWidget):
         self.btn_start = QPushButton("开始仿真")
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
-        self.btn_auto_ber_snr = QPushButton("自动绘制 BER-Eb/N0")
-        self.btn_stop_ber_snr = QPushButton("停止 BER-Eb/N0 扫描")
+        self.btn_auto_ber_snr = QPushButton("BER-Eb/N0 扫描")
+        self.btn_stop_ber_snr = QPushButton("停止扫描")
         self.btn_stop_ber_snr.setEnabled(False)
 
         for btn in (self.btn_start, self.btn_stop, self.btn_auto_ber_snr, self.btn_stop_ber_snr):
             btn.setMinimumHeight(28)
-            btn_layout.addWidget(btn)
+        run_row = QHBoxLayout()
+        run_row.addWidget(self.btn_start)
+        run_row.addWidget(self.btn_stop)
+        scan_row = QHBoxLayout()
+        scan_row.addWidget(self.btn_auto_ber_snr)
+        scan_row.addWidget(self.btn_stop_ber_snr)
+        btn_layout.addLayout(run_row)
+        btn_layout.addLayout(scan_row)
 
         self.btn_auto_ber_snr.clicked.connect(self._start_auto_ber_snr_sweep)
         self.btn_stop_ber_snr.clicked.connect(self._stop_auto_ber_snr_sweep)
         btn_group.setLayout(btn_layout)
-        layout.addWidget(btn_group)
         layout.addStretch(1)
 
         scroll.setWidget(panel)
-        return scroll
+        rail_layout.addWidget(btn_group)
+        rail_layout.addWidget(scroll, 1)
+        return rail
 
     def _apply_small_plot_size(self, plot_widget: pg.PlotWidget, width: int, height: int):
         """设置绘图控件的最小尺寸；窗口放大时自动扩展。"""
@@ -342,9 +391,14 @@ class BaseWaveformTab(QWidget):
         for row, name in enumerate(names):
             name_label = QLabel(f"{name}:")
             name_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            value_label = QLabel("--")
+            value_label = ElidedValueLabel("--")
             value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             value_label.setWordWrap(False)
+            # Runtime descriptions may be hundreds of characters long.  They
+            # must not enlarge the entire window; the full value is available
+            # on hover and in the detail panel.
+            value_label.setMinimumWidth(30)
+            value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             grid_layout.addWidget(name_label, row, 0)
             grid_layout.addWidget(value_label, row, 1)
             value_labels[name] = value_label
@@ -371,12 +425,14 @@ class BaseWaveformTab(QWidget):
                 label = self.metric_value_labels.get(key)
                 if label is not None:
                     label.setText(str(value))
+                    label.setToolTip(str(value))
 
         if config:
             for key, value in config.items():
                 label = self.config_value_labels.get(key)
                 if label is not None:
                     label.setText(str(value))
+                    label.setToolTip(str(value))
 
         if status_text is not None and self.status_text_label is not None:
             self.status_text_label.setText(str(status_text))
@@ -384,6 +440,44 @@ class BaseWaveformTab(QWidget):
     def _init_plot_style(self):
         """预留样式接口"""
         pass
+
+    def suspend_tasks(self):
+        """Stop work when leaving a page, keeping parameters and plotted data."""
+        self._tasks_suspended = True
+        self._stop_auto_ber_snr_sweep()
+        sweep = self._ber_snr_sweep_thread
+        if sweep is not None and sweep.is_alive() and sweep is not threading.current_thread():
+            sweep.join(timeout=1.7)
+        self._auto_ber_snr_active = False
+        self.btn_auto_ber_snr.setEnabled(True)
+        self.btn_stop_ber_snr.setEnabled(False)
+        for timer in self.findChildren(QTimer):
+            timer.stop()
+        timer = getattr(self, "update_timer", None)
+        if timer is not None:
+            timer.stop()
+        backend = getattr(self, "tb", None)
+        if backend is not None:
+            try:
+                backend.stop()
+            finally:
+                try:
+                    backend.wait(timeout=1.5)
+                finally:
+                    self.tb = None
+        if hasattr(self, "_set_ui_enabled"):
+            self._set_ui_enabled(True)
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.update_info_panel(metrics={"运行状态": "已停止"})
+
+    def resume_tasks(self):
+        """Make a page ready for explicit restart; never restart simulation."""
+        self._tasks_suspended = False
+
+    def closeEvent(self, event):
+        self.suspend_tasks()
+        super().closeEvent(event)
 
     def update_plots(self, spectrum_data=None, constellation_data=None, ber_data=None, ber_snr_data=None):
         """更新绘图接口"""
@@ -492,11 +586,23 @@ class BaseWaveformTab(QWidget):
                 else:
                     ber_combined = 1.0
 
-                self.ber_snr_sweep_point.emit(float(snr_db), max(float(ber_combined), 1e-12))
+                if not self._emit_sweep_signal("ber_snr_sweep_point", float(snr_db), max(float(ber_combined), 1e-12)):
+                    break
         except Exception as exc:
             reason = f"失败：{exc}"
         finally:
-            self.ber_snr_sweep_finished.emit(reason)
+            self._emit_sweep_signal("ber_snr_sweep_finished", reason)
+
+    def _emit_sweep_signal(self, name, *args):
+        """A stopped page must not receive late results from its sweep."""
+        if self._tasks_suspended:
+            return False
+        try:
+            getattr(self, name).emit(*args)
+            return True
+        except RuntimeError:
+            self._ber_snr_sweep_stop.set()
+            return False
 
     def _prepare_ber_snr_sweep_transceiver(self, tb, repeat_idx: int):
         """为自动 BER-Eb/N0 扫描准备独立仿真器。
@@ -560,6 +666,8 @@ class BaseWaveformTab(QWidget):
             time.sleep(0.05)
 
     def _on_auto_ber_snr_point(self, snr_db: float, ber: float):
+        if self._tasks_suspended:
+            return
         self._auto_ber_snr_x.append(float(snr_db))
         self._auto_ber_snr_raw_y.append(max(float(ber), 1e-12))
         order = np.argsort(np.asarray(self._auto_ber_snr_x, dtype=np.float64))
@@ -586,6 +694,8 @@ class BaseWaveformTab(QWidget):
             )
 
     def _on_auto_ber_snr_finished(self, reason: str):
+        if self._tasks_suspended:
+            return
         self._auto_ber_snr_active = False
         self._ber_snr_sweep_stop.clear()
         if hasattr(self, "btn_auto_ber_snr"):
