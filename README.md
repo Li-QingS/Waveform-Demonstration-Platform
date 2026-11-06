@@ -149,7 +149,7 @@ python scripts/study_afdm_ntn.py --frames 20 --seed 42
 
 ## 测试
 
-行为基线覆盖统一引擎、波形变换、服务层、硬件抽象与 FDIDM 仿真自适应（含信道块推进、连续多普勒、并发参数修改、时间图平滑、SER-SNR 固定信道对比等回归场景），以及首页导航、页面切换、任务停止和结果保留。CI（`.github/workflows/ci.yml`）仅安装 NumPy + pytest，UI 用例自动跳过，后端用例全部运行。
+行为基线覆盖统一引擎、波形变换、服务层、硬件抽象与 FDIDM 仿真自适应（含信道块推进、连续多普勒、并发参数修改、时间图平滑、SER-SNR 固定信道对比等回归场景），以及首页导航、页面切换、任务停止和结果保留。CI（`.github/workflows/ci.yml`）安装 NumPy、Matplotlib 和 pytest，以 Agg 无界面后端运行数值与图形导出测试；没有 Qt 依赖时，UI 用例自动跳过。
 
 ## 文档
 

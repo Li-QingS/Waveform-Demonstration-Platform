@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-ci/
 venv/
 
 # 本机 AI 凭据、环境配置与临时任务记录
