@@ -1,158 +1,167 @@
-# FDIDM 软波形自适应演示平台
+# FDIDM / OFDM / OTFS / AFDM 波形演示平台
 
-基于论文 *Fractional Dual Index Division Multiplexing: A Soft Waveform Design Toward Integrated Satellite-Terrestrial Networks* 开发的波形仿真与 USRP 硬件验证平台，支持 FDIDM / OFDM / OTFS / AFDM 四种波形的软件仿真、性能对比和 USRP B210 真机链路测试。
+基于 Python、PyQt5 和 pyqtgraph 的桌面实验平台，提供四种波形的本地仿真、星地链路参数研究、三波形配对比较，以及 USRP 硬件链路验证。平台 AI 助手可结合当前页面、图表和日志解释结果、提供操作指导。
 
-## 核心能力
+纯仿真无需 USRP、GNU Radio 或 AI 服务。硬件验证和 AI 对话分别按需配置。
 
-- 四种波形（FDIDM / OFDM / OTFS / AFDM）软件仿真；OFDM / OTFS / AFDM 提供独立星地研究引擎，三波形对比采用配对 Monte-Carlo 扫描
-- USRP B210（N210 / X310）硬件链路测试与 RF 安全保护
-- FDIDM α/β 预测式自适应闭环：硬件侧（`hardware/fdidm_hardtest.py`）与仿真侧（`simulation/fdidm_adaptive.py`）均实现“CSI 快照 → 理论 SER 搜索 → 稳定判定 → 冷却 → 自动应用”
-- FDIDM 仿真页自适应过程可视化：α/β 轨迹、预测 SER 对比、切换标注、状态文本
-- 时变信道模型（仿真页可切换，详见下文）：固定信道 / 动态块衰落 / 帧内快时变 / 连续多普勒
-- 仿真图右下角“实时性能随时间变化”图：固定滚动时间窗、Y 轴按可见数据自动拟合、3 s 滑动平均、增量刷新
-- 自适应过程页 SER-SNR 对比图：固定用户种子与信道实现，每个 SNR 点保持相同信道条件，观察 FDIDM 参数和自适应行为
-- 工程化：统一配置、统一引擎、实验 artifact + JSONL 事件日志、诊断脚本、行为基线测试与 CI
+## 安装与启动
 
-## 时变信道模式
+项目声明支持 **Python 3.10 及以上版本**；仓库的 CI 和 conda 环境使用 **Python 3.11**。以下命令在仓库根目录执行。
 
-FDIDM 仿真页“时变模式”下拉提供四种信道演化方式，参数基于真实 LEO 星地链路（3GPP TR 38.811）：
-
-- **固定信道**：整个运行期间保持同一 H_TF。
-- **动态块衰落**：路径表（时延/幅度/多普勒）固定，每个相干块对路径相位做一次均值回归（AR(1)）小幅游走；相邻块信道相关，SER 随时间平稳变化而不是独立跳变。
-- **帧内快时变**：每帧重新生成信道实现，并在帧内符号间做 AR(1) 增益演化。
-- **连续多普勒**：按各径真实多普勒逐帧旋转路径相位 exp(j2π·fD·T_frame)，信道连续演化、种子不变、可复现。
-
-参考量级：LEO 轨道速度约 7.8 km/s（28080 km/h）；20 GHz 载频下最大多普勒约 ±480 kHz、多普勒变化率可达 −5.44 kHz/s；默认径向系数 0.10 对应约 52 kHz 残余多普勒，此时相干时间仅数微秒——信道在帧级尺度上变化很快是物理事实，演示页用上述模式分别展示慢变/快变场景。
-
-## 目录结构
-
-```text
-waveform_sim/
-  main.py                       # 程序入口（PyQt5 主窗口）
-  core/                         # 工程化内核
-    config.py                   #   统一配置（Waveform/Adaptive/Hardware/Experiment）
-    engine.py                   #   统一链路引擎 LinkSimulator
-    modem.py / transforms.py / waveforms.py / metrics.py
-  simulation/                   # 软件仿真后端（transceiver 兼容壳）
-    simple_fdidm_rx.py / simple_ofdm_rx.py / simple_otfs_rx.py / simple_afdm_rx.py
-    fdidm_adaptive.py           #   FDIDM 仿真侧预测式自适应（mixin + 搜索内核）
-    compare_scan_backend.py     #   三波形 Monte-Carlo 对比扫描
-    ofdm_ntn.py / otfs_ntn.py / afdm_ntn.py  # 独立星地实时链路与可复现研究
-  hardware/                     # 硬件后端（兼容壳 + 抽象层）
-    fdidm_hardtest.py / ofdm_hardtest.py / otfs_hardtest.py / afdm_hardtest.py
-    transport.py / rf_safety.py / device_manager.py / iq_replay.py
-    stream.py / channel.py / fec.py / gr_flow.py / fdidm_adaptive.py
-  service/                      # 实验记录：experiment_service / artifact_writer / event_logger / run_state
-  diagnostics/                  # health_check / report_exporter / snapshot
-  ui/                           # GUI 页签与公共组件
-    main_window.py / landing_page.py / fdidm_tab.py / fdidm_plot_widgets.py
-    fdidm_adaptive_widgets.py / base_waveform_tab.py / compare_workers.py / ui_utils.py
-markdown/                       # 状态/待办文档（REFACTOR_CHECKLIST、TODO）
-scripts/                        # check_environment / check_usrp / run_self_test
-tests/                          # pytest 行为基线 / 回归测试
-.github/workflows/ci.yml        # 纯 Python 核心 CI
-```
-
-## 运行
-
-启动后先进入模式选择页，两个入口分别对应独立工作区：
-
-- **仿真**：FDIDM 软波形、OFDM、OTFS、AFDM 与波形对比；先配置参数，再启动仿真并查看结果。
-- **硬件验证**：FDIDM 自适应验证与三波形链路测评（OFDM / OTFS / AFDM）；先配置链路并连接 USRP，再启动验证并查看诊断与观测图表。
-
-顶部可返回首页或切换工作区，`Alt+Home` 返回首页，`Ctrl+Q` 退出。离开功能页时自动停止当前仿真、扫描或硬件任务，保留参数与最后结果；硬件连接会释放，返回后需手动连接并启动。页面首次访问时才加载，纯仿真无需连接 USRP。界面继续使用原有 Fusion 浅色控件与 MATLAB 风格图表。
-
-首页使用矢量绘制的仿真与 USRP 图标，配以星地链路、I/Q、频谱和覆盖网络背景，两个入口仍上下排列。硬件配置超出窗口时使用纵向滚动：三波形页各配置页独立滚动，FDIDM 高级参数采用分组两列表单；连接、开始、停止等运行按钮固定可见。长状态和错误保留完整内容，通过滚动区或提示查看，不挤压图表。布局已在 1100×700、1400×900 和不同字体大小下检查。
+Windows PowerShell 本地仿真环境：
 
 ```powershell
-cd waveform_sim
-python main.py
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m waveform_sim.main
 ```
 
-依赖：Python 3.11+、NumPy、PyQt5、pyqtgraph。硬件链路还需要 GNU Radio / UHD，以及 USRP B210（或 N210 / X310）设备；没有硬件时，纯仿真页面和波形对比页面仍可正常运行。
+Linux / macOS 可在创建环境后用 `source .venv/bin/activate` 激活，再执行相同的安装和启动命令。依赖版本见 [requirements.txt](requirements.txt) 和 [pyproject.toml](pyproject.toml)。后文的 `python` 均指所选环境中的解释器。
 
-无显示环境验证：
+## 页面与使用流程
+
+启动后从首页选择“仿真”或“硬件验证”，再在工作区内选择页面。页面首次访问时加载；先配置参数，再手动启动任务。
+
+| 工作区 / 页面 | 主要能力 |
+| --- | --- |
+| 仿真 / FDIDM 软波形 | α/β 参数、理论 SER 搜索、预测式自适应、性能面、星座与频谱、参数轨迹和时变信道观察 |
+| 仿真 / OFDM | 实时星地链路；Eb/N0、残余 CFO、子载波间隔、时延缩放等性能研究；JSON 导出 |
+| 仿真 / OTFS | 实时星地链路与 DD 能量显示；增加多普勒扩展、时隙数等研究维度；JSON 导出 |
+| 仿真 / AFDM | 实时星地链路、c1/c2、CPP/CP 和有效 DAFT 信道；参数扫描与 JSON 导出 |
+| 仿真 / 波形对比 | OFDM / OTFS / AFDM 实时配对比较与 Monte-Carlo 自动扫描；统一资源、载荷、物理信道和噪声；JSON 导出 |
+| 硬件 / FDIDM 自适应验证 | GMI 有限波形库选择、A-B-B-A 真链路验证、α/β 性能面、链路诊断、观测窗口及日志导出 |
+| 硬件 / 三波形链路测评 | 分别选择 OFDM / OTFS / AFDM，连接 USRP、发送文本、查看恢复文本、CRC、误码指标及图表 |
+
+顶部可返回首页或切换工作区；`Alt+Home` 返回首页，`Ctrl+Q` 退出。离开功能页会停止当前任务，保留参数和最近结果；硬件连接会释放，返回后需重新连接并启动。
+
+### FDIDM 的两种自适应路径
+
+**仿真侧**依据 CSI 快照进行预测 SER 粗细搜索，结合收益门限、连续推荐稳定性和冷却时间更新 α/β。可选择固定信道、动态块衰落、帧内快时变和连续多普勒，观察参数与性能随时间的变化。
+
+**硬件侧**使用接收机相关 GMI 对有限波形库评分。库预算可选 4 / 16 / 36，接收机可选对角 K=0 或完整匹配对照，并提供快速、标准、保守鲁棒等级。GMI 按包含数据、保护、训练和控制开销的共同资源归一化，单位为 **nats / charged sample**；选择考虑不确定性和切换代价。默认关闭自适应，启用后，满足门限的候选进入 A-B-B-A 非回归验证。GMI 负责选择，EVM / SER / CRC 提供实际链路证据；候选得分提高本身不等于实测改善。完整匹配对照用于验证该模型下 GMI 对 α/β 的不变性。
+
+### 结果的适用范围
+
+OFDM / OTFS / AFDM 独立研究页采用 NTN 时延功率轮廓与简化多径、多普勒模型，并提供训练或导频估计与理想 CSI 参考。三页的训练、前缀和接收机预算有所不同，曲线不能直接拼成同资源排名。
+
+波形对比页使用独立的共同资源模型，默认三波形均为理想 CSI 完整 LMMSE；“差异接收机演示”包含接收机复杂度差异。研究与对比结果保留真实误码计数；零误码仍为 0，对数图另用标记显示 95% Wilson 上界。结果受信道、种子、帧数、同步与接收机假设限制，不保证某种波形普遍占优，也不代表完整标准一致性测试或星地链路预算。
+
+## 可选：Windows USRP 硬件环境
+
+[environment.yml](environment.yml) 提供 Python 3.11、GNU Radio 3.10、GNU Radio UHD、UHD 4.x 和 Qt 等依赖：
 
 ```powershell
-python scripts/check_environment.py   # 环境健康检查
-python scripts/run_self_test.py       # FDIDM 自检（出帧 + 实验 artifact）
-python -m pytest -q                   # 行为基线 / 回归测试
+conda env create -f environment.yml
+conda activate waveform-demo-platform
+python scripts/check_environment.py
+python scripts/check_usrp.py
+python -m waveform_sim.main
 ```
 
-## 平台 AI 对话助手
+硬件验证需在同一运行环境中具备可导入的 `gnuradio` / `gnuradio.uhd`、匹配的 UHD 驱动与设备镜像，以及可被 UHD 发现的设备。检查脚本报告 `PASS` / `WARN`；纯仿真环境缺少硬件组件时出现 `WARN` 不影响仿真。
 
-首页、仿真及硬件验证的所有页面都可点击右下角 **AI** 悬浮球或按 **Ctrl+J** 打开同一个助手。助手由主窗口统一管理，独立于各实验页；可以一边操作平台一边提问，切页后聊天、草稿和缩放仍保留。上方提供“日志分析”“运行结果图解释”“异常原因排查”“优化建议”“操作指导”，点击后会显示对应的用户消息，再给出 AI 回答。输入框支持自由提问，Enter 发送、Shift+Enter 换行。
+当前专用验证和 RF 端口诊断脚本面向 **USRP B210**。实际测试前应核对自己的设备序列号、TX/RX 通道与天线端口、中心频率、采样率和增益；有线回环需配置适当外部衰减，OTA 需使用合适的天线和发射条件。先连接 / 配置设备，再启动测试；设备可发现不代表链路已完成验证。其他 USRP 型号需单独适配与核验。
 
-助手采用较大的统一正文和更宽松的行距，Windows 优先使用微软雅黑 UI，并适配系统显示缩放。标题栏的缩放按钮、Ctrl+滚轮或 Ctrl+加号/减号可整体调整界面（80%–140%），Ctrl+0 恢复 100%。缩放同时作用于已有及后续消息、输入框和按钮；拉伸窗口仅重新排版，不单独缩放某一条回答。
+## 可选：平台 AI 助手
 
-“操作指导”结合当前页真实的按钮名称、可用状态、参数和页面流程，说明下一步点哪里、先满足什么条件以及如何停止。首页或尚未运行实验时也能获得指导；助手只给出建议，不会替用户连接设备、启动测试或修改参数。仿真覆盖 FDIDM、OFDM、OTFS、AFDM 和波形对比，硬件覆盖 FDIDM 自适应验证和三波形链路测评；子视图及硬件页所选波形也纳入来源。
+首页和全部实验页共用右下角 **AI** 悬浮入口，`Ctrl+J` 打开助手。对话窗口可与平台同时操作，切页保留可见对话、草稿和缩放；新问题读取当前页面快照，旧回答保留提问时的来源。
 
-原始日志只作为后台证据，不在界面预览，也不附加到复制或保存的对话中。当前页没有独立日志时，可依据当前图表和保留结果进行分析；也可选择历史 `.log` / `.txt` 文件。“运行结果图解释”读取当前页面实际曲线、坐标轴、统计信息及性能面，区分对数坐标显示、参考曲线与实测结果，不把历史日志当作当前图表数据。切页后的旧回答标明提问时的来源，新的问题使用当前页的快照。分析服务地址、模型和凭据由后台管理。
+- 快捷入口：日志分析、运行结果图解释、异常原因排查、优化建议、操作指导。
+- 输入：`Enter` 发送，`Shift+Enter` 换行；可复制或保存对话。
+- 缩放：标题栏按钮、`Ctrl+滚轮` 或 `Ctrl++` / `Ctrl+-`，范围 80%–140%；`Ctrl+0` 恢复 100%。
+- 数据来源：当前页图表、参数、运行状态和日志，也可选择历史 `.log` / `.txt`。历史日志支持 UTF-8 / GB18030，文件上限 16 MiB，发送的日志正文最多保留末尾 24,000 个字符。
 
-部署管理员可通过服务端配置提供凭据。Windows 本地部署将凭据以当前 Windows 用户绑定的 DPAPI 加密数据保存在 `%LOCALAPPDATA%\WaveformDemonstrationPlatform\ai-config.dpapi`，不写入项目目录、日志或界面。用于共享部署时，凭据应保留在服务端；本地 DPAPI 配置仅适用于本机部署。管理员或 CI 也可使用 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL` 环境变量覆盖本地配置。
+只有发送问题或点击快捷入口时才会向配置的分析服务提交相关上下文。原始日志作为后台证据，不加入复制或保存的对话。助手提供解释与建议，不代替用户连接设备、启动实验或修改参数。取消会忽略未返回结果，已经发出的服务端请求可能继续处理。
 
-仅在发送问题或点击快捷入口后，后台才会向分析服务提交相关实验上下文。历史日志支持 UTF-8 和 GB18030 编码，上限为 16 MiB；超长日志保留最新 24,000 个字符，并向模型注明截断。对话携带有限的历史记录以支持追问；当前页面记录可能包含多次测试，分析单次实验时可选择对应记录。分析在后台运行，取消或离开页面会忽略未返回的结果；已经发送的请求可能仍由服务端完成。停止测试或返回页面后保留最近日志快照，AI 不会自动修改硬件参数。
+### 管理员配置
 
-## OFDM 星地链路与性能研究
+助手通过 [ai_config.py](waveform_sim/service/ai_config.py) 加载后台配置，调用 DeepSeek 兼容的聊天接口。环境变量优先于本地保存值：
 
-OFDM 页面包含“实时星地链路”和“性能研究”两个视图，支持 NTN-TDLA100 / NTN-TDLC5 的时延与功率轮廓、公共轨道频移预补偿、残余频偏、散射多普勒、分数时延、可配置 FFT / 子载波间隔 / CP，以及导频 LS 或理想单抽头 CSI 参考接收。性能研究按相同发送比特、路径实现和单位噪声对比导频 LS、理想 CSI 与关闭预补偿三种条件，可扫描 Eb/N0、额外残余 CFO、子载波间隔与时延缩放，导出配置和原始统计。
+| 环境变量 | 用途 / 默认值 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | 管理员注入的 API 凭据；必需，无内置密钥 |
+| `DEEPSEEK_BASE_URL` | API 基础地址；默认 `https://api.deepseek.com` |
+| `DEEPSEEK_MODEL` | 模型名称；代码默认 `deepseek-flash`，应按服务端实际可用模型配置 |
 
-BER 使用真实错误比特数 / 总比特数，不强制单调。零误码仍记录为 0，在对数图上以三角标记给出 95% Wilson 统计上界。Eb/N0 按发送整帧能量 / 载荷比特定义，计入 CP 和导频能量，噪声不随接收衰落逐帧归一化。
+Windows 本地部署也可调用 `save_ai_config()`，将配置以当前 Windows 用户绑定的 DPAPI 数据保存到 `%LOCALAPPDATA%\WaveformDemonstrationPlatform\ai-config.dpapi`。请在运行平台的同一 Windows 用户下执行。先运行 `python` 进入交互式解释器，再执行以下代码；密钥以隐藏方式输入，不写进命令文本：
 
-该研究模型假设辅助帧定时、未编码 SISO、固定种子路径幅度与初相和恒定逐径多普勒；标准时延/功率轮廓配合简化散射模型，不代表完整 3GPP 一致性信道、完整 NR 协议栈或星地链路预算。固定 FFT 扫描间隔时，带宽与 CP 时长会同时变化；单种子结果是所选信道实现下的结果。波形对比页使用独立的全载波配对基带模型，其曲线与 OFDM 星地研究页采用不同模型，不能直接混作同口径结果。
+```python
+from getpass import getpass
+from waveform_sim.service.ai_config import (
+    DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, save_ai_config,
+)
+from waveform_sim.service.ai_log_analyzer import DeepSeekConfig
 
-无界面复现四类扫描：
-
-```powershell
-python scripts/study_ofdm_ntn.py --frames 40 --seed 42
+base_url = input("API base URL: ").strip() or DEFAULT_AI_BASE_URL
+model = input("Model: ").strip() or DEFAULT_AI_MODEL
+save_ai_config(DeepSeekConfig(base_url, model, getpass("API Key: ")))
 ```
 
-结果默认保存至 `output/ofdm-ntn-study.json`。模型依据、实现假设和示例分析见 [OFDM 星地性能分析](markdown/OFDM_NTN_ANALYSIS.md)。
+环境变量方式可用于管理员管理的运行环境和 CI，也适用于不使用 Windows DPAPI 的部署。源码不读取 `.env` 文件；变量须由启动平台的进程继承。共享部署应由服务端保管密钥，向客户端提供受控接口。不要把实际密钥提交到仓库或写入实验日志。
 
-## OTFS 星地链路与性能研究
+## 命令行工具
 
-OTFS 页面与 OFDM 对齐为“实时星地链路”和“性能研究”，使用相同的 S / Ka 波段及 AWGN 预设、NTN 时延功率轮廓、公共轨道预补偿、残余 CFO、散射多普勒与分数时延模型。增加时延—多普勒网格尺寸、分辨率和接收 DD 能量展示，可扫描 Eb/N0、残余 CFO、多普勒扩展、子载波间隔、时延缩放与时隙数。
+以下工具在仓库根目录运行；带参数的脚本可用 `--help` 查看完整选项。
 
-发射端实现矩形脉冲 OTFS 的 ISFFT + 每时隙 CP，接收端 TF 均衡后作 SFFT。每突发增加一个已知训练时隙，以训练 LS 估计信道并保持至整个数据帧；理想 CSI 采用真实主对角项作为参考。两者均为 TF 单抽头 ZF/MMSE，尚未实现完整 DD 均衡或帧内导频跟踪；高动态下的训练老化、ICI 和 ISI 会保留在结果中。
+| 命令 | 用途与输出 |
+| --- | --- |
+| `python scripts/check_environment.py` | Python / Qt / GNU Radio / UHD 环境与 USRP 探测 |
+| `python scripts/check_usrp.py` | 通过 UHD 枚举设备 |
+| `python scripts/run_self_test.py` | 无显示、无射频的 FDIDM 出帧与实验记录自检；临时产物在退出后清理 |
+| `python scripts/study_ofdm_ntn.py --frames 40 --seed 42` | OFDM 研究；默认 `output/ofdm-ntn-study.json` |
+| `python scripts/study_otfs_ntn.py --frames 40 --seed 42` | OTFS 研究；默认 `output/otfs-ntn-study.json` |
+| `python scripts/study_afdm_ntn.py --frames 20 --seed 42` | AFDM 研究；默认 `output/afdm-ntn-study.json` |
+| `python scripts/reproduce_gmi_paper_example.py --json artifacts/gmi-paper-example.json` | GMI 有限库数值示例与图；默认图为 `artifacts/gmi_paper_example.png`，`--no-figure` 只计算数值 |
+| `python scripts/validate_alpha_beta_adaptation.py --output output/alpha-beta-validation.json` | 离线校验预测 SER 优化器；用于诊断与回归，硬件在线切换由 GMI 控制 |
+| `python scripts/validate_gmi_hardware.py --help` | B210 固定 / 对角 GMI / 完整匹配验证；实测需显式提供 `--serial`、`--tx-gain`、`--rx-gain`，默认报告为 `log/gmi_hardware_validation.json` |
+| `python scripts/diagnose_b210_rf_ports.py --help` | B210 RF 端口与增益扫描；实际运行会发射测试音，应显式指定自己的 `--serial` 与增益方案；结果逐条输出 JSON |
 
-实时与扫描共用数值引擎，三策略共用发送比特、信道和单位噪声。发送整帧能量计入训练与 CP；显示原始 BER/FER/EVM、错误/总比特及 95% Wilson 区间，零误码以统计上界标记绘图，支持不可被后续参数修改的 JSON 研究快照。运行中锁定实验参数，停止或切页保留结果，返回后手动启动。
+三种 NTN 研究脚本均支持 `--output` 自定义 JSON 路径。`--help` 只显示参数；硬件脚本的实际运行需要完成设备与射频链路配置。
 
-```powershell
-python scripts/study_otfs_ntn.py --frames 40 --seed 42
-```
+## 日志与实验产物
 
-默认输出 `output/otfs-ntn-study.json`。完整假设、接收机限制与解释方式见 [OTFS 星地性能分析](markdown/OTFS_NTN_ANALYSIS.md)。OTFS 的全 DD 载荷加训练时隙，与 OFDM 页的梳状导频预算不同；两页对齐研究流程，不构成同资源波形排名。涉及三波形公平比较时使用下述专门页面，并核对其接收机假设。
-
-## AFDM 星地链路与性能研究
-
-AFDM 页面与 OFDM、OTFS 对齐星地场景、实时链路、性能研究和 JSON 导出流程，增加可编辑 c1/c2、CPP/CP 前缀、数据块数及有效 DAFT 信道矩阵展示。场景支持相同的 NTN 时延/功率轮廓、公共轨道预补偿、残余 CFO、散射多普勒与分数时延。
-
-新研究模型使用标准 DAFT chirp 指数 `exp(-j 2π c n²)`，与旧兼容模型的 `exp(-j 2π c n²/M)` 有明确换算关系；CPP 实际应用 chirp 周期相位修正。已知训练块估计静态信道并构造完整块 LMMSE/ZF 接收机，理想 CSI 单独标注为已知本块时变矩阵的参考。该参考不能代表已经实现实际频偏捕获或完整工程接收机。
-
-性能研究支持 Eb/N0、残余 CFO、多普勒扩展、子载波间隔、时延缩放、c1/c2 与数据块数扫描，保存真实错误/比特、BER/FER/EVM、Wilson 区间及运行时配置。训练和前缀能量计入发送 Eb/N0；取消保留完整点，停止与切页保留最后结果。
-
-```powershell
-python scripts/study_afdm_ntn.py --frames 20 --seed 42
-```
-
-默认输出 `output/afdm-ntn-study.json`。参数定义、CPP、接收机假设与研究结果见 [AFDM 星地性能分析](markdown/AFDM_NTN_ANALYSIS.md)。三个独立研究页的资源和接收机预算不同；同资源排名应使用下述专门对比页，并核对其模型约定。
-
-## 波形对比的统一口径
-
-波形对比页的实时与扫描共用一套配对引擎。每帧 OFDM / OTFS / AFDM 使用相同载荷比特、物理信道、时域噪声、64×7 全载波资源和含 CP 的发送帧能量；固定种子使重复运行可复现。默认三种波形均采用理想 CSI 完整 LMMSE，另有明确标注的“差异接收机演示”（OFDM 单抽头、OTFS/AFDM 完整 LMMSE）。后者的差异包含接收机预算，不能直接视作波形固有优势。
-
-该页面保持 OFDM / OTFS / AFDM 三波形范围；FDIDM 单独研究软波形参数、特殊参数下的退化关系和自适应过程，不强行并入四波形统一排名。三波形对比的实时与扫描均可修改 AFDM c1/c2，使用标准相位 `exp(-j 2π c n²)`，默认值 `0.00078125 = 0.05/64` 等效保留原波形。参数只影响 AFDM，运行时锁定；结果保留当次 chirp 配置，后续改控件不重标旧曲线。本页仍使用普通 CP，与 AFDM 独立研究页的 CPP/训练结构不同。
-
-界面显示真实错误/比特计数、BER、EVM 与统计区间；零误码在对数图上用统计上界三角标记，原始数据仍为 0。扫描可导出 JSON，包含实际配置、计数、区间和完成/取消/错误状态。运行中锁定参数，实时与扫描互斥；切换页面停止任务并保留完整结果。该模型假设帧定时已知，公共频偏计入理想 CSI，不模拟同步捕获；全载波无导频的通用对比结果不代表完整工程接收机或标准 NTN 一致性测试。
-
-问题复现依据、修复范围和验证方式见 [波形对比页审计](markdown/WAVEFORM_COMPARE_AUDIT.md)。
+- FDIDM 硬件页的“导出日志”默认保存为 `log/fdidm_debug_时间戳.log`；三波形硬件页在“测试日志”中显示运行记录。
+- 独立研究页与波形对比页通过导出按钮保存 JSON，包含运行配置、原始计数和研究结果；保存路径由用户选择。
+- 使用 `ExperimentService` 或 `LinkSimulator(auto_start_run=True)` 时，实验服务默认创建 `runs/<run_id>/`，可记录 `config.json`、`events.jsonl`、`metrics.csv`、`figures/`，结束时写入 `report.md`。GUI 各页并非统一自动接入该记录流程。
+- `output/`、`artifacts/`、`runs/` 和运行日志属于本地产物，不作为源码版本内容。
 
 ## 测试
 
-行为基线覆盖统一引擎、波形变换、服务层、硬件抽象与 FDIDM 仿真自适应（含信道块推进、连续多普勒、并发参数修改、时间图平滑、SER-SNR 固定信道对比等回归场景），以及首页导航、页面切换、任务停止和结果保留。CI（`.github/workflows/ci.yml`）安装 NumPy、Matplotlib 和 pytest，以 Agg 无界面后端运行数值与图形导出测试；没有 Qt 依赖时，UI 用例自动跳过。
+安装 `requirements.txt` 后，可运行包含 Qt 界面用例的本地回归测试。Windows PowerShell 无显示模式：
 
-## 文档
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+$env:MPLBACKEND = 'Agg'
+python scripts/run_self_test.py
+python -m pytest -q
+python -m compileall waveform_sim
+```
 
-`markdown/` 下保留持续维护的状态文档：
-- `REFACTOR_CHECKLIST.md`：重构对照清单（阶段完成状态）
-- `TODO.md`：平台待办清单（自适应、对比展示、架构优化）
+测试覆盖数值内核、NTN 模型、配对比较、GMI、硬件抽象与接收链路、实验记录、导航及 AI 上下文等；使用模拟对象的硬件测试不能代替 B210 实测。
+
+[GitHub Actions CI](.github/workflows/ci.yml) 使用 Ubuntu、Python 3.11 和 `MPLBACKEND=Agg`，只安装 NumPy、Matplotlib、pytest 后运行 pytest 与 compileall。未安装 Qt / pyqtgraph 时相应 UI 用例自动跳过；因此 CI 不等于完整桌面界面验证，也不包含真实射频收发。
+
+## 目录与技术参考
+
+```text
+waveform_sim/
+  main.py          # 桌面入口：python -m waveform_sim.main
+  core/            # 配置、调制、变换、指标和统一链路引擎
+  simulation/      # FDIDM 自适应、NTN 研究、共同资源比较后端
+  gmi/             # 资源契约、有限库、接收机相关评分与选择
+  hardware/        # USRP 收发、同步、FEC、CSI、自适应及证据统计
+  service/         # 实验记录、事件日志、AI 配置与分析服务
+  diagnostics/     # 环境检查、快照和报告导出
+  ui/              # 首页、工作区、实验页与全局 AI 助手
+scripts/           # 可重复运行的研究、诊断与验证入口
+tests/             # 数值、服务、硬件抽象和 Qt 回归测试
+markdown/          # NTN 模型分析与波形对比技术说明
+.github/workflows/ # 核心 CI
+```
+
+- [OFDM 星地链路分析](markdown/OFDM_NTN_ANALYSIS.md)
+- [OTFS 星地链路分析](markdown/OTFS_NTN_ANALYSIS.md)
+- [AFDM 星地链路分析](markdown/AFDM_NTN_ANALYSIS.md)
+- [波形对比模型、比较契约与审计](markdown/WAVEFORM_COMPARE_AUDIT.md)

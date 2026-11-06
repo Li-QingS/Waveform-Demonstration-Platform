@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """FDIDM 硬件优势观测引擎：窗口汇总、错误计数分级、异常剔除、前后配对。
 
-纯 Python + numpy，不依赖 PyQt（spec N4）。数据来源为硬件后端
+纯 Python + numpy，不依赖 PyQt。数据来源为硬件后端
 ``get_status()`` 的逐次快照，本模块只做测量方法学，不做任何呈现。
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ from waveform_sim.hardware.evidence import (
     wilson_interval,
 )
 
-# 分级阈值（MATLAB ≥100 错误建议，与 UPGRADE_PLAN 问题 2 同源）
+# 按错误计数分级：至少 100 个错误为可信，至少 10 个错误为参考。
 GRADE_TRUSTED_K = 100
 GRADE_REFERENCE_K = 10
 # 段首瞬态秒数：切换后前 TRANSIENT_SEC 的样本不计入汇总

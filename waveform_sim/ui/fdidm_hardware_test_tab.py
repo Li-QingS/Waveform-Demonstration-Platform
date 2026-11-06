@@ -1133,9 +1133,6 @@ class FDIDMHardwareTestTab(QWidget):
                 self.beta_spin.setValue(current[1])
         self._last_backend_alpha_beta = current
 
-    def _toggle_advanced_controls_from_mode(self):
-        self._toggle_advanced_controls(self.btn_toggle_advanced.isChecked())
-
     # ---------------- button handlers ----------------
     def _on_connect_clicked(self):
         try:

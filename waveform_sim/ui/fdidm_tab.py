@@ -1718,21 +1718,6 @@ class FDIDMTab(BaseWaveformTab):
             lines.append("提示：" + note)
         return "\n".join(lines)
 
-    def _curve_style(self, name):
-        c = {
-            "OFDM": (0, 114, 189),
-            "OTFS": (217, 83, 25),
-            "当前": (126, 47, 142),
-            "理论最优": (0, 150, 80),
-        }
-        if "OFDM" in name:
-            return pg.mkPen(c["OFDM"], width=2.2), 'o'
-        if name.startswith("OTFS"):
-            return pg.mkPen(c["OTFS"], width=2.2), 's'
-        if name.startswith("理论最优"):
-            return pg.mkPen(c["理论最优"], width=2.4), 'd'
-        return pg.mkPen(c["当前"], width=2.2), 't'
-
     def _curve_style_alpha_beta(self, name):
         # Eleven visually distinct curves for β=0:0.2:2.
         colors = [
@@ -1894,24 +1879,6 @@ class FDIDMTab(BaseWaveformTab):
         if abs(v) >= 1e3 or (0 < abs(v) < 1e-2):
             return f"{v:.{digits}e}"
         return f"{v:.{digits}f}"
-
-    @staticmethod
-    def _trailing_mean(y, n):
-        """尾部滑动平均：第 i 点只依赖 <=i 的数据，历史点不会随新点重算而漂移。"""
-        y = np.asarray(y, dtype=np.float64)
-        if n <= 1 or y.size <= 1:
-            return y
-        n = int(n)
-        cum = np.cumsum(np.where(np.isfinite(y), y, 0.0))
-        cnt = np.cumsum(np.isfinite(y))
-        out = np.full_like(y, np.nan)
-        for i in range(y.size):
-            j0 = max(0, i - n + 1)
-            s = cum[i] - (cum[j0 - 1] if j0 > 0 else 0.0)
-            c = cnt[i] - (cnt[j0 - 1] if j0 > 0 else 0)
-            if c > 0:
-                out[i] = s / float(c)
-        return out
 
     def _update_info_panel(self, running=False):
         metrics = {}

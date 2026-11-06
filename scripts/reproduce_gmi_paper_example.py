@@ -34,33 +34,6 @@ def _raw_fdit(alpha: float, beta: float) -> np.ndarray:
     return S0 @ V
 
 
-def _diagonal_rate(B: np.ndarray, rho: float) -> float:
-    diagonal_energy = np.abs(np.diag(B)) ** 2
-    x = float(rho) * diagonal_energy
-    y = float(rho) * np.maximum(0.0, np.sum(np.abs(B) ** 2, axis=1) - diagonal_energy)
-
-    def derivative(s: float) -> float:
-        denominator = 1.0 + s * x
-        numerator = s * x * (1.0 - s * (1.0 + y))
-        numerator_derivative = x - 2.0 * s * x * (1.0 + y)
-        return float(np.sum(x / denominator + (numerator_derivative * denominator - numerator * x) / denominator ** 2))
-
-    lo, hi = 0.0, 1.0
-    if derivative(hi) >= 0.0:
-        optimum = hi
-    else:
-        for _ in range(48):
-            middle = 0.5 * (lo + hi)
-            if derivative(middle) > 0.0:
-                lo = middle
-            else:
-                hi = middle
-        optimum = 0.5 * (lo + hi)
-    denominator = 1.0 + optimum * x
-    objective = np.sum(np.log(denominator) + optimum * x * (1.0 - optimum * (1.0 + y)) / denominator)
-    return float(objective / CHARGED_SAMPLES)
-
-
 def _batch_relative_rates(delta_pairs: Sequence[Tuple[float, float]], rho: float) -> dict[Tuple[float, float], float]:
     diagonal = np.diag(SPECTRUM)
     reference = _raw_fdit(0.0, 0.0)

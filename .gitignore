@@ -18,7 +18,6 @@ venv/
 runs/
 /output/
 /artifacts/
-*.pyc
 .pytest_cache/
 
 # IDE
@@ -31,7 +30,6 @@ runs/
 !/log/.gitkeep
 
 # 本地诊断/截图产物（不进入版本库）
-/log/*.json
 /_fdidm_v6_backup/
 /.tmp_diff.txt
 /alpha_beta_validation.json
@@ -44,8 +42,6 @@ runs/
 /legend_*.png
 /pair_*.png
 /tmp_check.png
-/artifacts/gmi_paper_example.png
-/artifacts/ui-refresh/
 /commit_ui.py
 /head_ui.py
 /orig_ui.py
