@@ -15,7 +15,9 @@ import time
 import numpy as np
 
 from waveform_sim.simulation.compare_scan_backend import (
-    CHIRP_CONVENTION, PREFIX, ScanConfig, WaveformScanSimulator, validate_parameters,
+    CHIRP_CONVENTION, PREFIX, ScanConfig, WaveformScanSimulator,
+    _frame_cluster_bootstrap_interval, _paired_frame_difference_interval,
+    validate_parameters,
 )
 
 
@@ -41,7 +43,7 @@ def _integer(value, name, minimum=0):
 
 
 def _run_config(waveforms, snr_db, cfo_hz, doppler_hz, mod_order, seed, receiver_mode,
-                afdm_c1=None, afdm_c2=None):
+                afdm_c1=None, afdm_c2=None, csi_mode="ideal"):
     if isinstance(waveforms, str):
         raise ValueError("waveforms must be a sequence of waveform names")
     names = tuple(str(name).upper().strip() for name in waveforms)
@@ -55,6 +57,7 @@ def _run_config(waveforms, snr_db, cfo_hz, doppler_hz, mod_order, seed, receiver
         "mod_order": str(mod_order).upper().strip(),
         "seed": _integer(seed, "seed"),
         "receiver_mode": str(receiver_mode).lower().strip(),
+        "csi_mode": str(csi_mode).lower().strip(),
     }
     if not all(np.isfinite(config[key]) for key in ("snr_db", "cfo_hz", "doppler_hz")):
         raise ValueError("Channel parameters must be finite")
@@ -72,7 +75,12 @@ def _run_config(waveforms, snr_db, cfo_hz, doppler_hz, mod_order, seed, receiver
     )
     validated.pop("frames")
     config.update(validated)
+    config["comparison_mode"] = (
+        "unified_baseline" if config["receiver_mode"] == "full_mmse" else "practical_receiver"
+    )
     config.update(afdm_c1=resources.afdm_c1, afdm_c2=resources.afdm_c2,
+                  subcarrier_spacing_hz=resources.subcarrier_spacing,
+                  sample_rate_hz=resources.fft_len * resources.subcarrier_spacing,
                   chirp_convention=CHIRP_CONVENTION, prefix=PREFIX)
     return config
 
@@ -82,21 +90,14 @@ def _simulator_config(config):
     return ScanConfig(afdm_c1=config["afdm_c1"], afdm_c2=config["afdm_c2"]).validated()
 
 
-def _wilson_interval(errors, bits):
-    """Conditional two-sided 95% counting interval, including zero errors."""
-    if not bits:
-        return 0.0, 1.0
-    z = 1.959963984540054
-    probability = errors / bits
-    z2 = z * z
-    divisor = 1.0 + z2 / bits
-    centre = (probability + z2 / (2.0 * bits)) / divisor
-    radius = z * math.sqrt(probability * (1.0 - probability) / bits + z2 / (4.0 * bits * bits)) / divisor
-    return max(0.0, centre - radius), min(1.0, centre + radius)
-
-
 def _new_counts():
-    return {"bit_errors": 0, "total_bits": 0, "frames": 0, "frame_errors": 0, "evm_square_sum": 0.0}
+    return {"bit_errors": 0, "total_bits": 0, "frames": 0, "frame_errors": 0,
+            "evm_square_sum": 0.0, "csi_nmse_sum": 0.0,
+            "pilot_overhead_fraction": 0.0, "receiver_coefficients_per_row_sum": 0,
+            "receiver_complexity_proxy_sum": 0, "receiver_method": "not_run",
+            "receiver_iterations_max": 0,
+            "receiver_complexity_scope": "equalizer only; excludes waveform transforms, vector updates and CSI estimation",
+            "frame_error_counts": [], "frame_bit_counts": []}
 
 
 def _count_frame(counts, frame):
@@ -110,19 +111,45 @@ def _count_frame(counts, frame):
     counts["frames"] += 1
     counts["frame_errors"] += int(errors > 0)
     counts["evm_square_sum"] += evm * evm
+    counts["csi_nmse_sum"] += float(frame.get("csi_nmse", 0.0))
+    counts["pilot_overhead_fraction"] = float(frame.get("pilot_overhead_fraction", 0.0))
+    counts["receiver_coefficients_per_row_sum"] += int(frame.get("receiver_coefficients_per_row", 0))
+    counts["receiver_complexity_proxy_sum"] += int(frame.get("receiver_complexity_proxy", 0))
+    counts["receiver_method"] = str(frame.get("receiver_method", "unknown"))
+    counts["receiver_iterations_max"] = max(
+        counts["receiver_iterations_max"], int(frame.get("receiver_iterations_max", 0))
+    )
+    counts["receiver_complexity_scope"] = str(frame.get("receiver_complexity_scope", "unknown"))
+    counts["frame_error_counts"].append(errors)
+    counts["frame_bit_counts"].append(bits)
 
 
 def _metrics(counts):
     bits = counts["total_bits"]
     frames = counts["frames"]
-    low, high = _wilson_interval(counts["bit_errors"], bits)
+    low, high, method = _frame_cluster_bootstrap_interval(
+        counts["frame_error_counts"], counts["frame_bit_counts"]
+    )
     return {
         "bit_errors": counts["bit_errors"], "total_bits": bits, "frames": frames,
         "frame_errors": counts["frame_errors"],
         "ber": counts["bit_errors"] / bits if bits else 0.0,
         "fer": counts["frame_errors"] / frames if frames else 0.0,
-        "ci_low": low, "ci_high": high,
+        "ci_low": low, "ci_high": high, "ci_method": method,
+        "independent_frames": frames,
+        "ci_resamples": 2000 if method == "frame_cluster_bootstrap" else 0,
         "evm_percent": math.sqrt(counts["evm_square_sum"] / frames) if frames else 0.0,
+        "csi_nmse": counts["csi_nmse_sum"] / frames if frames else 0.0,
+        "pilot_overhead_fraction": float(counts["pilot_overhead_fraction"]),
+        "receiver_coefficients_per_row": (
+            counts["receiver_coefficients_per_row_sum"] / frames if frames else 0.0
+        ),
+        "receiver_complexity_proxy": (
+            counts["receiver_complexity_proxy_sum"] / frames if frames else 0.0
+        ),
+        "receiver_method": counts["receiver_method"],
+        "receiver_iterations_max": int(counts["receiver_iterations_max"]),
+        "receiver_complexity_scope": counts["receiver_complexity_scope"],
     }
 
 
@@ -135,6 +162,7 @@ def _frame_set(simulator, config, frame_index, stop_event):
         cfo_hz=config["cfo_hz"], doppler_hz=config["doppler_hz"],
         mod_order=config["mod_order"], seed=config["seed"], frame_index=frame_index,
         receiver_mode=config["receiver_mode"], stop_event=stop_event,
+        csi_mode=config.get("csi_mode", "ideal"),
     )
     if stop_event.is_set():
         raise InterruptedError("Comparison cancelled")
@@ -183,9 +211,10 @@ class _PairedWaveformRunner:
         return thread is not None and thread.is_alive()
 
     def start(self, waveforms, snr_db, cfo_hz, doppler_hz, mod_order,
-              seed=42, receiver_mode="full_mmse", afdm_c1=None, afdm_c2=None):
+              seed=42, receiver_mode="full_mmse", afdm_c1=None, afdm_c2=None,
+              csi_mode="ideal"):
         config = _run_config(waveforms, snr_db, cfo_hz, doppler_hz, mod_order, seed, receiver_mode,
-                             afdm_c1, afdm_c2)
+                             afdm_c1, afdm_c2, csi_mode)
         if len(config["waveforms"]) != 2:
             raise ValueError("The live comparison requires exactly two waveform selections")
         with self._lifecycle_lock:
@@ -290,6 +319,22 @@ class _ScanWorker(threading.Thread):
 
     def _put_point(self, family, value, counts, text):
         metrics = {name: _metrics(counts[name]) for name in _WAVEFORMS}
+        for name in _WAVEFORMS:
+            for other in _WAVEFORMS:
+                if name == other:
+                    continue
+                low, high, method = _paired_frame_difference_interval(
+                    counts[name]["frame_error_counts"],
+                    counts[name]["frame_bit_counts"],
+                    counts[other]["frame_error_counts"],
+                    counts[other]["frame_bit_counts"],
+                )
+                metrics[name][f"ber_diff_vs_{other}"] = (
+                    metrics[name]["ber"] - metrics[other]["ber"]
+                )
+                metrics[name][f"ber_diff_vs_{other}_ci_low"] = low
+                metrics[name][f"ber_diff_vs_{other}_ci_high"] = high
+                metrics[name][f"ber_diff_vs_{other}_ci_method"] = method
         with self.result_lock:
             if self.stop_event.is_set():
                 raise InterruptedError("Scan cancelled")
@@ -299,9 +344,11 @@ class _ScanWorker(threading.Thread):
                 previous = destination.get(name, {})
                 point = {"x": float(value), **metrics[name]}
                 updated[name] = {
-                    key: np.append(np.asarray(previous.get(key, []), dtype=(np.int64 if key in (
-                        "bit_errors", "total_bits", "frames", "frame_errors"
-                    ) else float)), val)
+                    key: np.append(np.asarray(previous.get(key, []), dtype=(
+                        np.int64 if key in ("bit_errors", "total_bits", "frames", "frame_errors")
+                        else object if key.endswith("_method") or key.endswith("_scope")
+                        else float
+                    )), val)
                     for key, val in point.items()
                 }
             # Replace the family atomically rather than one waveform at a time.
@@ -322,6 +369,7 @@ class _ScanWorker(threading.Thread):
                 self.params["fixed_doppler"], self.params["mod_order"],
                 self.params.get("seed", 42), self.params.get("receiver_mode", "full_mmse"),
                 self.params.get("afdm_c1"), self.params.get("afdm_c2"),
+                self.params.get("csi_mode", "ideal"),
             )
             resources = _simulator_config(config)
             frames = _integer(self.params["frames"], "frames", minimum=1)
@@ -339,7 +387,7 @@ class _ScanWorker(threading.Thread):
                         doppler_hz=float(value) if family == "doppler" else config["doppler_hz"],
                         mod_order=config["mod_order"], frames=frames,
                         seed=config["seed"], receiver_mode=config["receiver_mode"],
-                        config=resources,
+                        config=resources, csi_mode=config["csi_mode"],
                     )
                 axes[family] = values.copy()
             with self.result_lock:
@@ -350,7 +398,7 @@ class _ScanWorker(threading.Thread):
             if self.stop_event.is_set():
                 raise InterruptedError("Scan cancelled")
             with self.result_lock:
-                self.result_store["status"] = "正在准备统一的三波形配对比较..."
+                self.result_store["status"] = "正在准备三波形配对比较..."
             simulator = WaveformScanSimulator(resources)
             total_points = sum(len(values) for values in axes.values())
             for family, values in axes.items():
@@ -372,7 +420,7 @@ class _ScanWorker(threading.Thread):
                         f"扫描中：已完成 {completed_points + 1}/{total_points} 个完整配对点，每点 {frames} 帧。",
                     )
                     completed_points += 1
-            status = f"扫描完成：{completed_points} 个配对点，三波形共享比特、信道和噪声样本。"
+            status = f"扫描完成：{completed_points} 个配对点，三波形共享比特、信道、训练条件与噪声样本。"
         except InterruptedError:
             cancelled = True
             status = f"扫描已取消，保留 {completed_points} 个完整配对点。"

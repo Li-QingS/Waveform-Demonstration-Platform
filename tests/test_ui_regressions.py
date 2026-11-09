@@ -23,6 +23,22 @@ def app():
     yield instance
 
 
+def test_decoder_control_discloses_theory_receiver_policy(app):
+    tab = FDIDMTab()
+    try:
+        tip = tab.decoder_combo.toolTip()
+        assert "实时波形接收" in tip
+        assert "OFDM 单抽头 LMMSE" in tip
+        assert "OTFS/AFDM/FDIDM 稀疏 LMMSE" in tip
+        assert "增益归一" in tip
+        assert "高斯近似" in tip
+        assert "解析预测" in tip
+        assert "逐帧 Monte-Carlo" in tip
+        assert "保护间隔开销不计入 SER" in tip
+    finally:
+        tab._on_qt_destroyed()
+
+
 def test_fdidm_auto_refresh_floor_no_shadow(app):
     """回归：alpha_ser_floor 局部变量不得遮蔽模块函数（曾抛 UnboundLocalError）。"""
     tab = FDIDMTab()
@@ -58,6 +74,106 @@ def test_fdidm_alpha_ser_worker_floor_no_shadow(app):
     assert finished, "worker 未发出完成事件"
     reason = finished[-1][1]
     assert not str(reason).startswith("失败"), f"worker 失败：{reason}"
+
+
+def test_fdidm_alpha_ser_worker_drops_point_when_cancelled_during_evaluation(app, monkeypatch):
+    from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+    tab = FDIDMTab()
+    stop = threading.Event()
+    base_kwargs = tab._backend_kwargs()
+    emitted = []
+    original_evaluate = SharedWaveformBenchmark.evaluate
+
+    def cancel_after_first_evaluation(self, *args, **kwargs):
+        result = original_evaluate(self, *args, **kwargs)
+        stop.set()
+        return result
+
+    monkeypatch.setattr(SharedWaveformBenchmark, "evaluate", cancel_after_first_evaluation)
+    tab._emit_signal_safe = lambda name, *args: emitted.append((name, args)) or True
+    try:
+        tab._alpha_ser_worker(
+            token=0,
+            base_kwargs=base_kwargs,
+            stop_event=stop,
+            alpha_sweep_frames=10,
+            alpha_curve_mode="theory",
+            best_a=0.0,
+            best_b=0.0,
+        )
+    finally:
+        tab._on_qt_destroyed()
+
+    assert not [args for name, args in emitted if name == "alpha_beta_point"]
+    assert [args for name, args in emitted if name == "alpha_beta_finished"]
+
+
+def test_fdidm_theory_snr_worker_drops_cancelled_fdidm_point(app, monkeypatch):
+    from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+    tab = FDIDMTab()
+    tab.SER_SNR_POINTS = (10.0,)
+    stop = threading.Event()
+    base_kwargs = tab._backend_kwargs()
+    emitted = []
+    original_optimize = SharedWaveformBenchmark.optimize_fdidm_over_ensemble
+
+    def cancel_after_search(cls, *args, **kwargs):
+        result = original_optimize(*args, **kwargs)
+        stop.set()
+        return result
+
+    monkeypatch.setattr(
+        SharedWaveformBenchmark,
+        "optimize_fdidm_over_ensemble",
+        classmethod(cancel_after_search),
+    )
+    tab._emit_signal_safe = lambda name, *args: emitted.append((name, args)) or True
+    try:
+        tab._theory_snr_worker(
+            token=tab._auto_scan_token,
+            base_kwargs=base_kwargs,
+            stop_event=stop,
+            best_a=0.0,
+            best_b=0.0,
+        )
+    finally:
+        tab._on_qt_destroyed()
+
+    point_names = [args[1] for name, args in emitted if name == "ser_snr_point"]
+    assert point_names == ["OFDM", "OTFS", "AFDM"]
+    assert [args for name, args in emitted if name == "ser_snr_finished"]
+
+
+def test_fdidm_search_worker_ignores_cancelled_optimizer_result(app, monkeypatch):
+    from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+    tab = FDIDMTab()
+    stop = threading.Event()
+    emitted = []
+
+    def cancelled_search(cls, *args, **kwargs):
+        stop.set()
+        return {"cancelled": True}
+
+    monkeypatch.setattr(
+        SharedWaveformBenchmark,
+        "optimize_fdidm_over_ensemble",
+        classmethod(cancelled_search),
+    )
+    tab._emit_signal_safe = lambda name, *args: emitted.append((name, args)) or True
+    try:
+        tab._search_worker(
+            token=tab._auto_scan_token,
+            base_kwargs=tab._backend_kwargs(),
+            stop_event=stop,
+            reason="test",
+        )
+    finally:
+        tab._on_qt_destroyed()
+
+    assert not [args for name, args in emitted if name == "search_finished"]
 
 
 def test_fdidm_time_plot_y_axis_fits_data(app):

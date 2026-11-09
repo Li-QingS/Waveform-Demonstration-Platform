@@ -29,6 +29,8 @@ MATLAB_PURPLE = (126, 47, 142)
 LIGHT_PLOT_BACKGROUND = (250, 250, 250)
 AXIS_COLOR = (60, 60, 60)
 BORDER_COLOR = (225, 225, 225)
+SCAN_CI_FLOOR_OFFSET_DECADES = 0.18
+SCAN_CI_AXIS_PADDING_DECADES = 0.32
 
 
 
@@ -132,13 +134,16 @@ class WaveformCompareTab(QWidget):
         ctrl_layout.addWidget(self.mod_combo, 4, 1)
 
         self.receiver_combo = self._receiver_combo()
+        self.csi_combo = self._csi_combo()
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2_000_000_000)
         self.seed_spin.setValue(42)
-        ctrl_layout.addWidget(QLabel("接收机口径:"), 8, 0)
+        ctrl_layout.addWidget(QLabel("比较方式:"), 8, 0)
         ctrl_layout.addWidget(self.receiver_combo, 8, 1)
-        ctrl_layout.addWidget(QLabel("随机种子:"), 9, 0)
-        ctrl_layout.addWidget(self.seed_spin, 9, 1)
+        ctrl_layout.addWidget(QLabel("CSI 条件:"), 9, 0)
+        ctrl_layout.addWidget(self.csi_combo, 9, 1)
+        ctrl_layout.addWidget(QLabel("随机种子:"), 10, 0)
+        ctrl_layout.addWidget(self.seed_spin, 10, 1)
 
         self.c1_spin = self._chirp_spin()
         self.c2_spin = self._chirp_spin()
@@ -147,10 +152,10 @@ class WaveformCompareTab(QWidget):
         ctrl_layout.addWidget(QLabel("AFDM c2:"), 3, 0)
         ctrl_layout.addWidget(self.c2_spin, 3, 1)
         self.btn_reset_chirp = QPushButton("恢复 AFDM 默认参数")
-        ctrl_layout.addWidget(self.btn_reset_chirp, 10, 0, 1, 2)
+        ctrl_layout.addWidget(self.btn_reset_chirp, 11, 0, 1, 2)
         chirp_note = QLabel("c1/c2 仅作用于 AFDM，标准相位不除以 M。\n本页三波形均使用普通 CP。")
         chirp_note.setWordWrap(True)
-        ctrl_layout.addWidget(chirp_note, 11, 0, 1, 2)
+        ctrl_layout.addWidget(chirp_note, 12, 0, 1, 2)
 
         self.btn_start = QPushButton("开始对比")
         self.btn_stop = QPushButton("停止")
@@ -165,12 +170,16 @@ class WaveformCompareTab(QWidget):
         self.note_label.setWordWrap(True)
         self.note_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         self.model_note = QLabel(
-            "64 × 7 全载波 / 15 kHz / CP 16。\n理想 CSI 与帧定时，未编码模型。\n三角 = 零误码的 95% 统计上界。"
+            "64 × 7 全载波 / 15 kHz SCS / CP 16。\n可选理想 CSI 或共同导频估计 CSI。\n三角 = 零误码的 95% 统计上界。"
         )
         self.model_note.setWordWrap(True)
         self.model_note.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        self.model_note.setToolTip("全载波无导频的通用三径基带对比；各波形含 CP 的帧能量相同。与 OFDM 星地研究页不是同一模型，不评估实际同步捕获。")
-        ctrl_layout.setRowStretch(12, 1)
+        self.model_note.setToolTip(
+            "默认是理想 CSI 基准；共同导频模式每帧发送一个 OFDM 训练符号，"
+            "接收端知道路径时延支撑和帧定时，但不知道残余 CFO/逐径多普勒，只用 LS 估计复增益。"
+            "信道为通用三径模型，不是 NTN profile。"
+        )
+        ctrl_layout.setRowStretch(13, 1)
         ctrl_layout.setColumnStretch(1, 1)
 
         # 用分页避免 6 个图同时挤在一个页面里，但原实时 UI 完整保留。
@@ -194,18 +203,35 @@ class WaveformCompareTab(QWidget):
         control.setToolTip(
             '标准 DAFT 参数：exp(-j 2π c n²)，与独立 AFDM 仿真页相同。\n'
             '默认 0.05/64=0.00078125，保持原对比页波形；旧归一参数除以 M 后换算。\n'
-            '仅改变 AFDM 变换；本页使用普通 CP、理想 CSI，不包含独立页的训练或 CPP。'
+            '仅改变 AFDM 变换；本页三种波形使用普通 CP。'
         )
         return control
 
     @staticmethod
     def _receiver_combo():
         combo = QComboBox()
-        combo.addItem("统一完整 LMMSE", "full_mmse")
-        combo.addItem("差异接收机演示", "practical")
+        combo.addItem("统一接收机基准", "full_mmse")
+        combo.addItem("实际接收方案对照", "practical")
         combo.setMinimumContentsLength(10)
         combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        combo.setToolTip("统一完整 LMMSE：三种波形采用同级接收机。\n差异演示：OFDM 单抽头，OTFS/AFDM 完整 LMMSE，含接收机复杂度差异。\n已知频偏包含在理想 CSI 中；完整接收机下 CFO 曲线可能接近，不代表实际同步捕获无损。")
+        combo.setToolTip(
+            "统一接收机基准：三种波形使用同一完整 LMMSE 检测器和相同每行系数预算。\n"
+            "实际接收方案对照：OFDM 单抽头；OTFS/AFDM 使用最多两轮时域稀疏 PCG-LMMSE，再执行各自解调变换。"
+            "复杂度代理只估算均衡器的信道系数运算，不含调制变换、向量更新和 CSI 估计；"
+            "实际方案的计算预算仍不完全相等，结果反映波形与接收器的组合。"
+        )
+        return combo
+
+    @staticmethod
+    def _csi_combo():
+        combo = QComboBox()
+        combo.addItem("理想 CSI（无导频）", "ideal")
+        combo.addItem("共同导频估计 CSI", "pilot")
+        combo.setToolTip(
+            "共同导频模式每帧发送一个 OFDM 训练符号；接收端假设已知路径时延支撑和帧定时，"
+            "用 LS 估计复增益，不知道扫描中的残余 CFO 和逐径多普勒。"
+            "三种波形共享训练序列、导频开销和估计结果。"
+        )
         return combo
 
     def _init_live_page(self):
@@ -285,16 +311,17 @@ class WaveformCompareTab(QWidget):
         self.scan_snr_spin = spin(-20.0, 50.0, 14.0, " dB")
         self.scan_mod_combo = QComboBox()
         self.scan_mod_combo.addItems(["QPSK", "16QAM", "64QAM"])
-        self.scan_frames_spin = spin(1, 500, 10, integer=True)
-        self.scan_cfo_min_spin = spin(-400_000.0, 400_000.0, -15000.0, " Hz")
-        self.scan_cfo_max_spin = spin(-400_000.0, 400_000.0, 15000.0, " Hz")
-        self.scan_cfo_points_spin = spin(3, 41, 9, integer=True)
+        self.scan_frames_spin = spin(1, 500, 100, integer=True)
+        self.scan_cfo_min_spin = spin(-400_000.0, 400_000.0, -300.0, " Hz")
+        self.scan_cfo_max_spin = spin(-400_000.0, 400_000.0, 300.0, " Hz")
+        self.scan_cfo_points_spin = spin(3, 41, 31, integer=True)
         self.scan_fixed_doppler_spin = spin(0.0, 10_000.0, 120.0, " Hz")
         self.scan_doppler_min_spin = spin(0.0, 10_000.0, 0.0, " Hz")
-        self.scan_doppler_max_spin = spin(0.0, 10_000.0, 600.0, " Hz")
-        self.scan_doppler_points_spin = spin(3, 41, 9, integer=True)
+        self.scan_doppler_max_spin = spin(0.0, 10_000.0, 1200.0, " Hz")
+        self.scan_doppler_points_spin = spin(3, 41, 31, integer=True)
         self.scan_fixed_cfo_spin = spin(-400_000.0, 400_000.0, 0.0, " Hz")
         self.scan_receiver_combo = self._receiver_combo()
+        self.scan_csi_combo = self._csi_combo()
         self.scan_seed_spin = QSpinBox()
         self.scan_seed_spin.setRange(0, 2_000_000_000)
         self.scan_seed_spin.setValue(42)
@@ -306,7 +333,8 @@ class WaveformCompareTab(QWidget):
             ("扫描 Eb/N0:", self.scan_snr_spin),
             ("调制方式:", self.scan_mod_combo),
             ("每点统计帧数:", self.scan_frames_spin),
-            ("接收机口径:", self.scan_receiver_combo),
+            ("比较方式:", self.scan_receiver_combo),
+            ("CSI 条件:", self.scan_csi_combo),
             ("随机种子:", self.scan_seed_spin),
             ("AFDM c1:", self.scan_c1_spin),
             ("AFDM c2:", self.scan_c2_spin),
@@ -324,13 +352,17 @@ class WaveformCompareTab(QWidget):
             grid.addWidget(control, row, 1)
 
         self.scan_note_label = QLabel(
-            "每点三波形使用配对样本，累计真实错误/比特计数。扫描 CFO 时固定多普勒，反之亦然。"
-            "固定种子，运行中锁定参数。"
+            "每点三波形使用配对比特、信道与噪声。共同导频 CSI 不知道残余 CFO/多普勒。"
+            "扫描 CFO 时固定多普勒，反之亦然。"
         )
         self.scan_note_label.setWordWrap(True)
         grid.addWidget(self.btn_scan_reset_chirp, len(rows), 0, 1, 2)
         grid.addWidget(self.scan_note_label, len(rows) + 1, 0, 1, 2)
         grid.setRowStretch(len(rows) + 2, 1)
+        self.scan_cfo_min_spin.valueChanged.connect(self._update_scan_setup_note)
+        self.scan_cfo_max_spin.valueChanged.connect(self._update_scan_setup_note)
+        self.scan_doppler_max_spin.valueChanged.connect(self._update_scan_setup_note)
+        self._update_scan_setup_note()
         scroll.setWidget(scan_group)
         rail_layout.addWidget(scroll, 1)
         scan_layout.addWidget(rail)
@@ -355,7 +387,11 @@ class WaveformCompareTab(QWidget):
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.result_table.horizontalHeader().setStretchLastSection(True)
         results.addWidget(self.result_table)
-        self.scan_summary = QLabel("零误码保持为 0；对数图以三角标记显示 95% Wilson 上界。悬停表格 BER 可查看错误/比特及区间。")
+        self.scan_summary = QLabel(
+            "默认每轴 31 点、每点 100 帧；竖线为 95% 帧聚类区间。"
+            "零误码三角标记显示保守上界；下界为 0 的区间以向下三角标出，并截在自适应图底线。"
+            "图示截断不改变统计区间或导出结果。"
+        )
         self.scan_summary.setWordWrap(True)
         self.scan_summary.setMinimumWidth(0)
         self.scan_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
@@ -453,6 +489,22 @@ class WaveformCompareTab(QWidget):
         for name, color in (("ofdm", MATLAB_BLUE), ("otfs", MATLAB_ORANGE), ("afdm", MATLAB_GREEN)):
             setattr(plot_widget, name + "_zero_curve", plot_widget.plot(
                 pen=None, symbol="t", symbolSize=8, symbolBrush=color, symbolPen=color))
+            interval_color = pg.mkColor(color)
+            interval_color.setAlpha(175)
+            ci_errorbar = pg.ErrorBarItem(beam=0.0, pen=pg.mkPen(interval_color, width=1.2))
+            ci_errorbar.setToolTip(
+                "95% 独立帧聚类区间。对数坐标下按端点绘制；下界为 0 时显示截断标记。"
+            )
+            plot_widget.addItem(ci_errorbar)
+            setattr(plot_widget, name + "_ci_errorbar", ci_errorbar)
+            ci_floor_curve = plot_widget.plot(
+                pen=None, symbol="t1", symbolSize=8,
+                symbolBrush=interval_color, symbolPen=pg.mkPen(interval_color),
+            )
+            ci_floor_curve.setToolTip(
+                "该区间下界为 0；向下三角标记显示截在当前图表自适应底线，统计下界仍为 0。"
+            )
+            setattr(plot_widget, name + "_ci_floor_curve", ci_floor_curve)
 
     def _connect_signals(self):
         self.btn_start.clicked.connect(self._on_start_clicked)
@@ -467,6 +519,23 @@ class WaveformCompareTab(QWidget):
         self.c1_spin.valueChanged.connect(self._on_chirp_changed)
         self.c2_spin.valueChanged.connect(self._on_chirp_changed)
         self.tabs.currentChanged.connect(self._on_mode_changed)
+        self.receiver_combo.currentIndexChanged.connect(
+            lambda *_: self._prefer_pilot_for_practical(self.receiver_combo, self.csi_combo)
+        )
+        self.scan_receiver_combo.currentIndexChanged.connect(
+            lambda *_: self._prefer_pilot_for_practical(self.scan_receiver_combo, self.scan_csi_combo)
+        )
+        self.csi_combo.currentIndexChanged.connect(
+            lambda *_: self._prefer_pilot_for_practical(self.receiver_combo, self.csi_combo)
+        )
+        self.scan_csi_combo.currentIndexChanged.connect(
+            lambda *_: self._prefer_pilot_for_practical(self.scan_receiver_combo, self.scan_csi_combo)
+        )
+
+    @staticmethod
+    def _prefer_pilot_for_practical(mode_combo, csi_combo):
+        if mode_combo.currentData() == "practical" and csi_combo.currentData() == "ideal":
+            csi_combo.setCurrentIndex(csi_combo.findData("pilot"))
 
     def _reset_chirp(self, scan=False):
         if self.live_runner.is_running() or (self._scan_worker is not None and self._scan_worker.is_alive()):
@@ -490,17 +559,25 @@ class WaveformCompareTab(QWidget):
     def _set_live_note(self, text):
         if self._live_config:
             cfg = self._live_config
-            policy = '统一完整 LMMSE' if cfg['receiver_mode'] == 'full_mmse' else 'OFDM 单抽头 / 另两种完整 LMMSE'
+            policy = self._receiver_text(cfg['receiver_mode'], cfg.get('csi_mode', 'ideal'))
             text += (f'\n结果：{cfg["snr_db"]:g} dB / CFO {cfg["cfo_hz"]:g} Hz / '
                      f'多普勒 {cfg["doppler_hz"]:g} Hz\nseed {cfg["seed"]} · {policy}'
+                     f'\nSCS={cfg.get("subcarrier_spacing_hz", 15e3) / 1000:g} kHz · '
+                     f'Fs={cfg.get("sample_rate_hz", 960e3) / 1e6:g} MHz'
                      f'\nAFDM c1/c2={cfg["afdm_c1"]:.7g}/{cfg["afdm_c2"]:.7g}')
             self.note_label.setToolTip(json.dumps(self._json_value(cfg), ensure_ascii=False, indent=2))
         self.note_label.setText(text)
 
     @staticmethod
-    def _receiver_text(mode):
-        return ('统一完整 LMMSE；波形与接收机同级比较' if mode == 'full_mmse' else
-                '差异演示：OFDM 单抽头，OTFS/AFDM 完整 LMMSE，含复杂度差异')
+    def _receiver_text(mode, csi_mode="ideal"):
+        receiver = (
+            '统一接收机基准：三者完整 LMMSE、每行系数预算相同'
+            if mode == 'full_mmse' else
+            '实际接收方案：OFDM 单抽头 / OTFS、AFDM 时域稀疏 PCG-LMMSE 后接各自解调；预算不完全相等'
+        )
+        csi = ('理想 CSI（无导频）' if csi_mode == 'ideal' else
+               '共同导频 CSI（已知路径时延支撑；残余 CFO/多普勒未知）')
+        return f'{receiver}；{csi}'
 
     def _set_controls_state(self, running=None):
         live = self.live_runner.is_running()
@@ -508,12 +585,13 @@ class WaveformCompareTab(QWidget):
         busy = live or scan
         for control in (self.wave1_combo, self.wave2_combo, self.mod_combo, self.snr_spin,
                         self.cfo_spin, self.doppler_spin, self.seed_spin, self.receiver_combo,
+                        self.csi_combo,
                         self.c1_spin, self.c2_spin, self.btn_reset_chirp,
                         self.scan_snr_spin, self.scan_mod_combo, self.scan_frames_spin,
                         self.scan_cfo_min_spin, self.scan_cfo_max_spin, self.scan_cfo_points_spin,
                         self.scan_doppler_min_spin, self.scan_doppler_max_spin, self.scan_doppler_points_spin,
                         self.scan_fixed_cfo_spin, self.scan_fixed_doppler_spin,
-                        self.scan_seed_spin, self.scan_receiver_combo,
+                        self.scan_seed_spin, self.scan_receiver_combo, self.scan_csi_combo,
                         self.scan_c1_spin, self.scan_c2_spin, self.btn_scan_reset_chirp):
             control.setEnabled(not busy)
         self.btn_start.setEnabled(not busy)
@@ -539,6 +617,10 @@ class WaveformCompareTab(QWidget):
             for name in ('ofdm', 'otfs', 'afdm'):
                 getattr(plot, name + '_curve').setData([], [])
                 getattr(plot, name + '_zero_curve').setData([], [])
+                getattr(plot, name + '_ci_errorbar').setData(
+                    x=np.array([]), y=np.array([]), top=np.array([]), bottom=np.array([])
+                )
+                getattr(plot, name + '_ci_floor_curve').setData([], [])
         self.result_table.setRowCount(0)
         self._scan_signature = None
 
@@ -548,6 +630,7 @@ class WaveformCompareTab(QWidget):
             'snr_db': float(self.snr_spin.value()), 'cfo_hz': float(self.cfo_spin.value()),
             'doppler_hz': float(self.doppler_spin.value()), 'mod_order': self.mod_combo.currentText(),
             'seed': self.seed_spin.value(), 'receiver_mode': self.receiver_combo.currentData(),
+            'csi_mode': self.csi_combo.currentData(),
             'afdm_c1': self.c1_spin.value(), 'afdm_c2': self.c2_spin.value(),
         }
         try:
@@ -614,6 +697,7 @@ class WaveformCompareTab(QWidget):
                 'snr_db': float(self.scan_snr_spin.value()), 'mod_order': self.scan_mod_combo.currentText(),
                 'frames': int(self.scan_frames_spin.value()), 'seed': self.scan_seed_spin.value(),
                 'receiver_mode': self.scan_receiver_combo.currentData(),
+                'csi_mode': self.scan_csi_combo.currentData(),
                 'afdm_c1': self.scan_c1_spin.value(), 'afdm_c2': self.scan_c2_spin.value(),
                 'cfo_axis': self._build_axis(self.scan_cfo_min_spin.value(), self.scan_cfo_max_spin.value(), self.scan_cfo_points_spin.value()),
                 'doppler_axis': self._build_axis(self.scan_doppler_min_spin.value(), self.scan_doppler_max_spin.value(), self.scan_doppler_points_spin.value()),
@@ -628,6 +712,7 @@ class WaveformCompareTab(QWidget):
                         params['fixed_doppler'] if family == 'cfo' else value,
                         params['mod_order'], frames=params['frames'], seed=params['seed'],
                         receiver_mode=params['receiver_mode'], config=resource,
+                        csi_mode=params['csi_mode'],
                     )
         except ValueError as exc:
             self.scan_note_label.setText(f'扫描参数有误：{exc}')
@@ -650,7 +735,7 @@ class WaveformCompareTab(QWidget):
             self._refresh_scan_plots()
             return
         self.scan_timer.start(160)
-        self.scan_note_label.setText('正在扫描配对样本。' + self._receiver_text(params['receiver_mode']))
+        self.scan_note_label.setText('正在扫描配对样本。' + self._receiver_text(params['receiver_mode'], params['csi_mode']))
         self._set_controls_state()
 
     def _on_scan_stop_clicked(self, silent=False):
@@ -686,6 +771,21 @@ class WaveformCompareTab(QWidget):
             return
         self._mode_index = index
 
+    def _update_scan_setup_note(self, *_):
+        if not hasattr(self, "scan_note_label"):
+            return
+        spacing_hz = ScanConfig().subcarrier_spacing
+        cfo_fraction = max(abs(self.scan_cfo_min_spin.value()), abs(self.scan_cfo_max_spin.value())) / spacing_hz
+        doppler_fraction = 0.8 * self.scan_doppler_max_spin.value() / spacing_hz
+        sample_rate = 64 * spacing_hz
+        self.scan_note_label.setText(
+            f"SCS={spacing_hz / 1000:g} kHz，采样率={sample_rate / 1e6:g} MHz；"
+            f"当前 CFO 扫描端点={cfo_fraction:.3g}×SCS，最大逐径多普勒约 {doppler_fraction:.3g}×SCS。"
+            "采样点数固定时，改变 SCS 会改变物理时延和 CP 时长，因此本对比固定 SCS。"
+            "共同导频 CSI 假设已知路径时延支撑和帧定时，但不向接收机提供残余 CFO/多普勒。"
+            "两条扫描轴分别变化另一项固定。"
+        )
+
     def suspend_tasks(self):
         self._stop_live(silent=True, strict=True)
         self._stop_scan(silent=True, strict=True)
@@ -719,13 +819,30 @@ class WaveformCompareTab(QWidget):
             panel['ber_curve'].setData([], [])
         zero = y == 0
         panel['zero_curve'].setData(x[zero], upper[zero])
-        panel['zero_curve'].setToolTip('三角标记=零误码样本的 95% Wilson 上界；原始 BER 仍为 0。')
+        panel['zero_curve'].setToolTip('三角标记=零误码样本的帧错误率保守上界；原始 BER 仍为 0。')
         errors, bits, frames = data['bit_errors'], data['total_bits'], data['frames']
+        receiver_method = {
+            'ofdm_one_tap': 'OFDM 单抽头',
+            'sparse_pcg_lmmse': '稀疏 PCG-LMMSE',
+            'full_lmmse_time_domain': '完整时域 LMMSE',
+        }.get(data.get('receiver_method'), '接收器未运行')
+        iterations = (
+            f' · 最多 {data.get("receiver_iterations_max", 0)} 轮'
+            if data.get('receiver_method') == 'sparse_pcg_lmmse' else ''
+        )
         panel['summary'].setText(
             f'{frames} 配对帧 · 错误/比特 {errors}/{bits}\n'
-            f'BER {errors/max(bits,1):.4g} · EVM {data["evm_percent"]:.2f}%'
+            f'BER {errors/max(bits,1):.4g} · EVM {data["evm_percent"]:.2f}% · CSI-NMSE {data.get("csi_nmse", 0.0):.3g}\n'
+            f'接收器 {receiver_method}{iterations}'
         )
-        panel['summary'].setToolTip(f'95% Wilson 区间 [{data["ci_low"]:.6g}, {data["ci_high"]:.6g}]；FER={data["fer"]:.4g}')
+        panel['summary'].setToolTip(
+            f'95%帧聚类区间 [{data["ci_low"]:.6g}, {data["ci_high"]:.6g}]；'
+            f'方法={data.get("ci_method", "unknown")}；FER={data["fer"]:.4g}\n'
+            f'导频开销={data.get("pilot_overhead_fraction", 0.0):.1%}；'
+            f'每行检测系数预算={data.get("receiver_coefficients_per_row", 0):.1f}；'
+            f'均衡器复杂度代理={data.get("receiver_complexity_proxy", 0):.0f}；'
+            f'{data.get("receiver_complexity_scope", "")}'
+        )
 
     def _scan_snapshot(self):
         with self._scan_lock:
@@ -744,17 +861,92 @@ class WaveformCompareTab(QWidget):
         self._set_controls_state()
 
     def _update_scan_plot(self, plot, family_data):
+        y_range_values = []
+        series = []
         for name in ('OFDM', 'OTFS', 'AFDM'):
+            values = family_data.get(name, {})
+            x = np.asarray(values.get('x', []), dtype=float).reshape(-1)
+            y = np.asarray(values.get('ber', []), dtype=float).reshape(-1)
+            low = np.asarray(values.get('ci_low', np.full(y.shape, np.nan)), dtype=float).reshape(-1)
+            high = np.asarray(values.get('ci_high', np.full(y.shape, np.nan)), dtype=float).reshape(-1)
+            ci_lengths_match = low.size == high.size == y.size
+            data_lengths_match = x.size == y.size
+            if low.size != y.size:
+                low = np.full(y.shape, np.nan)
+            if high.size != y.size:
+                high = np.full(y.shape, np.nan)
+            zero = (
+                (y == 0) & np.isfinite(high) & (high > 0)
+                if data_lengths_match and high.size == y.size else np.zeros(y.size, dtype=bool)
+            )
+            valid_ci = (
+                (y > 0) & np.isfinite(y) & np.isfinite(low) & np.isfinite(high)
+                & (low >= 0) & (high >= low) & (high > 0)
+            ) if data_lengths_match and ci_lengths_match else np.zeros(y.size, dtype=bool)
+            if data_lengths_match:
+                positive_ber = y[np.isfinite(y) & (y > 0)]
+                y_range_values.extend(positive_ber.tolist())
+                if np.any(zero):
+                    y_range_values.extend(high[zero].tolist())
+                if np.any(valid_ci):
+                    y_range_values.extend(low[valid_ci][low[valid_ci] > 0].tolist())
+                    y_range_values.extend(high[valid_ci].tolist())
+            series.append((name, x, y, low, high, zero, valid_ci))
+
+        display_floor = None
+        if y_range_values:
+            log_values = np.log10(np.asarray(y_range_values, dtype=float))
+            min_log = float(np.min(log_values))
+            max_log = float(np.max(log_values))
+            display_floor = 10 ** (min_log - SCAN_CI_FLOOR_OFFSET_DECADES)
+            plot.setYRange(
+                min_log - SCAN_CI_AXIS_PADDING_DECADES,
+                max_log + SCAN_CI_FLOOR_OFFSET_DECADES,
+                padding=0,
+            )
+        else:
+            plot.enableAutoRange(axis=pg.ViewBox.YAxis)
+
+        for name, x, y, low, high, zero, valid_ci in series:
             curve = getattr(plot, name.lower() + '_curve')
             zero_curve = getattr(plot, name.lower() + '_zero_curve')
-            values = family_data.get(name, {})
-            x, y = np.asarray(values.get('x', [])), np.asarray(values.get('ber', []))
+            ci_errorbar = getattr(plot, name.lower() + '_ci_errorbar')
+            ci_floor_curve = getattr(plot, name.lower() + '_ci_floor_curve')
+            if x.size != y.size:
+                curve.setData([], [])
+                zero_curve.setData([], [])
+                ci_errorbar.setData(x=np.array([]), y=np.array([]), top=np.array([]), bottom=np.array([]))
+                ci_floor_curve.setData([], [])
+                continue
             if y.size and np.any(y > 0):
                 curve.setData(x, np.where(y > 0, y, np.nan), connect='finite')
             else:
                 curve.setData([], [])
-            zero = y == 0
-            zero_curve.setData(x[zero], np.asarray(values.get('ci_high', []))[zero])
+            zero_curve.setData(x[zero], high[zero])
+            if np.any(valid_ci) and display_floor is not None:
+                display_low = np.where(low[valid_ci] == 0, display_floor, low[valid_ci])
+                log_low = np.log10(display_low)
+                log_high = np.log10(high[valid_ci])
+            else:
+                log_low = np.array([], dtype=float)
+                log_high = np.array([], dtype=float)
+            sorted_x = np.sort(np.unique(x[valid_ci]))
+            steps = np.diff(sorted_x)
+            positive_steps = steps[steps > 0]
+            beam = float(np.min(positive_steps) * 0.18) if positive_steps.size else 0.0
+            ci_errorbar.setData(
+                x=x[valid_ci], y=log_low,
+                top=log_high - log_low, bottom=np.zeros(log_low.size), beam=beam,
+            )
+
+            lower_clipped = valid_ci & (low == 0)
+            if np.any(lower_clipped) and display_floor is not None:
+                ci_floor_curve.setData(x[lower_clipped], np.full(np.count_nonzero(lower_clipped), display_floor))
+                ci_floor_curve.setToolTip(
+                    f"该区间下界为 0；向下三角标记截在当前图表底线 {display_floor:.3g}，统计下界仍为 0。"
+                )
+            else:
+                ci_floor_curve.setData([], [])
 
     def _update_result_table(self, snapshot):
         signature = tuple(len(snapshot.get(f, {}).get('OFDM', {}).get('x', [])) for f in ('cfo', 'doppler'))
@@ -775,19 +967,43 @@ class WaveformCompareTab(QWidget):
                     item = QTableWidgetItem(text)
                     if 2 <= column <= 4:
                         stats = values[('OFDM', 'OTFS', 'AFDM')[column-2]]
-                        item.setToolTip(
+                        paired = ""
+                        if column in (3, 4):
+                            waveform = "OTFS" if column == 3 else "AFDM"
+                            paired = (
+                                f'ΔBER({waveform}-OFDM)='
+                                f'{stats["ber_diff_vs_OFDM"][i]:.4g} '
+                                f'[{stats["ber_diff_vs_OFDM_ci_low"][i]:.4g}, '
+                                f'{stats["ber_diff_vs_OFDM_ci_high"][i]:.4g}] '
+                                f'({stats["ber_diff_vs_OFDM_ci_method"][i]})\n'
+                            )
+                        tooltip = (
                             f'错误/比特 {int(stats["bit_errors"][i])}/{int(stats["total_bits"][i])}\n'
-                            f'95% Wilson [{stats["ci_low"][i]:.6g}, {stats["ci_high"][i]:.6g}]\n'
-                            f'EVM={stats["evm_percent"][i]:.3f}%'
+                            f'95%按帧区间/上界 [{stats["ci_low"][i]:.6g}, {stats["ci_high"][i]:.6g}]\n'
+                            f'方法={stats["ci_method"][i]}\n'
+                            f'CSI-NMSE={stats["csi_nmse"][i]:.4g}；'
+                            f'导频开销={stats["pilot_overhead_fraction"][i]:.1%}\n'
+                            f'接收器={stats["receiver_method"][i]}；'
+                            f'最多迭代={int(stats["receiver_iterations_max"][i])} 轮\n'
+                            f'每行检测系数预算={stats["receiver_coefficients_per_row"][i]:.1f}；'
+                            f'均衡器复杂度代理={stats["receiver_complexity_proxy"][i]:.0f}\n'
+                            f'{stats["receiver_complexity_scope"][i]}\n'
+                        )
+                        item.setToolTip(
+                            tooltip + paired + f'EVM={stats["evm_percent"][i]:.3f}%'
                         )
                     self.result_table.setItem(row, column, item)
         cfg = snapshot.get('config', {})
         mode = cfg.get('receiver_mode', 'full_mmse')
+        csi_mode = cfg.get('csi_mode', 'ideal')
+        spacing_hz = float(cfg.get('subcarrier_spacing_hz', 15e3))
         self.scan_summary.setText(
             f'已完成 CFO {signature[0]} 点、多普勒 {signature[1]} 点；'
-            f'结果配置 Eb/N0={cfg.get("snr_db", "—")} dB，seed={cfg.get("seed", "—")}；' + self._receiver_text(mode) +
+            f'结果配置 Eb/N0={cfg.get("snr_db", "—")} dB，SCS={spacing_hz / 1000:g} kHz，'
+            f'采样率={64 * spacing_hz / 1e6:g} MHz，seed={cfg.get("seed", "—")}；' + self._receiver_text(mode, csi_mode) +
             f'。AFDM c1/c2={cfg.get("afdm_c1", .05/64.):.7g}/{cfg.get("afdm_c2", .05/64.):.7g}（标准相位、普通 CP）' +
-            '。零误码三角标记为统计上界，非实测非零 BER。已知频偏计入理想 CSI，不评估同步捕获。'
+            f'。导频开销={1/(7+1):.1%}（若选择导频 CSI）；区间以独立帧为单位重采样。'
+            '零误码三角标记为帧错误率保守上界。帧定时已知，不评估同步捕获算法。'
         )
 
     @staticmethod
@@ -809,12 +1025,29 @@ class WaveformCompareTab(QWidget):
         if not path:
             return
         report = self._json_value(self._scan_snapshot())
-        report['assumptions'] = (
-            'Shared full-carrier 64x7 CP-protected OFDM/OTFS/DAFT-AFDM baseband model; ideal CSI and frame timing; '
-            'same bits/channel/time-domain noise/transmit-frame energy for each paired frame; '
-            'AFDM c1/c2 use exp(-j*2*pi*c*n^2) with no division by M; ordinary CP for all waveforms; '
-            'raw BER and Wilson counting intervals; receiver policy is part of the comparison, no forced ordering.'
-        )
+        report['assumptions'] = {
+            "channel": "Shared synthetic three-tap CP-protected baseband channel; not an NTN profile.",
+            "pairing": "Paired bits, channel realization, data noise, and total transmit-frame energy per information bit.",
+            "ideal_csi": "Perfect channel knowledge, zero pilot overhead; ideal baseline only.",
+            "pilot_csi": "One shared OFDM training symbol per frame; LS estimates complex path gains with known delay support and frame timing. Residual CFO and per-path Doppler are unknown to the receiver.",
+            "csi_estimation": {
+                "estimated_parameters": ["complex_path_gains"],
+                "assumed_known_parameters": ["path_delay_support", "frame_timing"],
+                "unestimated_impairments": ["residual_cfo", "per_path_doppler"],
+                "shared_across_waveforms": True,
+            },
+            "receiver_modes": {
+                "unified_baseline": "Same full LMMSE detector family and per-row coefficient budget for all waveforms.",
+                "practical_receiver": "OFDM one-tap; OTFS/AFDM use at most two sparse time-domain PCG-LMMSE iterations followed by their respective demodulation transforms. This is a receiver-structure comparison; equalizer budgets are not identical.",
+            },
+            "receiver_complexity_metric": {
+                "kind": "algorithmic equalizer coefficient-application proxy, not wall-clock runtime",
+                "excludes": ["waveform transforms", "vector updates", "CSI estimation", "memory traffic"],
+            },
+            "statistics": "Raw pooled BER with independent-frame cluster-bootstrap intervals; zero-error points use a conservative frame-error upper bound.",
+            "afdm": "AFDM c1/c2 use exp(-j*2*pi*c*n^2) with no division by M; ordinary CP.",
+            "synchronization": "Frame timing is assumed known. Residual CFO and per-path Doppler affect received pilot/data samples but are not supplied to the pilot CSI estimator or equalizer; acquisition algorithms are not evaluated.",
+        }
         try:
             with open(path, 'w', encoding='utf-8') as stream:
                 json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)

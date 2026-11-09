@@ -24,6 +24,196 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from waveform_sim.simulation.leo_ntn_channel import (
+    NTN_PROFILES,
+    absolute_doppler_shift_hz,
+    residual_common_cfo_hz,
+    sample_path_dopplers,
+)
+
+
+class OfdmNtnChannel:
+    """Stateful, sample-rate NTN impairment used before the OFDM RF transmitter."""
+
+    def __init__(
+        self,
+        sample_rate_hz: float,
+        carrier_frequency_hz: float,
+        profile: str = "NTN-TDLC5-200",
+        enabled: bool = False,
+        seed: int = 42,
+        velocity_kmh: float = 0.0,
+        radial_projection: float = 0.5,
+        compensation_ratio: float = 1.0,
+        residual_cfo_hz: float = 0.0,
+        doppler_spread_hz: Optional[float] = None,
+        delay_scale: float = 1.0,
+    ):
+        self.configure(
+            sample_rate_hz=sample_rate_hz,
+            carrier_frequency_hz=carrier_frequency_hz,
+            profile=profile,
+            enabled=enabled,
+            seed=seed,
+            velocity_kmh=velocity_kmh,
+            radial_projection=radial_projection,
+            compensation_ratio=compensation_ratio,
+            residual_cfo_hz=residual_cfo_hz,
+            doppler_spread_hz=doppler_spread_hz,
+            delay_scale=delay_scale,
+        )
+
+    @staticmethod
+    def _finite_float(name: str, value: Any, minimum: Optional[float] = None,
+                      maximum: Optional[float] = None) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite number") from exc
+        if not np.isfinite(result):
+            raise ValueError(f"{name} must be a finite number")
+        if minimum is not None and result < minimum:
+            raise ValueError(f"{name} must be >= {minimum}")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"{name} must be <= {maximum}")
+        return result
+
+    def configure(self, **kwargs):
+        settings = dict(getattr(self, "settings", {}))
+        settings.update(kwargs)
+        required = {
+            "sample_rate_hz", "carrier_frequency_hz", "profile", "enabled", "seed",
+            "velocity_kmh", "radial_projection", "compensation_ratio",
+            "residual_cfo_hz", "doppler_spread_hz", "delay_scale",
+        }
+        missing = required - settings.keys()
+        if missing:
+            raise ValueError(f"missing NTN channel settings: {', '.join(sorted(missing))}")
+
+        profile = str(settings["profile"]).upper().replace("_", "-").strip()
+        if profile not in NTN_PROFILES:
+            raise ValueError(f"unsupported NTN profile: {settings['profile']}")
+        sample_rate = self._finite_float("sample_rate_hz", settings["sample_rate_hz"], 1.0)
+        carrier_frequency = self._finite_float("carrier_frequency_hz", settings["carrier_frequency_hz"], 1.0)
+        velocity = self._finite_float("velocity_kmh", settings["velocity_kmh"], 0.0)
+        radial_projection = self._finite_float("radial_projection", settings["radial_projection"], 0.0, 1.0)
+        compensation = self._finite_float("compensation_ratio", settings["compensation_ratio"], 0.0, 1.0)
+        residual_cfo = self._finite_float("residual_cfo_hz", settings["residual_cfo_hz"])
+        delay_scale = self._finite_float("delay_scale", settings["delay_scale"], 0.0)
+        spread_value = settings["doppler_spread_hz"]
+        spread = (NTN_PROFILES[profile].maximum_doppler_hz if spread_value is None else
+                  self._finite_float("doppler_spread_hz", spread_value, 0.0))
+        try:
+            seed = int(settings["seed"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("seed must be an integer") from exc
+        if isinstance(settings["seed"], (float, np.floating)) and seed != settings["seed"]:
+            raise ValueError("seed must be an integer")
+
+        self.enabled = bool(settings["enabled"])
+        self.profile = profile
+        self.seed = seed
+        self.sample_rate_hz = sample_rate
+        self.carrier_frequency_hz = carrier_frequency
+        self.velocity_kmh = velocity
+        self.radial_projection = radial_projection
+        self.compensation_ratio = compensation
+        self.residual_cfo_hz = residual_cfo
+        self.doppler_spread_setting_hz = None if spread_value is None else spread
+        self.doppler_spread_hz = spread
+        self.delay_scale = delay_scale
+        self._profile = NTN_PROFILES[profile]
+
+        rng = np.random.default_rng(np.random.SeedSequence([seed, 3]))
+        powers = 10.0 ** (np.asarray(self._profile.powers_db, dtype=np.float64) / 10.0)
+        powers /= np.sum(powers)
+        gains = []
+        for power, fading in zip(powers, self._profile.fading):
+            if fading.upper() == "LOS":
+                fading_gain = np.exp(1j * rng.uniform(-np.pi, np.pi))
+            else:
+                fading_gain = (rng.standard_normal() + 1j * rng.standard_normal()) / np.sqrt(2.0)
+            gains.append(np.sqrt(power) * fading_gain)
+        self._path_gains = np.asarray(gains, dtype=np.complex128)
+        self._path_delays_s = np.asarray(self._profile.delays_ns, dtype=np.float64) * 1e-9 * delay_scale
+        orbital = absolute_doppler_shift_hz(carrier_frequency, velocity, radial_projection)
+        common_cfo = residual_common_cfo_hz(orbital, compensation) + residual_cfo
+        self._path_dopplers_hz = sample_path_dopplers(
+            self._profile.path_count, spread, common_cfo, rng,
+        )
+        max_delay_samples = float(np.max(self._path_delays_s) * sample_rate)
+        self._history = np.zeros(max(8, int(np.ceil(max_delay_samples)) + 2), dtype=np.complex128)
+        self._sample_index = 0
+        self.settings = {
+            "sample_rate_hz": sample_rate,
+            "carrier_frequency_hz": carrier_frequency,
+            "profile": profile,
+            "enabled": self.enabled,
+            "seed": seed,
+            "velocity_kmh": velocity,
+            "radial_projection": radial_projection,
+            "compensation_ratio": compensation,
+            "residual_cfo_hz": residual_cfo,
+            "doppler_spread_hz": self.doppler_spread_setting_hz,
+            "delay_scale": delay_scale,
+        }
+
+    @property
+    def sample_index(self) -> int:
+        return int(self._sample_index)
+
+    def reset(self):
+        self._history.fill(0.0)
+        self._sample_index = 0
+
+    @staticmethod
+    def _fractional_delay(ext: np.ndarray, history_length: int, indices: np.ndarray,
+                          delay_samples: float) -> np.ndarray:
+        position = history_length + indices.astype(np.float64) - float(delay_samples)
+        left = np.floor(position).astype(np.int64)
+        fraction = position - left
+        output = np.zeros(indices.size, dtype=np.complex128)
+        valid = (left >= 0) & (left < ext.size)
+        if np.any(valid):
+            left_valid = left[valid]
+            right_valid = np.minimum(left_valid + 1, ext.size - 1)
+            fraction_valid = fraction[valid]
+            output[valid] = ((1.0 - fraction_valid) * ext[left_valid]
+                             + fraction_valid * ext[right_valid])
+        return output
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        values = np.asarray(samples, dtype=np.complex64).reshape(-1)
+        if values.size == 0 or not self.enabled:
+            return values.copy()
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            values_128 = values.astype(np.complex128, copy=False)
+            history_length = self._history.size
+            extended = np.concatenate((self._history, values_128))
+            indices = np.arange(values_128.size, dtype=np.int64)
+            times = (self._sample_index + indices) / self.sample_rate_hz
+            output = np.zeros(values_128.size, dtype=np.complex128)
+            for delay_s, gain, doppler in zip(
+                self._path_delays_s, self._path_gains, self._path_dopplers_hz,
+            ):
+                delayed = self._fractional_delay(
+                    extended, history_length, indices,
+                    float(delay_s * self.sample_rate_hz),
+                )
+                output += gain * np.exp(2j * np.pi * float(doppler) * times) * delayed
+            self._history = extended[-history_length:].copy()
+            self._sample_index += int(values_128.size)
+        return output.astype(np.complex64)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            **self.settings,
+            "doppler_spread_hz": float(self.doppler_spread_hz),
+            "maximum_delay_s": float(np.max(self._path_delays_s)),
+            "path_count": int(self._profile.path_count),
+            "path_dopplers_hz": self._path_dopplers_hz.tolist(),
+        }
+
 
 class _LegacyOfdmHardwareTx:
     APP_MAGIC = b"MTPK"
@@ -41,6 +231,15 @@ class _LegacyOfdmHardwareTx:
         tx_text: str = "Hello OFDM Hardware Test!",
         mod_order: str = "QPSK",
         equalizer: str = "MMSE",
+        ntn_enabled: bool = False,
+        ntn_profile: str = "NTN-TDLC5-200",
+        ntn_seed: int = 42,
+        ntn_velocity_kmh: float = 0.0,
+        ntn_radial_projection: float = 0.5,
+        ntn_compensation_ratio: float = 1.0,
+        ntn_residual_cfo_hz: float = 0.0,
+        ntn_doppler_spread_hz: Optional[float] = None,
+        ntn_delay_scale: float = 1.0,
     ):
         self.carrier_freq = float(carrier_freq)
         self.sample_rate = float(samp_rate)
@@ -51,6 +250,20 @@ class _LegacyOfdmHardwareTx:
         self.serial = serial
         self.tx_antenna = str(tx_antenna)
         self.rx_antenna = str(rx_antenna)
+        self._ntn_channel = OfdmNtnChannel(
+            sample_rate_hz=self.sample_rate,
+            carrier_frequency_hz=self.carrier_freq,
+            profile=ntn_profile,
+            enabled=ntn_enabled,
+            seed=ntn_seed,
+            velocity_kmh=ntn_velocity_kmh,
+            radial_projection=ntn_radial_projection,
+            compensation_ratio=ntn_compensation_ratio,
+            residual_cfo_hz=ntn_residual_cfo_hz,
+            doppler_spread_hz=ntn_doppler_spread_hz,
+            delay_scale=ntn_delay_scale,
+        )
+        self._ntn_params = dict(self._ntn_channel.settings)
 
         # ===== OFDM 配置 =====
         self.fft_len = 64
@@ -165,6 +378,12 @@ class _LegacyOfdmHardwareTx:
 
         self._ber_hist_t: List[float] = []
         self._ber_hist_v: List[float] = []
+        self._frame_id = 0
+        self._frame_limit: Optional[int] = None
+        self._frame_bit_errors = 0
+        self._frame_bits_total = 0
+        self._bit_errors_total = 0
+        self._bits_total = 0
         self._t0 = time.time()
         self._rx_samples_seen = 0
         self._last_processed_abs_start = -10**18
@@ -276,12 +495,67 @@ class _LegacyOfdmHardwareTx:
         with self._lock:
             expected = len(self._tx_payload)
             ratio = (self._match_bytes / expected) if expected > 0 else 0.0
+            frame_ber = (
+                self._frame_bit_errors / self._frame_bits_total
+                if self._frame_bits_total > 0 else float("nan")
+            )
+            cumulative_ber = (
+                self._bit_errors_total / self._bits_total
+                if self._bits_total > 0 else float("nan")
+            )
             return {
                 "decode_ok": bool(self._decode_ok),
                 "match_bytes": int(self._match_bytes),
                 "expected_bytes": int(expected),
                 "match_ratio": float(ratio),
+                "frame_id": int(self._frame_id),
+                "frame_bit_errors": int(self._frame_bit_errors),
+                "frame_bits_total": int(self._frame_bits_total),
+                "frame_ber": float(frame_ber),
+                "bit_errors": int(self._bit_errors_total),
+                "bits_total": int(self._bits_total),
+                "cumulative_ber": float(cumulative_ber),
             }
+
+    def _record_ber_counts(self, bit_errors: int, bits_total: int) -> None:
+        errors = int(bit_errors)
+        total = int(bits_total)
+        if errors < 0 or total <= 0 or errors > total:
+            raise ValueError("BER counts must satisfy 0 <= bit_errors <= bits_total")
+        with self._lock:
+            self._frame_id += 1
+            self._frame_bit_errors = errors
+            self._frame_bits_total = total
+            self._bit_errors_total += errors
+            self._bits_total += total
+
+    def _reset_run_metrics(self) -> None:
+        with self._lock:
+            self._frame_id = 0
+            self._frame_bit_errors = 0
+            self._frame_bits_total = 0
+            self._bit_errors_total = 0
+            self._bits_total = 0
+
+    def set_frame_limit(self, frame_limit: Optional[int]) -> None:
+        """Limit decoded frames in the next run; None leaves a run unlimited."""
+        if self._running:
+            raise RuntimeError("运行中不能设置帧数上限，请先 stop()")
+        if frame_limit is None:
+            self._frame_limit = None
+            return
+        if isinstance(frame_limit, bool):
+            raise ValueError("frame_limit must be a positive integer")
+        try:
+            limit = int(frame_limit)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("frame_limit must be a positive integer") from exc
+        if limit <= 0 or limit != frame_limit:
+            raise ValueError("frame_limit must be a positive integer")
+        self._frame_limit = limit
+
+    def get_ntn_config(self) -> Dict[str, Any]:
+        return self._ntn_channel.summary()
 
     # =========================================================
     # 日志
@@ -331,12 +605,46 @@ class _LegacyOfdmHardwareTx:
         tx_text: Optional[str] = None,
         mod_order: Optional[str] = None,
         equalizer: Optional[str] = None,
+        ntn_enabled: Optional[bool] = None,
+        ntn_profile: Optional[str] = None,
+        ntn_seed: Optional[int] = None,
+        ntn_velocity_kmh: Optional[float] = None,
+        ntn_radial_projection: Optional[float] = None,
+        ntn_compensation_ratio: Optional[float] = None,
+        ntn_residual_cfo_hz: Optional[float] = None,
+        ntn_doppler_spread_hz: Optional[float] = None,
+        ntn_delay_scale: Optional[float] = None,
     ):
         if self._running:
             raise RuntimeError("运行中不能重新配置，请先 stop()")
 
         rebuild_top = False
         rebuild_waveform = False
+        ntn_changes = {
+            "enabled": ntn_enabled,
+            "profile": ntn_profile,
+            "seed": ntn_seed,
+            "velocity_kmh": ntn_velocity_kmh,
+            "radial_projection": ntn_radial_projection,
+            "compensation_ratio": ntn_compensation_ratio,
+            "residual_cfo_hz": ntn_residual_cfo_hz,
+            "doppler_spread_hz": ntn_doppler_spread_hz,
+            "delay_scale": ntn_delay_scale,
+        }
+        ntn_candidate = None
+        if (any(value is not None for value in ntn_changes.values())
+                or carrier_freq is not None or samp_rate is not None):
+            candidate_settings = dict(self._ntn_params)
+            candidate_settings.update({
+                key: value for key, value in ntn_changes.items() if value is not None
+            })
+            candidate_settings["carrier_frequency_hz"] = (
+                self.carrier_freq if carrier_freq is None else float(carrier_freq)
+            )
+            candidate_settings["sample_rate_hz"] = (
+                self.sample_rate if samp_rate is None else float(samp_rate)
+            )
+            ntn_candidate = OfdmNtnChannel(**candidate_settings)
 
         if carrier_freq is not None:
             self.carrier_freq = float(carrier_freq)
@@ -383,6 +691,11 @@ class _LegacyOfdmHardwareTx:
             self._set_tx_text_internal(self._tx_text)
             rebuild_top = True
 
+        if ntn_candidate is not None:
+            self._ntn_channel = ntn_candidate
+            self._ntn_params = dict(ntn_candidate.settings)
+            rebuild_top = True
+
         if rebuild_top:
             self._usrp_args = self._build_device_args()
             self._build_top_block()
@@ -392,6 +705,12 @@ class _LegacyOfdmHardwareTx:
             raise RuntimeError("top_block 未构建")
         if self._running:
             return
+        if self._monitor_thread is not None:
+            if self._monitor_thread.is_alive():
+                raise RuntimeError("上一次 OFDM 监控线程尚未退出，不能重新启动")
+            self._monitor_thread = None
+        self._ntn_channel.reset()
+        self._reset_run_metrics()
         self._tb.start()
         self._running = True
         self._status = "running"
@@ -400,15 +719,20 @@ class _LegacyOfdmHardwareTx:
         self._monitor_thread.start()
 
     def stop(self):
-        if not self._running:
+        monitor_thread = self._monitor_thread
+        if not self._running and monitor_thread is None:
             return
         self._monitor_stop.set()
-        if self._monitor_thread is not None:
-            self._monitor_thread.join(timeout=1.5)
+        if self._running:
+            self._tb.stop()
+            self._tb.wait()
+            self._running = False
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.5)
+            if monitor_thread.is_alive():
+                self._status = "stopping"
+                raise RuntimeError("OFDM 监控线程未在 1.5 秒内退出")
             self._monitor_thread = None
-        self._tb.stop()
-        self._tb.wait()
-        self._running = False
         self._status = "stopped"
 
     def wait(self, timeout: Optional[float] = 2.0):
@@ -432,6 +756,11 @@ class _LegacyOfdmHardwareTx:
         tx_gain_block = blocks.multiply_const_cc(1.0)
         tx_sink_vec = blocks.vector_sink_c()
         rx_sink_vec = blocks.vector_sink_c()
+        ntn_channel_block = None
+        if self._ntn_channel.enabled:
+            from .gr_flow import make_tdl_channel_block
+
+            ntn_channel_block = make_tdl_channel_block(self._ntn_channel)
 
         usrp_source = uhd.usrp_source(
             ",".join(("", self._usrp_args)),
@@ -456,7 +785,11 @@ class _LegacyOfdmHardwareTx:
         usrp_sink.set_antenna(self.tx_antenna, 0)
         usrp_sink.set_gain(self.tx_gain, 0)
 
-        tb.connect((vector_source, 0), (tx_gain_block, 0))
+        if ntn_channel_block is None:
+            tb.connect((vector_source, 0), (tx_gain_block, 0))
+        else:
+            tb.connect((vector_source, 0), (ntn_channel_block, 0))
+            tb.connect((ntn_channel_block, 0), (tx_gain_block, 0))
         tb.connect((tx_gain_block, 0), (usrp_sink, 0))
         tb.connect((tx_gain_block, 0), (tx_sink_vec, 0))
         tb.connect((usrp_source, 0), (rx_sink_vec, 0))
@@ -466,6 +799,7 @@ class _LegacyOfdmHardwareTx:
         self._usrp_sink = usrp_sink
         self._tx_sink_vec = tx_sink_vec
         self._rx_sink_vec = rx_sink_vec
+        self._ntn_channel_block = ntn_channel_block
 
         with self._lock:
             self._tx_buffer.clear()
@@ -536,6 +870,9 @@ class _LegacyOfdmHardwareTx:
     # OFDM 发射 / 接收主处理
     # =========================================================
     def _try_process_rx_window(self, rx_window: np.ndarray, abs_seen: int):
+        with self._lock:
+            if self._frame_limit is not None and self._frame_id >= self._frame_limit:
+                return
         metric = self._sync_metric(rx_window)
         if metric.size <= 1:
             return
@@ -634,7 +971,8 @@ class _LegacyOfdmHardwareTx:
 
             rx_syms = np.concatenate(x_hat_units)
             pre_eq_syms = np.concatenate(pre_eq_units) if pre_eq_units else np.zeros(0, dtype=np.complex128)
-            ber, raw_bytes, rx_payload, rx_text, match_bytes, decode_ok, rx_syms_best, phi_best = (
+            (ber, frame_bit_errors, frame_bits_total, raw_bytes, rx_payload, rx_text,
+             match_bytes, decode_ok, rx_syms_best, phi_best) = (
                 self._recover_payload_from_symbols(rx_syms)
             )
 
@@ -673,6 +1011,8 @@ class _LegacyOfdmHardwareTx:
                 "pilot_nmse": float(pilot_nmse),
                 "alpha_abs": float(alpha_abs),
                 "ber": float(ber),
+                "bit_errors": int(frame_bit_errors),
+                "bits_total": int(frame_bits_total),
                 "raw_bytes": raw_bytes,
                 "rx_payload": rx_payload,
                 "rx_text": rx_text,
@@ -699,6 +1039,8 @@ class _LegacyOfdmHardwareTx:
             return
 
         self._last_processed_abs_start = best["abs_frame_start"]
+        if best["bits_total"] > 0:
+            self._record_ber_counts(best["bit_errors"], best["bits_total"])
         self.last_sync_index = int(best["frame_start"])
         self.last_payload_start = int(best["frame_start"] + self._off_train)
         self.last_sync_metric = float(best["sync_metric"])
@@ -1123,12 +1465,12 @@ class _LegacyOfdmHardwareTx:
     def _recover_payload_from_symbols(
         self,
         rx_syms: np.ndarray,
-    ) -> Tuple[float, bytes, bytes, str, int, bool, np.ndarray, float]:
+    ) -> Tuple[float, int, int, bytes, bytes, str, int, bool, np.ndarray, float]:
         rx_syms = np.asarray(rx_syms, dtype=np.complex128).reshape(-1)
         frame_bits_len = int(self._tx_frame_bits.size)
         total_bits_need = int(frame_bits_len * self._payload_repeat)
         if frame_bits_len <= 0 or total_bits_need <= 0:
-            return 1.0, b"", b"", "", 0, False, rx_syms.astype(np.complex64), 0.0
+            return 1.0, 0, 0, b"", b"", "", 0, False, rx_syms.astype(np.complex64), 0.0
 
         # 相位候选：优先尝试最近一次成功锁定的相位
         base = [0.0, 0.5 * np.pi, np.pi, 1.5 * np.pi]
@@ -1139,6 +1481,8 @@ class _LegacyOfdmHardwareTx:
             "score": -1e18,
             "ber": 1.0,
             "ber_instant": 1.0,
+            "bit_errors": 0,
+            "bits_total": 0,
             "raw_bytes": b"",
             "rx_payload": b"",
             "rx_text": "",
@@ -1184,7 +1528,8 @@ class _LegacyOfdmHardwareTx:
                 frame_bits_single = (votes * 2 >= n_votes).astype(np.int8)
                 soft_sum = (1 - 2 * frame_bits_single).astype(np.float64)
 
-            ber_single = float(np.mean(frame_bits_single != self._tx_frame_bits))
+            bit_errors_single = int(np.count_nonzero(frame_bits_single != self._tx_frame_bits))
+            ber_single = float(bit_errors_single / frame_bits_len)
 
             soft_hist = list(self._frame_soft_history) + [soft_sum]
             soft_hist_sum = np.sum(np.stack(soft_hist, axis=0), axis=0)
@@ -1216,6 +1561,8 @@ class _LegacyOfdmHardwareTx:
                         "score": score,
                         "ber": ber_single,
                         "ber_instant": ber_single,
+                        "bit_errors": bit_errors_single,
+                        "bits_total": frame_bits_len,
                         "raw_bytes": frame_bytes,
                         "rx_payload": rx_payload,
                         "rx_text": rx_text,
@@ -1236,6 +1583,8 @@ class _LegacyOfdmHardwareTx:
         self._combine_frames = len(self._frame_soft_history)
         return (
             float(best["ber"]),
+            int(best["bit_errors"]),
+            int(best["bits_total"]),
             best["raw_bytes"],
             best["rx_payload"],
             best["rx_text"],
@@ -1428,6 +1777,14 @@ class _LegacyOfdmHardwareTx:
             "match_bytes": stats["match_bytes"],
             "expected_bytes": stats["expected_bytes"],
             "match_ratio": stats["match_ratio"],
+            "frame_id": stats["frame_id"],
+            "frame_bit_errors": stats["frame_bit_errors"],
+            "frame_bits_total": stats["frame_bits_total"],
+            "frame_ber": stats["frame_ber"],
+            "bit_errors": stats["bit_errors"],
+            "bits_total": stats["bits_total"],
+            "cumulative_ber": stats["cumulative_ber"],
+            "ntn": self.get_ntn_config(),
             "ber": float(ber_est) if np.isfinite(ber_est) else float("nan"),
         }
 

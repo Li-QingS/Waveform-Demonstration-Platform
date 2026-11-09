@@ -34,6 +34,18 @@ def tab(app):
     page.close()
 
 
+def test_scan_defaults_use_dense_sampling(tab):
+    assert tab.scan_frames_spin.value() == 100
+    assert tab.scan_cfo_points_spin.value() == 31
+    assert tab.scan_doppler_points_spin.value() == 31
+    assert tab.scan_cfo_min_spin.value() == -300.0
+    assert tab.scan_cfo_max_spin.value() == 300.0
+    assert tab.scan_doppler_min_spin.value() == 0.0
+    assert tab.scan_doppler_max_spin.value() == 1200.0
+    assert "SCS=15 kHz" in tab.scan_note_label.text()
+    assert "0.02×SCS" in tab.scan_note_label.text()
+
+
 def wait_until(predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -96,6 +108,44 @@ def test_real_live_and_scan_workers_count_the_same_seeded_physical_frames():
             assert int(store[family][name]["bit_errors"][0]) == live[side]["bit_errors"]
             assert int(store[family][name]["total_bits"][0]) == live[side]["total_bits"]
             assert store[family][name]["ber"][0] == live[side]["ber"]
+
+
+def test_mode_and_csi_configuration_are_preserved_in_live_and_scan_results():
+    config = compare_workers._run_config(
+        ("OFDM", "AFDM"), 10.0, 0.0, 0.0, "QPSK", 42, "practical",
+        csi_mode="ideal",
+    )
+    assert config["comparison_mode"] == "practical_receiver"
+    assert config["csi_mode"] == "pilot"
+    assert config["subcarrier_spacing_hz"] == pytest.approx(15e3)
+    assert config["sample_rate_hz"] == pytest.approx(960e3)
+
+    store = scan_store()
+    _ScanWorker(
+        store, threading.Lock(), threading.Event(),
+        scan_parameters(receiver_mode="practical", csi_mode="ideal"),
+    ).run()
+
+    assert store["done"] and not store["error"]
+    assert store["config"]["comparison_mode"] == "practical_receiver"
+    assert store["config"]["csi_mode"] == "pilot"
+    assert store["cfo"]["OFDM"]["pilot_overhead_fraction"][0] == pytest.approx(1 / 8)
+    assert store["cfo"]["OTFS"]["csi_nmse"][0] > 0.0
+    assert store["cfo"]["OTFS"]["receiver_method"][0] == "sparse_pcg_lmmse"
+
+
+def test_practical_receiver_selection_requires_common_pilot_csi(tab):
+    practical = tab.receiver_combo.findData("practical")
+    ideal = tab.csi_combo.findData("ideal")
+    pilot = tab.csi_combo.findData("pilot")
+
+    tab.receiver_combo.setCurrentIndex(practical)
+    assert tab.csi_combo.currentIndex() == pilot
+    tab.csi_combo.setCurrentIndex(ideal)
+    assert tab.csi_combo.currentIndex() == pilot
+
+    tab.scan_receiver_combo.setCurrentIndex(tab.scan_receiver_combo.findData("practical"))
+    assert tab.scan_csi_combo.currentData() == "pilot"
 
 
 def test_duplicate_live_waveforms_are_identical_and_snapshots_do_not_alias(monkeypatch):
@@ -239,6 +289,8 @@ def test_ui_zero_error_table_triangles_and_export_keep_raw_counts_and_config(tab
             item = tab.result_table.item(row, column)
             assert item.text() == "0"
             assert "0/200" in item.toolTip() and "95%" in item.toolTip()
+            if column == 3:
+                assert "ΔBER(OTFS-OFDM)" in item.toolTip()
         assert tab.result_table.item(row, 5).text() == "200"
         assert tab.result_table.item(row, 6).text() == "2"
     for plot in (tab.scan_cfo_plot, tab.scan_doppler_plot):
@@ -247,6 +299,9 @@ def test_ui_zero_error_table_triangles_and_export_keep_raw_counts_and_config(tab
             assert raw is None or len(raw) == 0
             upper = getattr(plot, name + "_zero_curve").yData
             assert len(upper) == 1 and 0 < upper[0] < 1
+            assert len(getattr(plot, name + "_ci_errorbar").opts["x"]) == 0
+            clipped = getattr(plot, name + "_ci_floor_curve").yData
+            assert clipped is None or len(clipped) == 0
     tab.scan_seed_spin.setValue(999)
     saved = tmp_path / "comparison.json"
     monkeypatch.setattr(waveform_compare_tab.QFileDialog, "getSaveFileName", lambda *_args: (str(saved), "JSON"))
@@ -258,6 +313,58 @@ def test_ui_zero_error_table_triangles_and_export_keep_raw_counts_and_config(tab
         for stats in report[family].values():
             assert stats["ber"] == [0.0] and stats["bit_errors"] == [0]
             assert stats["total_bits"] == [200] and stats["ci_high"][0] > 0
+            assert stats["ci_method"] == ["zero_error_frame_fer_upper_bound"]
+        assert report[family]["OTFS"]["ber_diff_vs_OFDM_ci_low"][0] < 0.0
+        assert report[family]["OTFS"]["ber_diff_vs_OFDM_ci_method"] == ["zero_error_paired_fer_bounds"]
+
+
+def test_scan_plot_renders_frame_cluster_intervals_on_log_axis_without_changing_zero_bounds(tab):
+    plot = tab.scan_cfo_plot
+    tab._update_scan_plot(plot, {
+        "OFDM": {
+            "x": np.array([1.0, 2.0, 3.0]),
+            "ber": np.array([1e-2, 1e-3, 0.0]),
+            "ci_low": np.array([5e-3, 0.0, 0.0]),
+            "ci_high": np.array([2e-2, 5e-3, 1e-2]),
+        },
+    })
+
+    intervals = plot.ofdm_ci_errorbar.opts
+    np.testing.assert_allclose(intervals["x"], [1.0, 2.0])
+    display_floor = float(plot.ofdm_ci_floor_curve.yData[0])
+    assert 1e-4 < display_floor < 1e-3
+    assert np.log10(display_floor) == pytest.approx(-3.18)
+    np.testing.assert_allclose(intervals["y"], np.log10([5e-3, display_floor]))
+    np.testing.assert_allclose(
+        intervals["top"],
+        np.log10([2e-2, 5e-3]) - np.log10([5e-3, display_floor]),
+    )
+    np.testing.assert_array_equal(intervals["bottom"], [0.0, 0.0])
+    np.testing.assert_array_equal(plot.ofdm_ci_floor_curve.getData()[0], [2.0])
+    np.testing.assert_allclose(plot.ofdm_ci_floor_curve.getData()[1], [-3.18])
+    assert plot.getViewBox().viewRange()[1][0] > -5.0
+
+    np.testing.assert_array_equal(plot.ofdm_zero_curve.xData, [3.0])
+    np.testing.assert_array_equal(plot.ofdm_zero_curve.yData, [1e-2])
+    assert "下界为 0" in plot.ofdm_ci_errorbar.toolTip()
+
+
+def test_clearing_scan_plots_removes_old_confidence_intervals(tab):
+    plot = tab.scan_cfo_plot
+    tab._update_scan_plot(plot, {
+        "OFDM": {
+            "x": np.array([1.0]),
+            "ber": np.array([1e-2]),
+            "ci_low": np.array([5e-3]),
+            "ci_high": np.array([2e-2]),
+        },
+    })
+    assert len(plot.ofdm_ci_errorbar.opts["x"]) == 1
+
+    tab._clear_scan_plots()
+
+    assert len(plot.ofdm_ci_errorbar.opts["x"]) == 0
+    assert plot.ofdm_ci_floor_curve.yData is None or len(plot.ofdm_ci_floor_curve.yData) == 0
 
 
 def test_internal_pages_stop_the_previous_task_and_keep_live_scan_mutually_exclusive(tab, monkeypatch):

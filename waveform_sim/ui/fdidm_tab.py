@@ -239,7 +239,13 @@ class FDIDMTab(BaseWaveformTab):
         self.decoder_combo = QComboBox()
         self.decoder_combo.addItems(["ZF", "MMSE", "ZF-SIC"])
         self.decoder_combo.setCurrentText("ZF")
-        idx_form.addRow("检测器:", self.decoder_combo)
+        self.decoder_combo.setToolTip(
+            "此设置作用于实时波形接收。理论对照固定使用："
+            "OFDM 单抽头 LMMSE，OTFS/AFDM/FDIDM 稀疏 LMMSE（残余干扰协方差使用完整信道真值）。"
+            "SER 使用增益归一后的残余方差与高斯近似进行解析预测，不是逐帧 Monte-Carlo；"
+            "按相同数据符号 Eb/N0 计算，保护间隔开销不计入 SER。"
+        )
+        idx_form.addRow("实时检测器:", self.decoder_combo)
 
         # --- 帧结构与波形 ---
         frame_group, frame_form = form_group("帧结构 / 波形")
@@ -985,7 +991,7 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_beta_data.clear()
         self._ser_snr_curves.clear()
         self._ser_snr_data.clear()
-        self.adaptive_plots.set_snr_title("共享信道 SER-SNR（等待搜索）")
+        self.adaptive_plots.set_snr_title("共享信道解析预测 SER-SNR（等待搜索）")
 
         dyn_mode = str(base_kwargs.get("channel_dynamics", "fixed"))
         dyn_note = (
@@ -1003,7 +1009,7 @@ class FDIDMTab(BaseWaveformTab):
             status_text=(
                 f"自动刷新启动：{self._auto_scan_reason}。\n"
                 f"信道统计模式：{dyn_note}；正在理论搜索 α*/β*。\n"
-                f"搜索结束后将启动双线程：{alpha_curve_text}；自适应页：共享信道四波形 SER-SNR 绘制。\n"
+                f"搜索结束后将启动双线程：{alpha_curve_text}；自适应页：共享信道四波形解析预测 SER-SNR 绘制。\n"
                 f"左下角显示下界=3/({alpha_sweep_frames}×{int(base_kwargs.get('m_subcarriers', 8))}×{int(base_kwargs.get('n_symbols', 8))})={ser_floor:.3e}；低于该值按下界连线显示。"
             )
         )
@@ -1051,6 +1057,8 @@ class FDIDMTab(BaseWaveformTab):
                 decision_ser_floor=1e-8,
                 stop_event=stop_event,
             )
+            if bool(optimized.get("cancelled", False)) or stop_event.is_set() or token != self._auto_scan_token:
+                return
             refs = benchmark.evaluate_all(working_snr, current_a, current_b)
             best_a = float(optimized["recommended_alpha"])
             best_b = float(optimized["recommended_beta"])
@@ -1065,7 +1073,10 @@ class FDIDMTab(BaseWaveformTab):
                 "step": float(coarse_step),
                 "fine_step": float(fine_step),
                 "elapsed_s": float(optimized["search_seconds"]),
-                "objective": "共享物理信道 + 干扰感知稀疏LMMSE的SER",
+                "objective": (
+                    "共享物理信道 + OFDM 单抽头 LMMSE / "
+                    "OTFS、AFDM、FDIDM 稀疏 LMMSE 的解析预测 SER"
+                ),
                 "snr_definition": str(base_kwargs.get("snr_definition", "Eb/N0")),
                 "significant": bool(gain_db >= 0.5),
                 "significance_note": (
@@ -1105,9 +1116,14 @@ class FDIDMTab(BaseWaveformTab):
         self._alpha_active_token = int(token)
         self._snr_active_token = int(token)
 
-        self.adaptive_plots.set_snr_title("共享信道 LMMSE SER-SNR")
+        self.adaptive_plots.set_snr_title("共享信道 LMMSE 解析预测 SER-SNR")
         self.adaptive_plots.snr_plot.setToolTip(
-            "四波形使用同一固定物理信道，采用稀疏 LMMSE 检测；FDIDM 在每个 SNR 点独立优化 α/β。"
+            "SER 由增益归一后的 LMMSE 残余方差经方形 QAM 公式和高斯近似估算，"
+            "属于解析预测，不是逐帧 Monte-Carlo。"
+            "四波形使用同一固定物理信道和相同数据符号 Eb/N0；保护间隔开销不计入 SER。"
+            "OFDM 使用单抽头 LMMSE，OTFS/AFDM/FDIDM 使用稀疏 LMMSE，"
+            "其残余干扰协方差取自完整信道真值。FDIDM 在每个 SNR 点独立优化 α/β；"
+            "实时检测器下拉框不改变此理论对照。"
         )
 
         self._alpha_thread = threading.Thread(
@@ -1176,6 +1192,10 @@ class FDIDMTab(BaseWaveformTab):
                             ser_display_floor=ser_floor,
                         )
                         ser_raw = float(item.get("ser", np.nan))
+                    if stop_event.is_set() or token != self._auto_scan_token:
+                        finish_reason = "已停止"
+                        self._emit_signal_safe("alpha_beta_finished", token, finish_reason)
+                        return
                     if not self._emit_signal_safe("alpha_beta_point", token, curve_name, float(a), float(ser_raw), float(ser_floor)):
                         return
         except Exception as exc:
@@ -1242,6 +1262,10 @@ class FDIDMTab(BaseWaveformTab):
                     decision_ser_floor=1e-15,
                     stop_event=stop_event,
                 )
+                if bool(result.get("cancelled", False)) or stop_event.is_set() or token != self._auto_scan_token:
+                    finish_reason = "已停止"
+                    self._emit_signal_safe("ser_snr_finished", token, finish_reason)
+                    return
                 a_star = float(result["recommended_alpha"])
                 b_star = float(result["recommended_beta"])
                 ser = float(result["predicted_ser_best"])
@@ -1800,8 +1824,10 @@ class FDIDMTab(BaseWaveformTab):
         if int(token) != int(self._auto_scan_token):
             return
         self._snr_active_token = None
-        self.adaptive_plots.set_snr_title("共享信道 LMMSE SER-SNR")
+        self.adaptive_plots.set_snr_title("共享信道 LMMSE 解析预测 SER-SNR")
         self.adaptive_plots.snr_plot.setToolTip(
+            f"增益归一后的残余方差采用高斯近似和方形 QAM 公式；"
+            f"等数据符号 Eb/N0，保护间隔开销不计入 SER。"
             f"四波形共享固定信道，FDIDM 在每个 SNR 点独立优化 α/β。扫描状态：{reason}"
         )
         self._maybe_finish_auto_refresh(int(token), str(reason))

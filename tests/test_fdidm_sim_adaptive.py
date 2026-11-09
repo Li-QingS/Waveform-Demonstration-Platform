@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """FDIDM simulation-side predictive adaptive tests."""
 import os
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -114,6 +115,30 @@ def test_kernel_max_order_guard():
     snap["max_order"] = 128  # 16*16=256 > 128
     with pytest.raises(ValueError):
         tb._optimize_alpha_beta_snapshot(snap)
+
+
+def test_live_snapshot_benchmark_path_enforces_max_order_guard():
+    tb = _make_backend(m_subcarriers=16, n_symbols=16)
+    tb.update_adaptive_config(max_order=128)
+    with tb._lock:
+        snapshot = tb._adaptive_snapshot_locked()
+
+    with pytest.raises(ValueError, match="exceeds max_order=128"):
+        tb._adaptive_benchmark_from_snapshot(snapshot)
+
+
+def test_snapshot_benchmark_freezes_fdidm_transform_dimensions_after_resize():
+    tb = _make_backend(m_subcarriers=4, n_symbols=4)
+    with tb._lock:
+        snapshot = tb._adaptive_snapshot_locked()
+
+    tb.set_frame_shape(8, 8)
+
+    bench = tb._adaptive_benchmark_from_snapshot(snapshot)
+    result = bench.evaluate("FDIDM", 10.0, alpha=0.2, beta=0.3)
+
+    assert bench.K == 16
+    assert np.isfinite(float(result["ser"]))
 
 
 def test_dynamic_channel_keeps_reference_power_for_ser_plot():
@@ -230,6 +255,267 @@ def test_closed_loop_context_invalidation():
     assert status["stable_count"] <= 10
     tb.stop_adaptive_tuning()
     tb.stop()
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"channel_seed": 43},
+        {"random_channel": False},
+        {"circular_channel": False},
+        {"tf_notch_depth_db": 12.0, "tf_notch_count": 1},
+        {"fast_channel_coherence_symbols": 2},
+    ],
+)
+def test_channel_scoring_configuration_changes_adaptive_context(update):
+    tb = _make_backend()
+    with tb._lock:
+        before = tb._adaptive_context_key_locked()
+    tb.update_runtime_parameters(**update)
+    with tb._lock:
+        after = tb._adaptive_context_key_locked()
+    assert after != before
+
+
+def test_adaptive_run_lifecycle_advances_context_generation():
+    tb = _make_backend()
+    tb.start_adaptive_tuning(auto_apply=False)
+    first_generation = int(tb._adaptive_context_epoch)
+    tb.stop_adaptive_tuning()
+    stopped_generation = int(tb._adaptive_context_epoch)
+    tb.start_adaptive_tuning(auto_apply=False)
+    restarted_generation = int(tb._adaptive_context_epoch)
+    tb.stop_adaptive_tuning()
+
+    assert stopped_generation > first_generation
+    assert restarted_generation > stopped_generation
+
+
+def test_decision_config_change_clears_snapshots_from_previous_generation():
+    tb = _make_backend()
+    tb.start_adaptive_tuning(auto_apply=False, window_frames=8, ensemble_snapshots=3)
+    try:
+        with tb._adaptive_lock:
+            snapshot = {
+                "frame": 1,
+                "context_key": tb._adaptive_context_key_locked(),
+                "adaptive_context_epoch": int(tb._adaptive_context_epoch),
+            }
+            tb._adaptive_window.extend([dict(snapshot), dict(snapshot)])
+            old_epoch = int(tb._adaptive_context_epoch)
+
+        tb.update_adaptive_config(
+            min_improvement_db=float(tb._adaptive_cfg("min_improvement_db")) + 0.1
+        )
+
+        with tb._adaptive_lock:
+            assert int(tb._adaptive_context_epoch) > old_epoch
+            assert len(tb._adaptive_window) == 0
+            assert tb._adaptive_pending_ensemble is None
+    finally:
+        tb.stop_adaptive_tuning()
+
+
+def test_ensemble_snapshot_count_is_clamped_to_two():
+    tb = _make_backend()
+
+    tb.update_adaptive_config(ensemble_snapshots=1)
+
+    assert int(tb._adaptive_cfg("ensemble_snapshots")) == 2
+    selected = tb._select_ensemble(
+        [{"frame": index} for index in range(5)],
+        int(tb._adaptive_cfg("ensemble_snapshots")),
+    )
+    assert [item["frame"] for item in selected] == [0, 4]
+
+
+def test_restart_waits_for_stopping_worker_before_starting_new_worker():
+    tb = _make_backend()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block_search(_ensemble):
+        entered.set()
+        assert release.wait(5.0)
+
+    tb._adaptive_process_ensemble = block_search
+    try:
+        tb.start_adaptive_tuning(auto_apply=False)
+        with tb._adaptive_lock:
+            tb._adaptive_pending_ensemble = [{}]
+            tb._adaptive_search_event.set()
+        assert entered.wait(2.0)
+        old_worker = tb._adaptive_search_thread
+        assert old_worker is not None
+
+        tb.stop_adaptive_tuning()
+        assert old_worker.is_alive()
+
+        tb.start_adaptive_tuning(auto_apply=False)
+        assert tb._adaptive_search_thread is old_worker
+
+        release.set()
+        assert _wait_for(
+            lambda: tb._adaptive_search_thread is not None
+            and tb._adaptive_search_thread is not old_worker
+            and tb._adaptive_search_thread.is_alive(),
+            timeout=5.0,
+        )
+        assert sum(
+            thread.name == "fdidm-slow-search" and thread.is_alive()
+            for thread in threading.enumerate()
+        ) == 1
+    finally:
+        release.set()
+        tb.stop_adaptive_tuning()
+
+
+def test_inflight_search_is_discarded_after_snr_context_change(monkeypatch):
+    from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+    tb = _make_backend(snr_db=8.0)
+    tb.start_adaptive_tuning(
+        interval_frames=1000,
+        stability_evals=1,
+        min_improvement_db=0.0,
+        auto_apply=True,
+        cooldown_frames=0,
+        window_frames=2,
+        ensemble_snapshots=2,
+    )
+    with tb._lock:
+        snapshot = tb._adaptive_snapshot_locked()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_optimize(cls, benchmarks, snr_db, **kwargs):
+        entered.set()
+        assert release.wait(5.0)
+        return {
+            "recommended_alpha": 1.0,
+            "recommended_beta": 0.0,
+            "predicted_ser_current": 0.2,
+            "predicted_ser_best": 0.1,
+            "predicted_geometric_ser_current": 0.2,
+            "predicted_geometric_ser_best": 0.1,
+            "decision_ser_floor": 1e-8,
+            "decision_geometric_ser_current": 0.2,
+            "decision_geometric_ser_best": 0.1,
+            "predicted_improvement_db": 3.0102999566,
+            "candidate_count": 9,
+            "search_seconds": 0.01,
+            "top_candidates": [],
+            "ensemble_size": len(benchmarks),
+            "working_snr_db": float(snr_db),
+            "search_mode": "test",
+        }
+
+    monkeypatch.setattr(
+        SharedWaveformBenchmark,
+        "optimize_fdidm_over_ensemble",
+        classmethod(blocked_optimize),
+    )
+    errors = []
+
+    def run_search():
+        try:
+            tb._adaptive_process_ensemble([snapshot])
+        except Exception as exc:  # pragma: no cover - assertion below surfaces it
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_search)
+    worker.start()
+    try:
+        assert entered.wait(5.0)
+        tb.update_runtime_parameters(snr_db=20.0)
+        tb.step()
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+        tb.stop_adaptive_tuning()
+
+    assert not worker.is_alive()
+    assert not errors
+    assert (float(tb.config.alpha), float(tb.config.beta)) == (0.0, 0.0)
+    assert not [item for item in tb.get_adaptive_history() if item.get("kind") == "switch"]
+
+
+def test_context_change_between_ready_decision_and_write_marks_eval_stale(monkeypatch):
+    from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+    tb = _make_backend(snr_db=8.0)
+
+    def change_context(_recommendation):
+        tb.update_runtime_parameters(snr_db=20.0)
+        tb.step()
+
+    tb.start_adaptive_tuning(
+        callback=change_context,
+        stability_evals=1,
+        min_improvement_db=0.0,
+        auto_apply=True,
+        cooldown_frames=0,
+    )
+    with tb._lock:
+        snapshot = tb._adaptive_snapshot_locked()
+
+    def optimized(cls, benchmarks, snr_db, **kwargs):
+        return {
+            "recommended_alpha": 1.0, "recommended_beta": 0.0,
+            "predicted_ser_current": 0.2, "predicted_ser_best": 0.1,
+            "predicted_geometric_ser_current": 0.2,
+            "predicted_geometric_ser_best": 0.1,
+            "decision_ser_floor": 1e-8,
+            "decision_geometric_ser_current": 0.2,
+            "decision_geometric_ser_best": 0.1,
+            "predicted_improvement_db": 3.0102999566,
+            "candidate_count": 9, "search_seconds": 0.01,
+            "top_candidates": [], "ensemble_size": len(benchmarks),
+            "working_snr_db": float(snr_db), "search_mode": "test",
+        }
+
+    monkeypatch.setattr(
+        SharedWaveformBenchmark,
+        "optimize_fdidm_over_ensemble",
+        classmethod(optimized),
+    )
+    try:
+        tb._adaptive_process_ensemble([snapshot])
+    finally:
+        tb.stop_adaptive_tuning()
+
+    evaluations = [item for item in tb.get_adaptive_history() if item.get("kind") == "eval"]
+    assert evaluations and evaluations[-1]["action"] == "stale"
+    assert (float(tb.config.alpha), float(tb.config.beta)) == (0.0, 0.0)
+    assert not [item for item in tb.get_adaptive_history() if item.get("kind") == "switch"]
+
+
+def test_adaptive_benchmark_ignores_selected_decoder_for_theory_policy():
+    from waveform_sim.simulation.shared_waveform_benchmark import SharedWaveformBenchmark
+
+    tb = _make_backend(decoder="ZF")
+    with tb._lock:
+        snapshot = tb._adaptive_snapshot_locked()
+    snapshot["equalizer"] = "ZF-SIC"
+
+    bench = tb._adaptive_benchmark_from_snapshot(snapshot)
+
+    assert bench.context.receiver_policy == SharedWaveformBenchmark.RECEIVER_POLICY
+    assert bench.evaluate("FDIDM", 10.0, 0.0, 0.0)["receiver_policy"] == (
+        SharedWaveformBenchmark.RECEIVER_POLICY
+    )
+
+
+def test_realtime_decoder_selection_does_not_invalidate_adaptive_context():
+    from dataclasses import replace
+
+    tb = _make_backend(decoder="ZF")
+    with tb._lock:
+        before = tb._adaptive_context_key_locked()
+        tb.config = replace(tb.config, decoder="MMSE")
+        after = tb._adaptive_context_key_locked()
+
+    assert after == before
 
 
 def test_history_capacity_limit():

@@ -160,6 +160,7 @@ class FDIDMSimAdaptiveMixin:
         self._adaptive_state = "disabled"
         self._adaptive_last_error = ""
         self._adaptive_context_key: Optional[Tuple[Any, ...]] = None
+        self._adaptive_context_epoch = int(getattr(self, "_adaptive_context_epoch", 0))
         self._adaptive_last_queued_frame = -10**9
         self._adaptive_last_metric_frame = -10**9
         self._adaptive_last_applied_frame = -10**9
@@ -177,6 +178,13 @@ class FDIDMSimAdaptiveMixin:
 
     def update_adaptive_config(self, **cfg) -> None:
         with self._adaptive_lock:
+            decision_config_fields = {
+                "enabled", "auto_apply", "interval_frames", "window_frames",
+                "window_stride_frames", "ensemble_snapshots", "stability_evals",
+                "cooldown_frames", "max_order", "coarse_step", "fine_step",
+                "min_improvement_db", "decision_ser_floor",
+            }
+            decision_config_changed = False
             for key, value in dict(cfg).items():
                 name = str(key)
                 if name.startswith("adaptive_"):
@@ -185,13 +193,29 @@ class FDIDMSimAdaptiveMixin:
                 if name in ("interval_frames", "window_frames", "window_stride_frames",
                             "ensemble_snapshots", "benchmark_interval_frames", "stability_evals",
                             "cooldown_frames", "max_order", "history_limit"):
-                    value = max(1 if name != "cooldown_frames" else 0, int(value))
+                    minimum = 0 if name == "cooldown_frames" else (
+                        2 if name == "ensemble_snapshots" else 1
+                    )
+                    value = max(minimum, int(value))
                 elif name in ("coarse_step", "fine_step", "display_interval_s",
                               "display_ema_alpha", "min_improvement_db", "decision_ser_floor"):
                     value = float(value)
                 elif name in ("enabled", "auto_apply"):
                     value = bool(value)
+                if name in decision_config_fields and getattr(self, attr, None) != value:
+                    decision_config_changed = True
                 setattr(self, attr, value)
+
+            if decision_config_changed:
+                self._adaptive_context_epoch = int(self._adaptive_context_epoch) + 1
+                self._adaptive_pending_ensemble = None
+                self._adaptive_window.clear()
+                self._adaptive_recommendation = {}
+                self._adaptive_stable_key = None
+                self._adaptive_stable_count = 0
+                self._adaptive_state = (
+                    "collecting" if self._adaptive_cfg("enabled", False) else "disabled"
+                )
 
             new_window = max(2, int(self._adaptive_cfg("window_frames", 32)))
             if self._adaptive_window.maxlen != new_window:
@@ -206,11 +230,15 @@ class FDIDMSimAdaptiveMixin:
 
     def _adaptive_context_key_locked(self) -> Tuple[Any, ...]:
         cfg = self.config
+        channel_seed = (
+            int(getattr(self, "_dynamic_base_seed", getattr(cfg, "channel_seed", 0)))
+            if bool(getattr(cfg, "dynamic_channel", False))
+            else int(getattr(cfg, "channel_seed", 0))
+        )
         return (
             int(getattr(cfg, "m_subcarriers", 0)),
             int(getattr(cfg, "n_symbols", 0)),
             str(getattr(cfg, "mod_order", "")),
-            str(getattr(cfg, "decoder", "")),
             str(getattr(cfg, "channel_model", "")),
             str(getattr(cfg, "ntn_profile", "")),
             float(getattr(cfg, "residual_doppler_spread_hz", 0.0)),
@@ -221,11 +249,20 @@ class FDIDMSimAdaptiveMixin:
             float(getattr(cfg, "subcarrier_spacing_hz", 0.0)),
             float(getattr(cfg, "ebn0_db", 0.0)),
             str(getattr(cfg, "snr_definition", "Eb/N0")),
+            bool(getattr(cfg, "random_channel", True)),
+            channel_seed,
+            bool(getattr(cfg, "dynamic_channel", False)),
             str(getattr(cfg, "channel_dynamics", "fixed")),
             int(getattr(cfg, "channel_coherence_frames", 1)),
+            int(getattr(cfg, "fast_channel_coherence_symbols", 1)),
+            bool(getattr(cfg, "circular_channel", True)),
+            float(getattr(cfg, "tf_notch_depth_db", 0.0)),
+            int(getattr(cfg, "tf_notch_count", 0)),
+            str(getattr(cfg, "link_mode", "matrix")),
         )
 
     def _adaptive_invalidate_locked(self, context: Tuple[Any, ...]) -> None:
+        self._adaptive_context_epoch = int(self._adaptive_context_epoch) + 1
         self._adaptive_context_key = context
         self._adaptive_recommendation = {}
         self._adaptive_stable_key = None
@@ -282,7 +319,6 @@ class FDIDMSimAdaptiveMixin:
             "bits_per_symbol": int(self.bits_per_symbol),
             "snr_definition": str(getattr(cfg, "snr_definition", "Eb/N0")),
             "snr_db": float(cfg.ebn0_db),
-            "equalizer": str(cfg.decoder),
             "alpha": float(cfg.alpha),
             "beta": float(cfg.beta),
             "index_epoch": int(getattr(self, "_adaptive_index_epoch", 0)),
@@ -292,12 +328,21 @@ class FDIDMSimAdaptiveMixin:
             "residual_doppler_spread_hz": float(
                 getattr(cfg, "residual_doppler_spread_hz", 200.0)
             ),
+            "max_residual_doppler_hz": float(
+                self._channel_max_residual_doppler_hz()
+            ),
+            "max_order": int(self._adaptive_cfg("max_order", 512)),
             "context_key": self._adaptive_context_key_locked(),
+            "adaptive_context_epoch": int(self._adaptive_context_epoch),
         }
 
     def _adaptive_benchmark_from_snapshot(self, snapshot: Dict[str, Any]) -> SharedWaveformBenchmark:
         M = int(snapshot["M"])
         N = int(snapshot["N"])
+        max_order = int(snapshot.get("max_order", self._adaptive_cfg("max_order", 512)))
+        K = M * N
+        if M <= 0 or N <= 0 or K > max_order:
+            raise ValueError(f"adaptive matrix order {K} exceeds max_order={max_order}")
         raw = np.asarray(snapshot["htf"], dtype=np.complex128)
         if str(snapshot.get("htf_kind", "full")) == "diag" or raw.shape == (M, N) or raw.ndim == 1:
             diag = raw.reshape(-1, order="F")[: M * N]
@@ -309,19 +354,58 @@ class FDIDMSimAdaptiveMixin:
             qam_order=int(snapshot.get("qam_order", self._adaptive_qam_order(snapshot.get("mod_order", "16QAM")))),
             bits_per_symbol=int(snapshot.get("bits_per_symbol", round(math.log2(max(4, self._adaptive_qam_order(snapshot.get("mod_order", "16QAM"))))))),
             snr_definition=str(snapshot.get("snr_definition", getattr(self.config, "snr_definition", "Eb/N0"))),
-            detector=str(snapshot.get("equalizer", getattr(self.config, "decoder", "MMSE"))),
             path_count=int(snapshot.get("path_count", 3)),
             maximum_delay_ns=float(snapshot.get("maximum_delay_ns", 0.0)),
             residual_doppler_spread_hz=float(snapshot.get("residual_doppler_spread_hz", 200.0)),
+            max_residual_doppler_hz=(
+                float(snapshot["max_residual_doppler_hz"])
+                if snapshot.get("max_residual_doppler_hz") is not None
+                else None
+            ),
         )
-        return SharedWaveformBenchmark(ctx, raw.reshape(M * N, M * N), self._fdit_matrices)
+        # The live backend can be resized while this snapshot is being scored.
+        # Freeze the FDIDM transform dimensions to the snapshot, just like the
+        # copied H_tf matrix; otherwise a 4x4 snapshot can receive 8x8
+        # transforms from the mutable backend and fail during evaluation.
+        gamma = getattr(self, "_gamma", None)
+        expected_shape = (M * N, M * N)
+        if callable(gamma):
+            def fdit_factory(alpha: float, beta: float):
+                tx = np.kron(
+                    gamma(N, -float(beta)),
+                    gamma(M, float(alpha)),
+                )
+                rx = np.kron(
+                    gamma(N, float(beta)),
+                    gamma(M, -float(alpha)),
+                )
+                return tx, rx
+        else:
+            mutable_factory = self._fdit_matrices
+
+            def fdit_factory(alpha: float, beta: float):
+                tx, rx = mutable_factory(float(alpha), float(beta))
+                tx = np.asarray(tx, dtype=np.complex128)
+                rx = np.asarray(rx, dtype=np.complex128)
+                if tx.shape != expected_shape or rx.shape != expected_shape:
+                    raise ValueError(
+                        "FDIDM transform dimensions changed after adaptive snapshot"
+                    )
+                return tx, rx
+
+        return SharedWaveformBenchmark(
+            ctx,
+            raw.reshape(M * N, M * N),
+            fdit_factory,
+        )
 
     @staticmethod
     def _select_ensemble(window: Sequence[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
         items = list(window)
-        if len(items) <= max(1, int(count)):
+        count = max(2, int(count))
+        if len(items) <= count:
             return [dict(x) for x in items]
-        idx = np.linspace(0, len(items) - 1, max(1, int(count)), dtype=np.int64)
+        idx = np.linspace(0, len(items) - 1, count, dtype=np.int64)
         return [dict(items[int(i)]) for i in idx]
 
     # ------------------------------------------------------------------ compatibility optimizer
@@ -363,6 +447,11 @@ class FDIDMSimAdaptiveMixin:
         with self._adaptive_lock:
             metric_thread = self._adaptive_metric_thread
             search_thread = self._adaptive_search_thread
+            if self._adaptive_stop_event.is_set() and any(
+                thread is not None and thread.is_alive()
+                for thread in (metric_thread, search_thread)
+            ):
+                return
             need_metric = metric_thread is None or not metric_thread.is_alive()
             need_search = search_thread is None or not search_thread.is_alive()
             if not need_metric and not need_search:
@@ -383,6 +472,23 @@ class FDIDMSimAdaptiveMixin:
                 )
                 self._adaptive_search_thread.start()
 
+    def _adaptive_worker_exited(self, worker_name: str) -> None:
+        current = threading.current_thread()
+        with self._adaptive_lock:
+            attr = (
+                "_adaptive_metric_thread"
+                if worker_name == "metric"
+                else "_adaptive_search_thread"
+            )
+            if getattr(self, attr) is current:
+                setattr(self, attr, None)
+            restart = (
+                bool(self._adaptive_cfg("enabled", False))
+                and self._adaptive_stop_event.is_set()
+            )
+        if restart:
+            self._ensure_adaptive_worker()
+
     def _adaptive_note_frame_processed(self) -> None:
         if not bool(self._adaptive_cfg("enabled", False)):
             return
@@ -397,6 +503,7 @@ class FDIDMSimAdaptiveMixin:
                 return
             if context != self._adaptive_context_key:
                 self._adaptive_invalidate_locked(context)
+            snapshot["adaptive_context_epoch"] = int(self._adaptive_context_epoch)
 
             stride = max(1, int(self._adaptive_cfg("window_stride_frames", 1)))
             if frame % stride == 0:
@@ -438,42 +545,48 @@ class FDIDMSimAdaptiveMixin:
 
     def _adaptive_metric_loop(self) -> None:
         """Dedicated thread for the decimated real-time SER display points."""
-        while not self._adaptive_stop_event.is_set():
-            self._adaptive_metric_event.wait(timeout=0.25)
-            self._adaptive_metric_event.clear()
-            if self._adaptive_stop_event.is_set():
-                break
-            with self._adaptive_lock:
-                metric_snapshot = self._adaptive_pending_metric
-                self._adaptive_pending_metric = None
-                enabled = bool(self._adaptive_cfg("enabled", False))
-            if not enabled or metric_snapshot is None:
-                continue
-            try:
-                self._adaptive_process_metric(metric_snapshot)
-            except Exception as exc:
+        try:
+            while not self._adaptive_stop_event.is_set():
+                self._adaptive_metric_event.wait(timeout=0.25)
+                self._adaptive_metric_event.clear()
+                if self._adaptive_stop_event.is_set():
+                    break
                 with self._adaptive_lock:
-                    self._adaptive_last_error = f"metric: {type(exc).__name__}: {exc}"
+                    metric_snapshot = self._adaptive_pending_metric
+                    self._adaptive_pending_metric = None
+                    enabled = bool(self._adaptive_cfg("enabled", False))
+                if not enabled or metric_snapshot is None:
+                    continue
+                try:
+                    self._adaptive_process_metric(metric_snapshot)
+                except Exception as exc:
+                    with self._adaptive_lock:
+                        self._adaptive_last_error = f"metric: {type(exc).__name__}: {exc}"
+        finally:
+            self._adaptive_worker_exited("metric")
 
     def _adaptive_search_loop(self) -> None:
         """Dedicated thread for the slow alpha/beta search and switch decision."""
-        while not self._adaptive_stop_event.is_set():
-            self._adaptive_search_event.wait(timeout=0.25)
-            self._adaptive_search_event.clear()
-            if self._adaptive_stop_event.is_set():
-                break
-            with self._adaptive_lock:
-                ensemble = self._adaptive_pending_ensemble
-                self._adaptive_pending_ensemble = None
-                enabled = bool(self._adaptive_cfg("enabled", False))
-            if not enabled or not ensemble:
-                continue
-            try:
-                self._adaptive_process_ensemble(ensemble)
-            except Exception as exc:
+        try:
+            while not self._adaptive_stop_event.is_set():
+                self._adaptive_search_event.wait(timeout=0.25)
+                self._adaptive_search_event.clear()
+                if self._adaptive_stop_event.is_set():
+                    break
                 with self._adaptive_lock:
-                    self._adaptive_last_error = f"optimizer: {type(exc).__name__}: {exc}"
-                    self._adaptive_state = "error"
+                    ensemble = self._adaptive_pending_ensemble
+                    self._adaptive_pending_ensemble = None
+                    enabled = bool(self._adaptive_cfg("enabled", False))
+                if not enabled or not ensemble:
+                    continue
+                try:
+                    self._adaptive_process_ensemble(ensemble)
+                except Exception as exc:
+                    with self._adaptive_lock:
+                        self._adaptive_last_error = f"optimizer: {type(exc).__name__}: {exc}"
+                        self._adaptive_state = "error"
+        finally:
+            self._adaptive_worker_exited("search")
 
     def _adaptive_process_metric(self, snapshot: Dict[str, Any]) -> None:
         # Skip the four-waveform evaluation when the display budget has not
@@ -544,6 +657,17 @@ class FDIDMSimAdaptiveMixin:
             current_a = float(self.config.alpha)
             current_b = float(self.config.beta)
             start_epoch = int(getattr(self, "_adaptive_index_epoch", 0))
+            start_context = self._adaptive_context_key_locked()
+        with self._adaptive_lock:
+            start_context_epoch = int(self._adaptive_context_epoch)
+            snapshot_contexts_match = all(
+                tuple(item.get("context_key", start_context)) == start_context
+                and int(item.get("adaptive_context_epoch", start_context_epoch))
+                == start_context_epoch
+                for item in snapshots
+            )
+        if not snapshot_contexts_match:
+            return
         snr_db = float(latest["snr_db"])
 
         result = SharedWaveformBenchmark.optimize_fdidm_over_ensemble(
@@ -556,6 +680,8 @@ class FDIDMSimAdaptiveMixin:
             decision_ser_floor=float(self._adaptive_cfg("decision_ser_floor", 1e-8)),
             stop_event=self._adaptive_stop_event,
         )
+        if bool(result.get("cancelled", False)) or self._adaptive_stop_event.is_set():
+            return
         refs_current = self._mean_reference_metrics(
             benchmarks, snr_db, current_a, current_b
         )
@@ -584,9 +710,12 @@ class FDIDMSimAdaptiveMixin:
             actual_a = float(self.config.alpha)
             actual_b = float(self.config.beta)
             actual_epoch = int(getattr(self, "_adaptive_index_epoch", 0))
+            actual_context = self._adaptive_context_key_locked()
+            with self._adaptive_lock:
+                actual_context_epoch = int(self._adaptive_context_epoch)
         if actual_epoch != start_epoch or (
             abs(actual_a - current_a) + abs(actual_b - current_b) > 1e-12
-        ):
+        ) or actual_context != start_context or actual_context_epoch != start_context_epoch:
             with self._adaptive_lock:
                 if bool(self._adaptive_cfg("enabled", False)):
                     self._adaptive_state = "collecting"
@@ -602,7 +731,12 @@ class FDIDMSimAdaptiveMixin:
                         "actual_beta": actual_b,
                         "recommended_alpha": best_a,
                         "recommended_beta": best_b,
-                        "reason": "index_epoch_changed_during_search",
+                        "reason": (
+                            "context_changed_during_search"
+                            if actual_context != start_context
+                            or actual_context_epoch != start_context_epoch
+                            else "index_epoch_changed_during_search"
+                        ),
                     })
             return
 
@@ -730,11 +864,18 @@ class FDIDMSimAdaptiveMixin:
             # background jobs can both pass the epoch check before either writes,
             # then append duplicate switch events for the same recommendation.
             with self._lock:
-                still_current = (
-                    int(getattr(self, "_adaptive_index_epoch", 0)) == start_epoch
-                    and abs(float(self.config.alpha) - current_a) <= 1e-12
-                    and abs(float(self.config.beta) - current_b) <= 1e-12
-                )
+                actual_epoch = int(getattr(self, "_adaptive_index_epoch", 0))
+                actual_context = self._adaptive_context_key_locked()
+                actual_alpha = float(self.config.alpha)
+                actual_beta = float(self.config.beta)
+                with self._adaptive_lock:
+                    still_current = (
+                        actual_epoch == start_epoch
+                        and int(self._adaptive_context_epoch) == start_context_epoch
+                        and actual_context == start_context
+                        and abs(actual_alpha - current_a) <= 1e-12
+                        and abs(actual_beta - current_b) <= 1e-12
+                    )
                 if still_current:
                     # RLock makes this safe and preserves the single public path
                     # that advances the index epoch and invalidates stale votes.
@@ -746,7 +887,25 @@ class FDIDMSimAdaptiveMixin:
                     )
             if not still_current:
                 with self._adaptive_lock:
-                    self._adaptive_state = "collecting"
+                    reason = (
+                        "context_changed_before_apply"
+                        if actual_context != start_context
+                        or int(self._adaptive_context_epoch) != start_context_epoch
+                        else "indices_changed_before_apply"
+                    )
+                    for item in reversed(self._adaptive_history):
+                        if item.get("kind") == "eval" and int(item.get("seq", -1)) == seq:
+                            item["action"] = "stale"
+                            item["state"] = "stale"
+                            item["stale_reason"] = reason
+                            break
+                    if int(self._adaptive_recommendation.get("recommendation_seq", -1)) == seq:
+                        self._adaptive_recommendation = {}
+                    if (
+                        int(self._adaptive_eval_seq) == seq
+                        and bool(self._adaptive_cfg("enabled", False))
+                    ):
+                        self._adaptive_state = "collecting"
                 return
             applied_sim_time_s = float(applied_frame * applied_frame_duration_s)
             with self._adaptive_lock:
@@ -786,6 +945,12 @@ class FDIDMSimAdaptiveMixin:
         if cfg:
             self.update_adaptive_config(**cfg)
         with self._adaptive_lock:
+            self._adaptive_context_epoch = int(self._adaptive_context_epoch) + 1
+            self._adaptive_pending_ensemble = None
+            self._adaptive_recommendation = {}
+            self._adaptive_window.clear()
+            self._adaptive_stable_key = None
+            self._adaptive_stable_count = 0
             self.adaptive_enabled = True
             if callback is not None:
                 self._adaptive_callback = callback
@@ -799,9 +964,14 @@ class FDIDMSimAdaptiveMixin:
 
     def stop_adaptive_tuning(self) -> None:
         with self._adaptive_lock:
+            self._adaptive_context_epoch = int(self._adaptive_context_epoch) + 1
             self.adaptive_enabled = False
             self._adaptive_state = "disabled"
             self._adaptive_force_next = False
+            self._adaptive_pending_ensemble = None
+            self._adaptive_recommendation = {}
+            self._adaptive_stable_key = None
+            self._adaptive_stable_count = 0
         self._adaptive_stop_event.set()
         self._adaptive_metric_event.set()
         self._adaptive_search_event.set()
@@ -809,8 +979,16 @@ class FDIDMSimAdaptiveMixin:
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=2.0)
         with self._adaptive_lock:
-            self._adaptive_metric_thread = None
-            self._adaptive_search_thread = None
+            if (
+                self._adaptive_metric_thread is not None
+                and not self._adaptive_metric_thread.is_alive()
+            ):
+                self._adaptive_metric_thread = None
+            if (
+                self._adaptive_search_thread is not None
+                and not self._adaptive_search_thread.is_alive()
+            ):
+                self._adaptive_search_thread = None
             self._adaptive_pending_metric = None
             self._adaptive_pending_ensemble = None
 

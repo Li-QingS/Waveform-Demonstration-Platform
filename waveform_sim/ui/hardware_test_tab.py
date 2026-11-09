@@ -16,6 +16,7 @@ import gc
 import importlib
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -23,6 +24,7 @@ import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -36,12 +38,18 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+from ..core.config import ExperimentConfig, HardwareConfig, WaveformConfig
+from ..hardware.hardware_scan import NTNScanPlan, NTN_SCAN_PARAMETERS
+from ..service.hardware_run_recorder import HardwareRunRecorder
+from ..simulation.leo_ntn_channel import get_profile
 
 
 _BACKEND_SPECS: Dict[str, Tuple[str, str]] = {
@@ -118,6 +126,14 @@ class HardwareTestTab(QWidget):
         self._last_status_error = ""
         self._last_runtime_log_time = 0.0
         self._last_plot_samp_rate: Optional[float] = None
+        self._hardware_recorder: Optional[HardwareRunRecorder] = None
+        self._last_run_status: Dict[str, Any] = {}
+        self._scan_plan: Optional[NTNScanPlan] = None
+        self._scan_values = []
+        self._scan_index = 0
+        self._scan_start_frame_id = 0
+        self._scan_active = False
+        self._scan_transitioning = False
 
         self._init_ui()
         self._init_plot_style()
@@ -280,6 +296,81 @@ class HardwareTestTab(QWidget):
         hw_grid.addWidget(QLabel("RX 天线"), 7, 0)
         hw_grid.addWidget(self.rx_antenna_combo, 7, 1)
         link_layout.addWidget(hw_group)
+
+        self.ntn_group = QGroupBox("软件 NTN 信道（发射前注入）")
+        ntn_grid = QGridLayout(self.ntn_group)
+        ntn_grid.setHorizontalSpacing(8)
+        ntn_grid.setVerticalSpacing(6)
+        self.ntn_enabled_check = QCheckBox("启用软件信道注入")
+        self.ntn_profile_combo = QComboBox()
+        self.ntn_profile_combo.addItems(
+            ["NTN-TDLC5-200", "NTN-TDLA100-200", "NTN-TDLC5-1200"]
+        )
+        self.ntn_mode_combo = QComboBox()
+        self.ntn_mode_combo.addItem("单点配置", "single")
+        self.ntn_mode_combo.addItem("单参数扫描", "scan")
+        self.ntn_velocity_spin = self._dspin(0, 40_000, 28_080, 0, " km/h")
+        self.ntn_radial_spin = self._dspin(0, 1, 0.5, 3)
+        self.ntn_compensation_spin = self._dspin(0, 100, 99.9, 2, " %")
+        self.ntn_cfo_spin = self._dspin(-200_000, 200_000, 0, 1, " Hz", step=10)
+        self.ntn_doppler_spin = self._dspin(0, 1200, 200, 1, " Hz", step=10)
+        self.ntn_delay_scale_spin = self._dspin(0.01, 1000, 1, 2, " 倍", step=0.1)
+        self.ntn_seed_spin = QSpinBox()
+        self.ntn_seed_spin.setRange(0, 2_000_000_000)
+        self.ntn_seed_spin.setValue(42)
+        self.ntn_seed_spin.setMinimumHeight(30)
+
+        ntn_grid.addWidget(self.ntn_enabled_check, 0, 0, 1, 2)
+        ntn_grid.addWidget(QLabel("Profile"), 1, 0)
+        ntn_grid.addWidget(self.ntn_profile_combo, 1, 1)
+        ntn_grid.addWidget(QLabel("运行方式"), 2, 0)
+        ntn_grid.addWidget(self.ntn_mode_combo, 2, 1)
+        for row, label, control in (
+            (3, "径向速度", self.ntn_velocity_spin),
+            (4, "径向投影", self.ntn_radial_spin),
+            (5, "预补偿比例", self.ntn_compensation_spin),
+            (6, "额外残余 CFO", self.ntn_cfo_spin),
+            (7, "散射多普勒", self.ntn_doppler_spin),
+            (8, "时延缩放", self.ntn_delay_scale_spin),
+            (9, "随机种子", self.ntn_seed_spin),
+        ):
+            ntn_grid.addWidget(QLabel(label), row, 0)
+            ntn_grid.addWidget(control, row, 1)
+
+        self.ntn_scan_widget = QWidget()
+        scan_grid = QGridLayout(self.ntn_scan_widget)
+        scan_grid.setContentsMargins(0, 4, 0, 0)
+        self.ntn_scan_parameter_combo = QComboBox()
+        for parameter, spec in NTN_SCAN_PARAMETERS.items():
+            suffix = f" ({spec['unit']})" if spec["unit"] else ""
+            self.ntn_scan_parameter_combo.addItem(f"{spec['label']}{suffix}", parameter)
+        self.ntn_scan_start_spin = self._dspin(-40_000, 40_000, -200, 2)
+        self.ntn_scan_stop_spin = self._dspin(-40_000, 40_000, 200, 2)
+        self.ntn_scan_points_spin = QSpinBox()
+        self.ntn_scan_points_spin.setRange(2, 101)
+        self.ntn_scan_points_spin.setValue(6)
+        self.ntn_scan_frames_spin = QSpinBox()
+        self.ntn_scan_frames_spin.setRange(1, 10_000)
+        self.ntn_scan_frames_spin.setValue(10)
+        scan_grid.addWidget(QLabel("扫描参数"), 0, 0)
+        scan_grid.addWidget(self.ntn_scan_parameter_combo, 0, 1)
+        scan_grid.addWidget(QLabel("起始值"), 1, 0)
+        scan_grid.addWidget(self.ntn_scan_start_spin, 1, 1)
+        scan_grid.addWidget(QLabel("结束值"), 2, 0)
+        scan_grid.addWidget(self.ntn_scan_stop_spin, 2, 1)
+        scan_grid.addWidget(QLabel("扫描点数"), 3, 0)
+        scan_grid.addWidget(self.ntn_scan_points_spin, 3, 1)
+        scan_grid.addWidget(QLabel("每点接收帧数"), 4, 0)
+        scan_grid.addWidget(self.ntn_scan_frames_spin, 4, 1)
+        ntn_grid.addWidget(self.ntn_scan_widget, 10, 0, 1, 2)
+        self.ntn_group.setToolTip(
+            "OFDM 基带样点在送入 USRP 发射链之前经过软件 NTN 信道；参考 profile 为简化 SISO 工程模型。"
+        )
+        self.ntn_compensation_spin.setToolTip("预补偿公共轨道频移的比例；不消除散射多普勒扩展。")
+        self.ntn_radial_spin.setToolTip("速度沿视线方向的比例，不代表卫星仰角。")
+        self.ntn_delay_scale_spin.setToolTip("1 倍使用 profile 时延；其它值用于工程压力测试。")
+        self._sync_ntn_scan_bounds()
+        link_layout.addWidget(self.ntn_group)
         link_layout.addStretch(1)
 
         # ---------- AFDM 专用参数 ----------
@@ -554,6 +645,10 @@ class HardwareTestTab(QWidget):
         self.tx_plot_combo.currentIndexChanged.connect(
             lambda _index: self._refresh_tx_plot_only()
         )
+        self.ntn_enabled_check.toggled.connect(self._on_ntn_configuration_changed)
+        self.ntn_mode_combo.currentIndexChanged.connect(self._on_ntn_configuration_changed)
+        self.ntn_profile_combo.currentTextChanged.connect(self._on_ntn_profile_changed)
+        self.ntn_scan_parameter_combo.currentIndexChanged.connect(self._sync_ntn_scan_bounds)
 
         self.tx_gain_spin.valueChanged.connect(
             lambda value: self._hot_set_gain("tx", float(value))
@@ -574,6 +669,20 @@ class HardwareTestTab(QWidget):
             self.c1_spin.valueChanged,
             self.c2_spin.valueChanged,
             self.tx_text_edit.textChanged,
+            self.ntn_profile_combo.currentTextChanged,
+            self.ntn_velocity_spin.valueChanged,
+            self.ntn_radial_spin.valueChanged,
+            self.ntn_compensation_spin.valueChanged,
+            self.ntn_cfo_spin.valueChanged,
+            self.ntn_doppler_spin.valueChanged,
+            self.ntn_delay_scale_spin.valueChanged,
+            self.ntn_seed_spin.valueChanged,
+            self.ntn_mode_combo.currentIndexChanged,
+            self.ntn_scan_parameter_combo.currentIndexChanged,
+            self.ntn_scan_start_spin.valueChanged,
+            self.ntn_scan_stop_spin.valueChanged,
+            self.ntn_scan_points_spin.valueChanged,
+            self.ntn_scan_frames_spin.valueChanged,
         ]
         for signal in dirty_signals:
             signal.connect(self._mark_configuration_dirty)
@@ -590,6 +699,7 @@ class HardwareTestTab(QWidget):
     def _on_waveform_changed(self, waveform: str):
         waveform = str(waveform).upper()
         self.afdm_group.setVisible(waveform == "AFDM")
+        self.ntn_group.setVisible(waveform == "OFDM")
 
         current_text = self.tx_text_edit.toPlainText().strip()
         known_defaults = {text.strip() for text in _DEFAULT_TEXTS.values()}
@@ -599,6 +709,66 @@ class HardwareTestTab(QWidget):
 
         if not self._initializing:
             self._mark_configuration_dirty()
+        self._update_ntn_controls()
+
+    def _on_ntn_profile_changed(self, profile: str):
+        try:
+            self.ntn_doppler_spin.setValue(float(get_profile(profile).maximum_doppler_hz))
+        except Exception:
+            pass
+        self._on_ntn_configuration_changed()
+
+    def _on_ntn_configuration_changed(self, *_args):
+        if not self._initializing:
+            self._mark_configuration_dirty()
+        self._update_ntn_controls()
+
+    def _sync_ntn_scan_bounds(self, *_args):
+        parameter = self.ntn_scan_parameter_combo.currentData()
+        spec = NTN_SCAN_PARAMETERS.get(parameter)
+        if spec is None:
+            return
+        self.ntn_scan_start_spin.blockSignals(True)
+        self.ntn_scan_stop_spin.blockSignals(True)
+        self.ntn_scan_start_spin.setRange(spec["minimum"], spec["maximum"])
+        self.ntn_scan_stop_spin.setRange(spec["minimum"], spec["maximum"])
+        self.ntn_scan_start_spin.setValue(spec["start"])
+        self.ntn_scan_stop_spin.setValue(spec["stop"])
+        decimals = 3 if parameter == "ntn_radial_projection" else 2
+        self.ntn_scan_start_spin.setDecimals(decimals)
+        self.ntn_scan_stop_spin.setDecimals(decimals)
+        self.ntn_scan_start_spin.setSuffix(f" {spec['unit']}" if spec["unit"] else "")
+        self.ntn_scan_stop_spin.setSuffix(f" {spec['unit']}" if spec["unit"] else "")
+        self.ntn_scan_start_spin.blockSignals(False)
+        self.ntn_scan_stop_spin.blockSignals(False)
+        self._update_ntn_controls()
+
+    def _update_ntn_controls(self):
+        is_ofdm = self._current_waveform() == "OFDM"
+        enabled = is_ofdm and self.ntn_enabled_check.isChecked()
+        scanning = enabled and self.ntn_mode_combo.currentData() == "scan"
+        for control in (
+            self.ntn_enabled_check,
+            self.ntn_profile_combo,
+            self.ntn_mode_combo,
+            self.ntn_velocity_spin,
+            self.ntn_radial_spin,
+            self.ntn_compensation_spin,
+            self.ntn_cfo_spin,
+            self.ntn_doppler_spin,
+            self.ntn_delay_scale_spin,
+            self.ntn_seed_spin,
+        ):
+            control.setEnabled(is_ofdm and not self.test_running and (control is self.ntn_enabled_check or enabled))
+        self.ntn_scan_widget.setVisible(self.ntn_mode_combo.currentData() == "scan")
+        for control in (
+            self.ntn_scan_parameter_combo,
+            self.ntn_scan_start_spin,
+            self.ntn_scan_stop_spin,
+            self.ntn_scan_points_spin,
+            self.ntn_scan_frames_spin,
+        ):
+            control.setEnabled(scanning and not self.test_running)
 
     def _update_button_states(self):
         connected = self.backend is not None
@@ -633,6 +803,7 @@ class HardwareTestTab(QWidget):
         self.rx_gain_spin.setEnabled(True)
         self.const_mode_combo.setEnabled(True)
         self.tx_plot_combo.setEnabled(True)
+        self._update_ntn_controls()
 
     # =========================================================
     # Backend loading / lifecycle
@@ -661,6 +832,28 @@ class HardwareTestTab(QWidget):
             )
         return backend_class
 
+    def _current_ntn_kwargs(self) -> Dict[str, Any]:
+        return {
+            "ntn_enabled": bool(self.ntn_enabled_check.isChecked()),
+            "ntn_profile": self.ntn_profile_combo.currentText().strip(),
+            "ntn_seed": int(self.ntn_seed_spin.value()),
+            "ntn_velocity_kmh": float(self.ntn_velocity_spin.value()),
+            "ntn_radial_projection": float(self.ntn_radial_spin.value()),
+            "ntn_compensation_ratio": float(self.ntn_compensation_spin.value()) / 100.0,
+            "ntn_residual_cfo_hz": float(self.ntn_cfo_spin.value()),
+            "ntn_doppler_spread_hz": float(self.ntn_doppler_spin.value()),
+            "ntn_delay_scale": float(self.ntn_delay_scale_spin.value()),
+        }
+
+    def _current_ntn_scan_plan(self) -> NTNScanPlan:
+        return NTNScanPlan(
+            parameter=str(self.ntn_scan_parameter_combo.currentData()),
+            start=float(self.ntn_scan_start_spin.value()),
+            stop=float(self.ntn_scan_stop_spin.value()),
+            points=int(self.ntn_scan_points_spin.value()),
+            frames_per_point=int(self.ntn_scan_frames_spin.value()),
+        )
+
     def _constructor_kwargs(self, waveform: str) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
             "carrier_freq": float(self.fc_spin.value()),
@@ -677,12 +870,287 @@ class HardwareTestTab(QWidget):
         }
         if waveform == "AFDM":
             kwargs.update(c1=float(self.c1_spin.value()), c2=float(self.c2_spin.value()))
+        elif waveform == "OFDM":
+            kwargs.update(self._current_ntn_kwargs())
         return kwargs
+
+    def _build_hardware_run_config(self, ntn_kwargs: Optional[Dict[str, Any]] = None) -> ExperimentConfig:
+        ntn = dict(ntn_kwargs or (self._current_ntn_kwargs() if self._current_waveform() == "OFDM" else {}))
+        waveform = self._current_waveform()
+        wave_config = WaveformConfig(
+            waveform=waveform,
+            mod_order=self.mod_order_combo.currentText().strip(),
+            center_freq_hz=float(self.fc_spin.value()),
+            sample_rate_hz=float(self.samp_rate_spin.value()),
+            seed=int(ntn.get("ntn_seed", 42)),
+            ntn_profile=str(ntn.get("ntn_profile", "NTN-TDLA100-200")),
+            cfo_hz=float(ntn.get("ntn_residual_cfo_hz", 0.0)),
+            velocity_kmh=float(ntn.get("ntn_velocity_kmh", 0.0)),
+            doppler_radial_factor=float(ntn.get("ntn_radial_projection", 0.0)),
+            doppler_compensation_ratio=float(ntn.get("ntn_compensation_ratio", 1.0)),
+            residual_doppler_spread_hz=float(ntn.get("ntn_doppler_spread_hz", 0.0)),
+        )
+        hardware_config = HardwareConfig(
+            transport="uhd",
+            device_args=self.serial_edit.text().strip(),
+            device_hint=self.device_combo.currentText().strip(),
+            mode="rf",
+            center_freq_hz=float(self.fc_spin.value()),
+            sample_rate_hz=float(self.samp_rate_spin.value()),
+            tx_gain_db=float(self.tx_gain_spin.value()),
+            rx_gain_db=float(self.rx_gain_spin.value()),
+            tx_antenna=self.tx_antenna_combo.currentText().strip(),
+            rx_antenna=self.rx_antenna_combo.currentText().strip(),
+        )
+        return ExperimentConfig(
+            waveform=wave_config,
+            hardware=hardware_config,
+            notes="硬件收发验证",
+            tags=["hardware", waveform.lower()],
+            runs_dir="runs",
+        ).normalized()
+
+    def _begin_hardware_run(
+        self,
+        ntn_kwargs: Optional[Dict[str, Any]] = None,
+        scan_point: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        ntn = dict(ntn_kwargs or {})
+        metadata: Dict[str, Any] = {
+            "waveform": self._current_waveform(),
+            "modulation": self.mod_order_combo.currentText().strip(),
+            "rf": {
+                "device": self.device_combo.currentText().strip(),
+                "serial": self.serial_edit.text().strip(),
+                "center_freq_hz": float(self.fc_spin.value()),
+                "sample_rate_hz": float(self.samp_rate_spin.value()),
+                "tx_gain_db": float(self.tx_gain_spin.value()),
+                "rx_gain_db": float(self.rx_gain_spin.value()),
+                "tx_antenna": self.tx_antenna_combo.currentText().strip(),
+                "rx_antenna": self.rx_antenna_combo.currentText().strip(),
+            },
+            "payload_utf8_bytes": len(self.tx_text_edit.toPlainText().encode("utf-8")),
+        }
+        if ntn:
+            metadata["channel_injection"] = {
+                "stage": "tx_baseband_before_rf",
+                **ntn,
+            }
+        if scan_point:
+            metadata["scan_point"] = dict(scan_point)
+        try:
+            recorder = HardwareRunRecorder(
+                self._build_hardware_run_config(ntn), metadata=metadata
+            )
+            run_id = recorder.start()
+            self._hardware_recorder = recorder
+            self._last_run_status = {}
+            self._log(f"硬件结果记录已创建：{recorder.run_dir.resolve()} ({run_id})")
+            return True
+        except Exception as exc:
+            self._hardware_recorder = None
+            self._log(f"创建硬件结果记录失败：{type(exc).__name__}: {exc}")
+            self.decode_status_label.setText(
+                f"解调状态：无法创建结果记录：{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    def _finish_hardware_run(self, status: Optional[Dict[str, Any]] = None, stats: Optional[Dict[str, Any]] = None, error: Optional[str] = None):
+        recorder = self._hardware_recorder
+        if recorder is None:
+            return None
+        combined = dict(status or self._last_run_status)
+        combined.update(stats or {})
+        run_dir = recorder.run_dir
+        try:
+            if error:
+                recorder.fail(error)
+            else:
+                recorder.finish(
+                    {
+                        "frame_id": combined.get("frame_id"),
+                        "bit_errors": combined.get("bit_errors"),
+                        "bits_total": combined.get("bits_total"),
+                        "ber": combined.get("cumulative_ber", combined.get("ber")),
+                        "decode_ok": combined.get("decode_ok"),
+                    }
+                )
+        except Exception as exc:
+            self._log(f"写入硬件运行结束状态失败：{type(exc).__name__}: {exc}")
+        finally:
+            self._hardware_recorder = None
+        return run_dir
+
+    def _capture_final_hardware_status(
+        self,
+        fallback_status: Optional[Dict[str, Any]] = None,
+        fallback_stats: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        status = dict(fallback_status or {})
+        stats = dict(fallback_stats or {})
+        if self.backend is not None:
+            status = dict(self.backend.get_status() or status)
+            stats = dict(self.backend.get_decode_stats() or stats)
+        status.update(stats)
+        self._last_run_status = status
+        if self._hardware_recorder is not None:
+            self._hardware_recorder.record_status(status)
+        return status
+
+    def _start_recorded_backend(
+        self,
+        ntn_kwargs: Optional[Dict[str, Any]] = None,
+        scan_point: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not self._begin_hardware_run(ntn_kwargs=ntn_kwargs, scan_point=scan_point):
+            return False
+        try:
+            if self.backend_waveform == "OFDM":
+                frame_limit = (
+                    self._scan_plan.frames_per_point
+                    if self._scan_active and self._scan_plan is not None
+                    else None
+                )
+                set_frame_limit = getattr(self.backend, "set_frame_limit", None)
+                if frame_limit is not None and not callable(set_frame_limit):
+                    raise RuntimeError("当前 OFDM 后端不支持按接收帧数结束扫描点")
+                if callable(set_frame_limit):
+                    set_frame_limit(frame_limit)
+            self._reset_runtime_plots()
+            self.rx_text_view.clear()
+            self.backend.start()
+            self._scan_start_frame_id = 0
+            self.test_running = True
+            self._backend_started_once = True
+            self._last_runtime_log_time = 0.0
+            self.update_timer.start()
+            self.decode_status_label.setText(
+                f"解调状态：{self.backend_waveform} 运行中，等待接收帧。"
+            )
+            return True
+        except Exception as exc:
+            self.test_running = False
+            self.update_timer.stop()
+            self._finish_hardware_run(error=f"{type(exc).__name__}: {exc}")
+            self.decode_status_label.setText(
+                f"解调状态：开始测试失败：{type(exc).__name__}: {exc}"
+            )
+            raise
+
+    def _start_scan_point(self):
+        if self.backend is None or self._scan_plan is None:
+            return
+        value = self._scan_values[self._scan_index]
+        ntn_kwargs = self._current_ntn_kwargs()
+        ntn_kwargs[self._scan_plan.parameter] = float(value)
+        scan_point = {
+            "parameter": self._scan_plan.parameter,
+            "value": float(value),
+            "index": self._scan_index + 1,
+            "count": len(self._scan_values),
+            "frames_per_point": self._scan_plan.frames_per_point,
+        }
+        try:
+            self.backend.configure(**ntn_kwargs)
+            if not self._start_recorded_backend(ntn_kwargs=ntn_kwargs, scan_point=scan_point):
+                self._scan_active = False
+                self._scan_plan = None
+                self.test_running = False
+                return
+            if self.test_running:
+                spec = NTN_SCAN_PARAMETERS[self._scan_plan.parameter]
+                unit = f" {spec['unit']}" if spec["unit"] else ""
+                self._log(
+                    f"扫描点 {self._scan_index + 1}/{len(self._scan_values)}："
+                    f"{spec['label']}={float(value):g}{unit}，"
+                    f"每点 {self._scan_plan.frames_per_point} 帧。"
+                )
+        except Exception as exc:
+            self._scan_active = False
+            self._scan_transitioning = False
+            self._finish_hardware_run(error=f"{type(exc).__name__}: {exc}")
+            self.test_running = False
+            self.update_timer.stop()
+            self.decode_status_label.setText(
+                f"解调状态：NTN 扫描中止：{type(exc).__name__}: {exc}"
+            )
+            self._log(f"NTN 扫描中止：{type(exc).__name__}: {exc}")
+        finally:
+            self._update_button_states()
+
+    def _maybe_advance_scan(self, status: Dict[str, Any], stats: Dict[str, Any]):
+        if not self._scan_active or self._scan_transitioning or self._scan_plan is None:
+            return
+        try:
+            frame_id = int(status.get("frame_id", status.get("frames_processed", 0)) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if frame_id - self._scan_start_frame_id < self._scan_plan.frames_per_point:
+            return
+        self._scan_transitioning = True
+        QTimer.singleShot(0, lambda: self._complete_scan_point(dict(status), dict(stats)))
+
+    def _complete_scan_point(self, status: Dict[str, Any], stats: Dict[str, Any]):
+        if not self._scan_active or self._scan_plan is None:
+            self._scan_transitioning = False
+            return
+        try:
+            self.update_timer.stop()
+            self.backend.stop()
+            if hasattr(self.backend, "wait"):
+                self.backend.wait()
+            self.test_running = False
+            point_status = self._capture_final_hardware_status(status, stats)
+            run_dir = self._finish_hardware_run(point_status)
+            self._log(
+                f"扫描点 {self._scan_index + 1}/{len(self._scan_values)} 完成："
+                f"BER={point_status.get('cumulative_ber', point_status.get('ber'))}, "
+                f"误码={point_status.get('bit_errors')}/{point_status.get('bits_total')}，"
+                f"记录={run_dir}"
+            )
+            self._scan_index += 1
+            if self._scan_index >= len(self._scan_values):
+                self._scan_active = False
+                self._scan_plan = None
+                self.decode_status_label.setText(
+                    f"解调状态：NTN 单参数扫描完成，共 {len(self._scan_values)} 点；"
+                    "每点 BER 与误码计数已分别保存。"
+                )
+                self._log("NTN 单参数扫描完成。")
+            else:
+                self._start_scan_point()
+        except Exception as exc:
+            self._scan_active = False
+            self._scan_plan = None
+            if self.test_running:
+                self.update_timer.start()
+                self.decode_status_label.setText(
+                    f"解调状态：扫描切换失败，当前后端保留：{type(exc).__name__}: {exc}"
+                )
+                self._log(f"NTN 扫描切换失败；当前结果记录保留：{type(exc).__name__}: {exc}")
+            else:
+                self.update_timer.stop()
+                self._finish_hardware_run(error=f"{type(exc).__name__}: {exc}")
+                self.decode_status_label.setText(
+                    f"解调状态：扫描点停止后读取结果失败：{type(exc).__name__}: {exc}"
+                )
+                self._log(f"NTN 扫描点结果读取失败：{type(exc).__name__}: {exc}")
+        finally:
+            self._scan_transitioning = False
+            self._update_button_states()
 
     def _create_backend(self) -> bool:
         waveform = self._current_waveform()
         identity = self._current_identity()
-        self._dispose_backend(clear_plots=False)
+        try:
+            self._dispose_backend(clear_plots=False, strict=True)
+        except Exception as exc:
+            self.decode_status_label.setText(
+                f"解调状态：停止旧后端失败，已取消创建新后端：{type(exc).__name__}: {exc}"
+            )
+            self._log(f"停止旧后端失败，已取消创建新后端：{type(exc).__name__}: {exc}")
+            self._update_button_states()
+            return False
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -724,11 +1192,13 @@ class HardwareTestTab(QWidget):
     def _dispose_backend(self, clear_plots: bool = True, *, strict: bool = False):
         self.update_timer.stop()
         backend = self.backend
+        shutdown_complete = True
 
         if backend is not None:
             try:
                 backend.stop()
             except Exception as exc:
+                shutdown_complete = False
                 self._log(f"停止后端时出现异常：{type(exc).__name__}: {exc}")
                 if strict:
                     if self.test_running:
@@ -738,11 +1208,23 @@ class HardwareTestTab(QWidget):
                 if hasattr(backend, "wait"):
                     backend.wait()
             except Exception as exc:
+                shutdown_complete = False
                 self._log(f"等待后端退出时出现异常：{type(exc).__name__}: {exc}")
                 if strict:
                     if self.test_running:
                         self.update_timer.start()
                     raise
+        if self._hardware_recorder is not None:
+            if shutdown_complete:
+                try:
+                    final_status = self._capture_final_hardware_status()
+                except Exception as exc:
+                    self._finish_hardware_run(error=f"{type(exc).__name__}: {exc}")
+                    self._log(f"读取硬件最终状态失败：{type(exc).__name__}: {exc}")
+                else:
+                    self._finish_hardware_run(final_status)
+            elif not strict:
+                self._finish_hardware_run(error="停止硬件后端失败，最终测量状态未知")
         self.backend = None
         self.backend_waveform = None
         self._backend_identity = None
@@ -780,20 +1262,29 @@ class HardwareTestTab(QWidget):
                 if not self._create_backend():
                     return
 
-            self._reset_runtime_plots()
-            self.rx_text_view.clear()
-            self.backend.start()
-            self.test_running = True
-            self._backend_started_once = True
-            self._last_runtime_log_time = 0.0
-            self.update_timer.start()
-            self.decode_status_label.setText(
-                f"解调状态：{self.backend_waveform} 运行中，等待接收帧。"
-            )
-            self._log(f"{self.backend_waveform} 硬件测试已启动。")
+            if (
+                self.backend_waveform == "OFDM"
+                and self.ntn_enabled_check.isChecked()
+                and self.ntn_mode_combo.currentData() == "scan"
+            ):
+                self._scan_plan = self._current_ntn_scan_plan()
+                self._scan_values = self._scan_plan.values()
+                self._scan_index = 0
+                self._scan_active = True
+                self._scan_transitioning = False
+                self._start_scan_point()
+            else:
+                self._scan_active = False
+                self._scan_plan = None
+                channel = self._current_ntn_kwargs() if self.backend_waveform == "OFDM" else None
+                if self._start_recorded_backend(ntn_kwargs=channel):
+                    self._log(f"{self.backend_waveform} 硬件测试已启动。")
         except Exception as exc:
             self.test_running = False
             self.update_timer.stop()
+            self._scan_active = False
+            self._scan_plan = None
+            self._finish_hardware_run(error=f"{type(exc).__name__}: {exc}")
             self.decode_status_label.setText(
                 f"解调状态：开始测试失败：{type(exc).__name__}: {exc}"
             )
@@ -805,6 +1296,9 @@ class HardwareTestTab(QWidget):
         self.update_timer.stop()
         if self.backend is None:
             self.test_running = False
+            self._scan_active = False
+            self._scan_plan = None
+            self._finish_hardware_run()
             self._update_button_states()
             return
 
@@ -812,12 +1306,33 @@ class HardwareTestTab(QWidget):
             self.backend.stop()
             if hasattr(self.backend, "wait"):
                 self.backend.wait()
-            self._log("硬件测试已停止；最后一次曲线与星座图予以保留。")
-        except Exception as exc:
-            self._log(f"停止测试失败：{type(exc).__name__}: {exc}")
-        finally:
             self.test_running = False
-            self.decode_status_label.setText("解调状态：已停止。")
+            self._scan_active = False
+            self._scan_plan = None
+            final_status = self._capture_final_hardware_status()
+            run_dir = self._finish_hardware_run(final_status)
+            message = self._measurement_summary(self._last_run_status)
+            self.decode_status_label.setText(
+                f"解调状态：已停止。{message}" if message else "解调状态：已停止。"
+            )
+            self._log(f"硬件测试已停止；最后一次曲线与星座图予以保留。记录：{run_dir}")
+        except Exception as exc:
+            self._scan_active = False
+            self._scan_plan = None
+            if self.test_running:
+                self.update_timer.start()
+                self.decode_status_label.setText(
+                    f"解调状态：停止失败，后端仍保留运行：{type(exc).__name__}: {exc}"
+                )
+                self._log(f"停止测试失败：{type(exc).__name__}: {exc}")
+            else:
+                self.update_timer.stop()
+                self._finish_hardware_run(error=f"{type(exc).__name__}: {exc}")
+                self.decode_status_label.setText(
+                    f"解调状态：后端已停止，但读取最终结果失败：{type(exc).__name__}: {exc}"
+                )
+                self._log(f"读取最终硬件结果失败：{type(exc).__name__}: {exc}")
+        finally:
             self._update_button_states()
 
     def _on_disconnect_clicked(self):
@@ -904,6 +1419,11 @@ class HardwareTestTab(QWidget):
         try:
             status = self.backend.get_status() or {}
             stats = self.backend.get_decode_stats() or {}
+            frame_status = dict(status)
+            frame_status.update(stats)
+            self._last_run_status = frame_status
+            if self.test_running and self._hardware_recorder is not None:
+                self._hardware_recorder.record_status(frame_status)
             samp_rate = self._extract_samp_rate(status)
             self._apply_stable_plot_ranges(samp_rate)
 
@@ -925,6 +1445,7 @@ class HardwareTestTab(QWidget):
 
             self._update_decode_status(stats, status)
             self._maybe_log_runtime(stats, status)
+            self._maybe_advance_scan(status, stats)
         except Exception as exc:
             self._log(f"刷新失败：{type(exc).__name__}: {exc}")
 
@@ -1115,7 +1636,10 @@ class HardwareTestTab(QWidget):
         reason = str(status.get("reason", status.get("status", "")) or "")
         sync = format_metric(status.get("sync_metric"), ".3f")
         cfo = format_metric(status.get("cfo_est_hz"), ".1f")
-        ber = format_metric(status.get("ber"), ".3e")
+        total_bits = status.get("bits_total", stats.get("bits_total"))
+        bit_errors = status.get("bit_errors", stats.get("bit_errors"))
+        ber_value = status.get("cumulative_ber", status.get("ber"))
+        ber = format_metric(ber_value, ".3e")
         combine = int(status.get("combine_frames", 0) or 0)
         repeat = int(status.get("payload_repeat", 0) or 0)
 
@@ -1148,11 +1672,34 @@ class HardwareTestTab(QWidget):
             )
 
         extra_text = " | " + ", ".join(extras) if extras else ""
+        if total_bits is not None and bit_errors is not None:
+            try:
+                extras.append(f"误码={int(bit_errors)}/{int(total_bits)}")
+                extra_text = " | " + ", ".join(extras)
+            except (TypeError, ValueError, OverflowError):
+                pass
         self.decode_status_label.setText(
             f"解调状态：{waveform} {state_text} ({match}/{expected} bytes) | "
             f"reason={reason}, Sync={sync}, CFO={cfo} Hz, BER={ber}, "
             f"合并帧={combine}, 帧内重复={repeat}{extra_text}"
         )
+
+    @staticmethod
+    def _measurement_summary(status: Dict[str, Any]) -> str:
+        if not status:
+            return ""
+        total_bits = status.get("bits_total")
+        bit_errors = status.get("bit_errors")
+        ber = status.get("cumulative_ber", status.get("ber"))
+        if total_bits is None and bit_errors is None and ber is None:
+            return ""
+        text = f"BER={format_metric(ber, '.3e')}"
+        if total_bits is not None and bit_errors is not None:
+            try:
+                text += f"，误码={int(bit_errors)}/{int(total_bits)} bit"
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return text
 
     def _maybe_log_runtime(
         self, stats: Dict[str, Any], status: Dict[str, Any]
@@ -1216,10 +1763,21 @@ class HardwareTestTab(QWidget):
     def suspend_tasks(self):
         """Release the radio when leaving this page, keeping the evidence."""
         had_backend = self.backend is not None
+        run_dir = (
+            self._hardware_recorder.run_dir
+            if self._hardware_recorder is not None else None
+        )
+        self._scan_active = False
+        self._scan_plan = None
+        self._scan_transitioning = False
         self._dispose_backend(clear_plots=False, strict=True)
+        if self._hardware_recorder is not None:
+            run_dir = self._finish_hardware_run()
         if had_backend:
-            self.decode_status_label.setText("解调状态：已停止并释放 USRP；结果已保留。")
-            self._log("离开测试页面，已停止并释放 USRP；再次测试请连接设备。")
+            self.decode_status_label.setText(
+                f"解调状态：已停止并释放 USRP；{self._measurement_summary(self._last_run_status)}"
+            )
+            self._log(f"离开测试页面，已停止并释放 USRP；结果已保留：{run_dir}")
 
     def closeEvent(self, event):
         try:
