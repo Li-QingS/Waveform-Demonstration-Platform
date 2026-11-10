@@ -223,7 +223,7 @@ class WaveformCompareTab(QWidget):
         return combo
 
     @staticmethod
-    def _csi_combo():
+    def _csi_combo(default="ideal"):
         combo = QComboBox()
         combo.addItem("理想 CSI（无导频）", "ideal")
         combo.addItem("共同导频估计 CSI", "pilot")
@@ -232,6 +232,7 @@ class WaveformCompareTab(QWidget):
             "用 LS 估计复增益，不知道扫描中的残余 CFO 和逐径多普勒。"
             "三种波形共享训练序列、导频开销和估计结果。"
         )
+        combo.setCurrentIndex(combo.findData(default))
         return combo
 
     def _init_live_page(self):
@@ -321,7 +322,7 @@ class WaveformCompareTab(QWidget):
         self.scan_doppler_points_spin = spin(3, 41, 31, integer=True)
         self.scan_fixed_cfo_spin = spin(-400_000.0, 400_000.0, 0.0, " Hz")
         self.scan_receiver_combo = self._receiver_combo()
-        self.scan_csi_combo = self._csi_combo()
+        self.scan_csi_combo = self._csi_combo(default="pilot")
         self.scan_seed_spin = QSpinBox()
         self.scan_seed_spin.setRange(0, 2_000_000_000)
         self.scan_seed_spin.setValue(42)
@@ -362,6 +363,7 @@ class WaveformCompareTab(QWidget):
         self.scan_cfo_min_spin.valueChanged.connect(self._update_scan_setup_note)
         self.scan_cfo_max_spin.valueChanged.connect(self._update_scan_setup_note)
         self.scan_doppler_max_spin.valueChanged.connect(self._update_scan_setup_note)
+        self.scan_csi_combo.currentIndexChanged.connect(self._update_scan_setup_note)
         self._update_scan_setup_note()
         scroll.setWidget(scan_group)
         rail_layout.addWidget(scroll, 1)
@@ -778,11 +780,16 @@ class WaveformCompareTab(QWidget):
         cfo_fraction = max(abs(self.scan_cfo_min_spin.value()), abs(self.scan_cfo_max_spin.value())) / spacing_hz
         doppler_fraction = 0.8 * self.scan_doppler_max_spin.value() / spacing_hz
         sample_rate = 64 * spacing_hz
+        csi_note = (
+            "共同导频 CSI：假设已知路径时延支撑与帧定时，不向接收机提供残余 CFO/多普勒。"
+            if self.scan_csi_combo.currentData() == "pilot" else
+            "理想 CSI：接收机使用完整真实信道矩阵，包含 CFO/多普勒影响，不含导频开销。"
+        )
         self.scan_note_label.setText(
             f"SCS={spacing_hz / 1000:g} kHz，采样率={sample_rate / 1e6:g} MHz；"
             f"当前 CFO 扫描端点={cfo_fraction:.3g}×SCS，最大逐径多普勒约 {doppler_fraction:.3g}×SCS。"
             "采样点数固定时，改变 SCS 会改变物理时延和 CP 时长，因此本对比固定 SCS。"
-            "共同导频 CSI 假设已知路径时延支撑和帧定时，但不向接收机提供残余 CFO/多普勒。"
+            f"{csi_note}"
             "两条扫描轴分别变化另一项固定。"
         )
 

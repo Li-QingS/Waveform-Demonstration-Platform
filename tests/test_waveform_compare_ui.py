@@ -35,15 +35,25 @@ def tab(app):
 
 
 def test_scan_defaults_use_dense_sampling(tab):
+    assert tab.scan_snr_spin.value() == 14.0
+    assert tab.scan_mod_combo.currentText() == "QPSK"
     assert tab.scan_frames_spin.value() == 100
+    assert tab.scan_receiver_combo.currentData() == "full_mmse"
     assert tab.scan_cfo_points_spin.value() == 31
     assert tab.scan_doppler_points_spin.value() == 31
+    assert tab.scan_csi_combo.currentData() == "pilot"
     assert tab.scan_cfo_min_spin.value() == -300.0
     assert tab.scan_cfo_max_spin.value() == 300.0
+    assert tab.scan_fixed_doppler_spin.value() == 120.0
     assert tab.scan_doppler_min_spin.value() == 0.0
     assert tab.scan_doppler_max_spin.value() == 1200.0
+    assert tab.scan_fixed_cfo_spin.value() == 0.0
     assert "SCS=15 kHz" in tab.scan_note_label.text()
     assert "0.02×SCS" in tab.scan_note_label.text()
+    assert "共同导频 CSI" in tab.scan_note_label.text()
+
+    tab.scan_csi_combo.setCurrentIndex(tab.scan_csi_combo.findData("ideal"))
+    assert "理想 CSI" in tab.scan_note_label.text()
 
 
 def wait_until(predicate, timeout=5.0):
