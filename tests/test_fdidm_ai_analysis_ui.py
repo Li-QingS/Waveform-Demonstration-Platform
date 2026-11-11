@@ -100,6 +100,12 @@ def test_chat_surface_has_shortcuts_and_never_displays_raw_log():
     assert dialog.windowTitle() == "平台 AI 助手"
     assert dialog.header_title.text() == "AI 助手"
     assert "实验" in dialog.header_subtitle.text()
+    welcome = dialog.messages[0]["content"]
+    assert "波形仿真与硬件验证平台的 AI 助手" in welcome
+    assert all(
+        term in welcome
+        for term in ("仿真和硬件结果", "解读图表", "排查日志", "操作指导")
+    )
     assert [button.text() for button in dialog.quick_buttons] == [
         "日志分析", "运行结果图解释", "异常原因排查", "优化建议",
         "操作指导",
@@ -110,6 +116,26 @@ def test_chat_surface_has_shortcuts_and_never_displays_raw_log():
     assert not hasattr(dialog, "base_url_edit")
     assert RAW_MARKER not in _visible_text(dialog)
     assert RAW_MARKER not in "\n".join(widget.text() for widget in dialog.findChildren(type(dialog.source_label)))
+
+
+def test_config_failure_shows_safe_specific_guidance():
+    from waveform_sim.service.ai_config import AIConfigurationError
+
+    secret = "must-not-appear-in-ui"
+
+    def broken_config():
+        raise AIConfigurationError(
+            f"unsafe backend details containing {secret}",
+            code="stored_config_unreadable",
+        )
+
+    dialog = _dialog(config_provider=broken_config)
+    dialog.send_message("我看到什么内容？", intent="guide")
+
+    visible = _visible_text(dialog)
+    assert "Windows 用户账户下重新配置" in visible
+    assert secret not in visible
+    assert "unsafe backend details" not in visible
 
 
 def test_platform_guide_works_on_home_without_log_or_results(monkeypatch):

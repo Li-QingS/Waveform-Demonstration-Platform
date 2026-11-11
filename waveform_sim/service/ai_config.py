@@ -26,6 +26,10 @@ _CONFIG_ERROR = "AI 助手服务尚未就绪，请联系平台管理员。"
 class AIConfigurationError(RuntimeError):
     """A configuration error that never includes credential material."""
 
+    def __init__(self, message: str = _CONFIG_ERROR, *, code: str = "invalid_settings"):
+        super().__init__(message)
+        self.code = code
+
 
 def config_directory(environ: Mapping[str, str] | None = None) -> Path:
     env = os.environ if environ is None else environ
@@ -36,7 +40,7 @@ def config_directory(environ: Mapping[str, str] | None = None) -> Path:
 
 def _crypt(data: bytes, *, decrypt: bool) -> bytes:
     if os.name != "nt":
-        raise AIConfigurationError(_CONFIG_ERROR)
+        raise AIConfigurationError(_CONFIG_ERROR, code="dpapi_unavailable")
     from ctypes import wintypes
 
     class DataBlob(ctypes.Structure):
@@ -64,7 +68,8 @@ def _crypt(data: bytes, *, decrypt: bool) -> bytes:
     # UI forbidden; omit LOCAL_MACHINE so only the current Windows user can decrypt.
     if not operation(ctypes.byref(incoming), description, None, None, None, 1,
                      ctypes.byref(outgoing)):
-        raise AIConfigurationError(_CONFIG_ERROR)
+        code = "dpapi_unprotect_failed" if decrypt else "dpapi_protect_failed"
+        raise AIConfigurationError(_CONFIG_ERROR, code=code)
     try:
         return ctypes.string_at(outgoing.data, outgoing.size)
     finally:
@@ -81,22 +86,29 @@ def _unprotect(data: bytes) -> bytes:
 
 def _validated(config: DeepSeekConfig) -> DeepSeekConfig:
     try:
-        values = (config.api_key, config.base_url, config.model)
+        key_value = config.api_key
+        base_url_value = config.base_url
+        model_value = config.model
+        if isinstance(key_value, str) and not key_value.strip():
+            raise AIConfigurationError(_CONFIG_ERROR, code="missing_api_key")
+        values = (key_value, base_url_value, model_value)
         if not all(isinstance(value, str) and value.strip() for value in values):
             raise ValueError
-        base_url = config.base_url.strip()
+        base_url = base_url_value.strip()
         parsed = urlparse(base_url)
         if parsed.scheme not in {"https", "http"} or not parsed.hostname:
             raise ValueError
         timeout = float(config.timeout_s)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError
-        key = config.api_key.strip()
+        key = key_value.strip()
         if "\n" in key or "\r" in key:
             raise ValueError
-        return DeepSeekConfig(base_url, config.model.strip(), key, timeout)
+        return DeepSeekConfig(base_url, model_value.strip(), key, timeout)
+    except AIConfigurationError:
+        raise
     except (AttributeError, ValueError, TypeError):
-        raise AIConfigurationError(_CONFIG_ERROR) from None
+        raise AIConfigurationError(_CONFIG_ERROR, code="invalid_settings") from None
 
 
 def load_ai_config(*, config_dir: Path | None = None,
@@ -113,7 +125,7 @@ def load_ai_config(*, config_dir: Path | None = None,
                 raise ValueError
     except Exception:
         if not override_key:
-            raise AIConfigurationError(_CONFIG_ERROR) from None
+            raise AIConfigurationError(_CONFIG_ERROR, code="stored_config_unreadable") from None
         saved = {}
 
     config = DeepSeekConfig(
@@ -154,4 +166,4 @@ def save_ai_config(config: DeepSeekConfig, *, config_dir: Path | None = None) ->
             temp.unlink(missing_ok=True)
         return path
     except Exception:
-        raise AIConfigurationError(_CONFIG_ERROR) from None
+        raise AIConfigurationError(_CONFIG_ERROR, code="config_write_failed") from None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import math
 import threading
 import weakref
@@ -662,7 +663,11 @@ class FDIDMAIAnalysisDialog(QDialog):
         self._history.clear()
         self._chart_followups = False
         self._conversation_mode = None
-        self._add_message("assistant", "你好，我可以帮你解读 FDIDM 实验现象、结果图和日志证据。")
+        self._add_message(
+            "assistant",
+            "你好，我是波形仿真与硬件验证平台的 AI 助手，可分析仿真和硬件结果、解读图表、"
+            "排查日志，并提供优化建议与操作指导。",
+        )
 
     def _add_message(self, role: str, content: str) -> None:
         entry = {"role": role, "content": str(content)}
@@ -885,9 +890,25 @@ class FDIDMAIAnalysisDialog(QDialog):
         try:
             config = self._config_provider()
             api_key = str(config.api_key)
-        except Exception:
-            self._add_message("assistant", "AI 助手暂不可用，请联系平台管理员。")
-            self.status_label.setText("AI 助手暂不可用，请联系平台管理员。")
+        except Exception as exc:
+            from waveform_sim.service.ai_config import AIConfigurationError
+
+            if isinstance(exc, AIConfigurationError):
+                guidance = {
+                    "missing_api_key": "AI 助手尚未完成后台配置，请联系平台管理员设置服务凭据。",
+                    "stored_config_unreadable": "AI 助手的本机加密配置无法读取，请管理员在运行平台的 Windows 用户账户下重新配置。",
+                    "dpapi_unavailable": "当前运行环境无法读取本机加密配置，请联系平台管理员检查运行环境。",
+                    "invalid_settings": "AI 助手配置无效，请联系平台管理员检查服务地址、模型和超时设置。",
+                }
+                message = guidance.get(exc.code, "AI 助手配置读取失败，请联系平台管理员检查后台配置。")
+                logging.getLogger(__name__).warning("AI configuration unavailable (code=%s)", exc.code)
+            else:
+                logging.getLogger(__name__).warning(
+                    "AI configuration provider failed (type=%s)", type(exc).__name__
+                )
+                message = "AI 助手暂不可用，请联系平台管理员。"
+            self._add_message("assistant", message)
+            self.status_label.setText(message)
             return
         if api_key:
             self._redaction_keys.add(api_key)

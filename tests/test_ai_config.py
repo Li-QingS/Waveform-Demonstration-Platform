@@ -13,8 +13,9 @@ def test_unconfigured_backend_has_safe_error_and_does_not_create_files(tmp_path)
     from waveform_sim.service.ai_config import AIConfigurationError, load_ai_config
 
     folder = tmp_path / "not-created"
-    with pytest.raises(AIConfigurationError, match="AI"):
+    with pytest.raises(AIConfigurationError, match="AI") as error:
         load_ai_config(config_dir=folder, environ={})
+    assert error.value.code == "missing_api_key"
     assert not folder.exists()
 
 
@@ -90,6 +91,7 @@ def test_decryption_failure_does_not_expose_underlying_data(tmp_path, monkeypatc
     with pytest.raises(ai_config.AIConfigurationError) as error:
         ai_config.load_ai_config(config_dir=tmp_path, environ={})
     assert "test-only-secret" not in str(error.value)
+    assert error.value.code == "stored_config_unreadable"
 
 
 @pytest.mark.parametrize("payload", [[], {"api_key": ""}, {"api_key": 123}, {"api_key": "dummy", "model": []}])
