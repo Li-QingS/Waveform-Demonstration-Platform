@@ -5,12 +5,13 @@ import math
 from PyQt5.QtCore import QPointF, QRect, QRectF, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
-    QLabel, QPushButton, QSizePolicy, QStyle, QStyleOptionButton, QVBoxLayout, QWidget,
+    QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 
 BLUE = (0, 114, 189)
 ORANGE = (217, 83, 25)
+UI_FONT_FAMILY = "Microsoft YaHei"
 
 
 class _EntryButton(QPushButton):
@@ -20,7 +21,10 @@ class _EntryButton(QPushButton):
         super().__init__(f"{title}\n{description}", parent)
         self._title, self._description = title, description
         self._colour = QColor(*colour)
+        self._hover_colour = QColor("#EDF6FC" if name == "simulation" else "#FFF4ED")
+        self._pressed_colour = QColor("#DDEBF6" if name == "simulation" else "#FCE7D9")
         self.setObjectName(f"enter_{name}")
+        self.setFont(QFont(UI_FONT_FAMILY, 10))
         self.setAccessibleName(f"进入{title}")
         self.setAccessibleDescription(description)
         self.setMinimumHeight(120)
@@ -91,26 +95,36 @@ class _EntryButton(QPushButton):
         return QIcon(pixmap)
 
     def paintEvent(self, event):
-        option = QStyleOptionButton()
-        self.initStyleOption(option)
-        option.text = ""
-        option.icon = QIcon()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        self.style().drawControl(QStyle.CE_PushButton, option, painter, self)
+        rect = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+        fill = self._pressed_colour if self.isDown() else self._hover_colour if self.underMouse() else QColor("#FFFFFF")
+        shape = QPainterPath()
+        shape.addRoundedRect(rect, 6, 6)
+        painter.fillPath(shape, fill)
+        painter.save()
+        painter.setClipPath(shape)
+        painter.fillRect(QRectF(rect.left(), rect.top(), 6, rect.height()), self._colour)
+        painter.restore()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#D1DDE8"), 1))
+        painter.drawRoundedRect(rect, 6, 6)
+        if self.hasFocus():
+            painter.setPen(QPen(self._colour, 1.5))
+            painter.drawRoundedRect(rect.adjusted(3, 3, -3, -3), 4, 4)
         shift = 1 if self.isDown() else 0
         self.icon().paint(painter, QRect(23 + shift, (self.height() - 64) // 2 + shift, 64, 64))
         left, right = 107 + shift, self.width() - 36
         text_width = max(1, right - left)
         title_font = QFont(self.font()); title_font.setPointSize(17); title_font.setWeight(QFont.DemiBold)
         painter.setFont(title_font)
-        painter.setPen(self.palette().buttonText().color())
+        painter.setPen(QColor("#20364A"))
         painter.drawText(QRectF(left, self.height() / 2 - 29 + shift, text_width, 32),
                          Qt.AlignLeft | Qt.AlignVCenter, self._title)
         detail_font = QFont(self.font()); detail_font.setPointSize(10)
         painter.setFont(detail_font)
         painter.setPen(self.palette().color(self.palette().Disabled, self.palette().ButtonText)
-                       if not self.isEnabled() else QColor(82, 82, 82))
+                       if not self.isEnabled() else QColor("#5D7185"))
         detail = painter.fontMetrics().elidedText(self._description, Qt.ElideRight, int(text_width))
         painter.drawText(QRectF(left, self.height() / 2 + 8 + shift, text_width, 23),
                          Qt.AlignLeft | Qt.AlignVCenter, detail)
@@ -129,6 +143,13 @@ class LandingPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("platformEntry")
+        self.setFont(QFont(UI_FONT_FAMILY, 10))
+        self.setStyleSheet(
+            "QWidget#platformEntry { background-color: #F3F6FA; color: #20364A; }"
+            "QLabel#landingTitle { color: #18324B; }"
+            "QLabel#landingSubtitle { color: #536B80; }"
+            "QLabel#landingFooter { color: #64798C; }"
+        )
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 26, 32, 26)
         outer.addStretch(2)
@@ -138,12 +159,15 @@ class LandingPage(QWidget):
         column.setContentsMargins(20, 18, 20, 18)
         column.setSpacing(14)
         title = QLabel("软波形自适应演示平台")
+        title.setObjectName("landingTitle")
         title.setAlignment(Qt.AlignCenter)
         title_font = QFont(self.font()); title_font.setPointSize(25); title_font.setWeight(QFont.DemiBold)
         title.setFont(title_font)
         column.addWidget(title)
         subtitle = QLabel("FDIDM / OFDM / OTFS / AFDM")
+        subtitle.setObjectName("landingSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setFont(QFont(UI_FONT_FAMILY, 11))
         column.addWidget(subtitle)
         column.addSpacing(10)
         self.simulation_button = _EntryButton(
@@ -159,7 +183,9 @@ class LandingPage(QWidget):
         outer.addWidget(self._content, alignment=Qt.AlignHCenter)
         outer.addStretch(2)
         footer = QLabel("波形仿真与 USRP 原型验证  ·  v6.0")
+        footer.setObjectName("landingFooter")
         footer.setAlignment(Qt.AlignCenter)
+        footer.setFont(QFont(UI_FONT_FAMILY, 9))
         outer.addWidget(footer)
 
     @staticmethod
@@ -236,7 +262,7 @@ class LandingPage(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         width, height = self.width(), self.height()
-        painter.setPen(QPen(QColor(110, 110, 110, 19), 1))
+        painter.setPen(QPen(QColor(68, 101, 132, 18), 1))
         for x in range(0, width, 40):
             painter.drawLine(x, 0, x, height)
         for y in range(0, height, 40):

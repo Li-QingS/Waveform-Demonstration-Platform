@@ -9,10 +9,12 @@ import pytest
 pytest.importorskip("PyQt5")
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QLineEdit, QPushButton, QWidget
 
 from waveform_sim.ui import main_window
+from waveform_sim.ui.landing_page import LandingPage
 
 
 @pytest.fixture(scope="module")
@@ -56,6 +58,34 @@ def test_entry_has_two_stacked_buttons_and_does_not_load_backends(platform):
     assert buttons[0].geometry().bottom() < buttons[1].geometry().top()
     assert buttons[0].width() == buttons[1].width()
     assert buttons[0].height() >= 100
+
+
+def test_homepage_uses_microsoft_yahei_and_distinct_base_colors(app):
+    original_font = QFont(app.font())
+    app.setFont(QFont("SimSun"))
+    page = LandingPage()
+    try:
+        page.resize(900, 620)
+        page.show()
+        app.processEvents()
+
+        assert page.font().family() == "Microsoft YaHei"
+        assert page.simulation_button.font().family() == "Microsoft YaHei"
+        assert page.hardware_button.font().family() == "Microsoft YaHei"
+
+        image = page.grab().toImage()
+        assert image.pixelColor(5, 5) == QColor("#F3F6FA")
+        simulation = page.simulation_button.rect().translated(
+            page.simulation_button.mapTo(page, page.simulation_button.rect().topLeft())
+        )
+        hardware = page.hardware_button.rect().translated(
+            page.hardware_button.mapTo(page, page.hardware_button.rect().topLeft())
+        )
+        assert image.pixelColor(simulation.left() + 2, simulation.center().y()) == QColor("#0072BD")
+        assert image.pixelColor(hardware.left() + 2, hardware.center().y()) == QColor("#D95319")
+    finally:
+        page.close()
+        app.setFont(original_font)
 
 
 def test_workspace_switch_stops_tasks_and_preserves_configuration(platform):
